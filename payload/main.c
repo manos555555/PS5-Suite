@@ -250,6 +250,66 @@ static int g_extendedinfo_resolved = 0;
 static pthread_mutex_t g_extendedinfo_lock = PTHREAD_MUTEX_INITIALIZER;
 
 // ============================================================================
+// Crash-surviving trace: every mount/dispatch stage is emitted as a raw UDP
+// broadcast datagram (port 9871) AND appended to /data/ps5_suite_trace.log
+// via write() — no malloc, no stdio, no locks. Async-signal-safe: even if the
+// process wedges in kernel IPC or dies mid-malloc, the last emitted line
+// pinpoints where it happened.
+// ============================================================================
+static int  g_dbg_sock = -1;
+static int  g_dbg_fd   = -1;
+static struct sockaddr_in g_dbg_bcast;
+
+static void dbg_raw(const char *msg, int len) {
+    if (g_dbg_sock >= 0)
+        sendto(g_dbg_sock, msg, len, 0,
+               (struct sockaddr *)&g_dbg_bcast, sizeof(g_dbg_bcast));
+    if (g_dbg_fd >= 0) {
+        ssize_t w = write(g_dbg_fd, msg, len); (void)w;
+    }
+}
+
+static void dbg_log(const char *msg) { dbg_raw(msg, (int)strlen(msg)); }
+
+// msg + unsigned value, manual formatting (no snprintf/malloc — handler-safe)
+static void dbg_kv(const char *msg, unsigned long v) {
+    char buf[96]; int i = 0;
+    while (*msg && i < 80) buf[i++] = *msg++;
+    if (v == 0) { buf[i++] = '0'; }
+    char tmp[24]; int t = 0;
+    while (v) { tmp[t++] = (char)('0' + (v % 10)); v /= 10; }
+    while (t) buf[i++] = tmp[--t];
+    buf[i++] = '\n';
+    dbg_raw(buf, i);
+}
+
+// msg + hex value — pointer/fault-address formatting
+static void dbg_kx(const char *msg, unsigned long v) {
+    char buf[96]; int i = 0;
+    while (*msg && i < 80) buf[i++] = *msg++;
+    if (v == 0) { buf[i++] = '0'; }
+    char tmp[20]; int t = 0;
+    while (v) { int d = (int)(v & 0xF); tmp[t++] = (char)(d < 10 ? '0' + d : 'a' + d - 10); v >>= 4; }
+    while (t) buf[i++] = tmp[--t];
+    buf[i++] = '\n';
+    dbg_raw(buf, i);
+}
+
+static void dbg_init(void) {
+    g_dbg_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (g_dbg_sock >= 0) {
+        int one = 1;
+        setsockopt(g_dbg_sock, SOL_SOCKET, SO_BROADCAST, &one, sizeof(one));
+        memset(&g_dbg_bcast, 0, sizeof(g_dbg_bcast));
+        g_dbg_bcast.sin_family = AF_INET;
+        g_dbg_bcast.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+        g_dbg_bcast.sin_port = htons(9871);
+    }
+    g_dbg_fd = open("/data/ps5_suite_trace.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    dbg_log("== trace start ==\n");
+}
+
+// ============================================================================
 // Kernel-RPC serialization: kernel_dynlib_* talks to the kernel over a shared
 // RPC pipe pair. Two threads interleaving requests on it corrupt the stream
 // and the payload wedges. EVERY dynlib call goes through these wrappers.
@@ -365,7 +425,13 @@ static __thread sigjmp_buf t_wdg_jmp;
 static __thread volatile int t_wdg_armed = 0;
 
 static void wdg_fault_handler(int sig, siginfo_t *info, void *uap) {
-    (void)info; (void)uap;
+    (void)uap;
+    dbg_kv("CRASH sig=", sig);   // async-safe: raw write/UDP only
+    if (info) {
+        dbg_kx("  addr=0x", (unsigned long)info->si_addr);
+        dbg_kv("  code=", (unsigned long)info->si_code);
+    }
+    dbg_kx("  tid=0x", (unsigned long)pthread_self());
     if (t_wdg_armed) {
         t_wdg_armed = 0;
         siglongjmp(t_wdg_jmp, sig);
@@ -1345,10 +1411,10 @@ static int handle_fan_set_threshold(int sock, int temp_c) {
 
 // Registration using the dump_installer model (by EchoStretch):
 //   1. Resolve AppInstallTitleDir via kernel_dynlib (NID)
-//   2. Call sceAppInstUtilInitialize (extern linked) - done in process_game
-//   3. Call sceAppInstUtilAppUnInstall to clear stale registration - done in process_game
-//   4. Try AppInstallTitleDir first
-//   5. Fallback to AppInstallAll for FW 12.00+
+//   2. Try AppInstallTitleDir first (handles duplicates internally)
+//   3. Fallback to AppInstallAll for FW 12.00+
+// Note: v7.2.4 removed pre-mount Initialize+UnInstall calls — they caused
+// home screen refresh. the mount bridge doesn't use them either.
 
 // install_app - dump_installer style registration
 // Returns 0 on success, negative on failure
@@ -1366,7 +1432,20 @@ static int install_app(const char *title_id, const char *base_path,
 
     // Resolve AppInstallTitleDir via kernel_dynlib (dump_installer method)
     resolve_appinstutil();
-    
+
+    // The daemon session must be initialized before AppInstallTitleDir /
+    // AppInstallAll — without it both calls fail and the mount aborts.
+    // (v7.2.4 removed it together with AppUnInstall; only UnInstall caused
+    // the home-screen refresh flicker — Initialize alone is silent.)
+    // 0x80990001 = already initialized, treated as success.
+    int init_rc = wdg_fn_call((void*)sceAppInstUtilInitialize, NULL, NULL, NULL, NULL, 30000);
+    if (init_rc != 0 && init_rc != 0x80990001) {
+        char dbg[128];
+        snprintf(dbg, sizeof(dbg), "AppInstUtil init failed: 0x%X", init_rc);
+        send_progress_message(dbg);
+        return init_rc;
+    }
+
     // Try AppInstallTitleDir first (if resolved)
     if (g_sceAppInstUtilAppInstallTitleDir) {
         ret = g_sceAppInstUtilAppInstallTitleDir(title_id, base_path, 0);
@@ -1502,6 +1581,7 @@ static int wdg_fn_call(void *fn, void *a, void *b, void *c, void *d, int timeout
         waited += 20;
     }
     wdg_mark_dead(fn);
+    dbg_kv("wdg PARKED timeout_ms=", (unsigned long)timeout_ms);
     return -2;   // timed out — leak the 40-byte state, worker keeps running
 }
 
@@ -2024,11 +2104,17 @@ void release_file_mutex(const char *path) {
 #define CMD_POWER_ACTION   0x77  // "reboot"|"shutdown" → reboot() syscall
 #define CMD_USB_LIST       0x78  // → usb mount lines "path|fstype|dev|total|free"
 #define CMD_PAD_INFO       0x79  // → controller info key=value + raw hex dump
-#define CMD_DISC_DUMP      0x7A  // "start"|"status"|"cancel" → disc → HDD copy
 #define CMD_SCREENSHOT     0x7B  // → sceScreenShotCapture (screen grab)
 #define CMD_NOTIFY         0x7C  // "text" → PS5 UI notification
 #define CMD_PAD_ACTION     0x7D  // "lightbar|r,g,b" | "vibrate|l,s"
 #define CMD_ICC_CONTROL    0x7E  // "led|n" "buzzer|n" "buzzervol|n" "buzzermute|n" "ledcolor|b,w,o"
+
+// Trophy viewer (NpTrophy V2) — read-only for now: lists every registered
+// trophy set and ships the raw tropconf/tropmeta JSON + TRPTITLE.DAT so the
+// client can render names/tiers/timestamps.
+#define CMD_TROPHY_LIST    0x80  // → RESP_DATA framed blob (see handle_trophy_list)
+#define CMD_TROPHY_UNLOCK  0x82  // "unlock:<id|all>" / "lock:<id>" via trophy daemon
+#define CMD_TROPHY_ICON    0x81  // "NPWR|entry.png" → RESP_DATA raw PNG bytes
 
 #define CMD_SHUTDOWN 0xFF
 
@@ -2055,11 +2141,14 @@ static bool is_local_connection(int sock) {
 void send_progress_message(const char *msg);
 static void payload_restore_privileges(void);   // defined in main() section
 
-// Serialize mount-games runs: the g_mounted_ids duplicate list must not be
-// reset while another client is mid-mount.
-static pthread_mutex_t g_mounted_lock = PTHREAD_MUTEX_INITIALIZER;
-static void lock_mounted_ids(void)   { pthread_mutex_lock(&g_mounted_lock); }
-static void unlock_mounted_ids(void) { pthread_mutex_unlock(&g_mounted_lock); }
+// Mount-run dedup table. v7.2.5: flat array + atomics ONLY — the previous
+// pthread_mutex + linked list faulted inside pthread_mutex_lock (SIGBUS on a
+// dangling libkernel mutex-object pointer left by an exited detached thread).
+// The only writer is the serialized mount worker (g_mount_running), so plain
+// atomic publishes are sufficient; readers just need a consistent count.
+#define MOUNTED_IDS_MAX 64
+static char g_mounted_ids_flat[MOUNTED_IDS_MAX][10];
+static volatile int g_mounted_count = 0;
 
 // ============================================================================
 // GLOBAL STATE GUARDS (shared progress socket + counters)
@@ -2109,34 +2198,27 @@ static const char* GAME_SCAN_PATHS[] = {
     "/mnt/usb2/games",       // USB drive 2
     "/mnt/usb3/games",       // USB drive 3
     "/mnt/ext0/games",       // M.2 SSD
+    "/data/homebrew",        // Native homebrew apps (homebrew.page catalog)
 };
 #define NUM_GAME_SCAN_PATHS (sizeof(GAME_SCAN_PATHS) / sizeof(GAME_SCAN_PATHS[0]))
 
 // Track mounted title IDs in a dynamically sized list (title IDs are always
 // 9 chars + NUL, so no need for a fixed 256x12 array).
-typedef struct mounted_id_node {
-    char id[10];
-    struct mounted_id_node *next;
-} mounted_id_node_t;
-
-static mounted_id_node_t *g_mounted_ids = NULL;
-static int g_mounted_count = 0;
-
 static int is_duplicate_title(const char* title_id) {
-    for (mounted_id_node_t *n = g_mounted_ids; n; n = n->next) {
-        if (strcmp(n->id, title_id) == 0)
+    int n = __atomic_load_n(&g_mounted_count, __ATOMIC_SEQ_CST);
+    if (n > MOUNTED_IDS_MAX) n = MOUNTED_IDS_MAX;
+    for (int i = 0; i < n; i++) {
+        if (strncmp(g_mounted_ids_flat[i], title_id, 10) == 0)
             return 1;
     }
     return 0;
 }
 
 static void track_mounted_title(const char* title_id) {
-    mounted_id_node_t *n = (mounted_id_node_t*)malloc(sizeof(mounted_id_node_t));
-    if (!n) return;
-    snprintf(n->id, sizeof(n->id), "%s", title_id);
-    n->next = g_mounted_ids;
-    g_mounted_ids = n;
-    g_mounted_count++;
+    int i = __atomic_load_n(&g_mounted_count, __ATOMIC_SEQ_CST);
+    if (i >= MOUNTED_IDS_MAX) return;
+    snprintf(g_mounted_ids_flat[i], 10, "%s", title_id);
+    __atomic_store_n(&g_mounted_count, i + 1, __ATOMIC_SEQ_CST);
 }
 
 void send_notification_ex(const char *msg, const char *icon_uri) {
@@ -2150,7 +2232,9 @@ void send_notification_ex(const char *msg, const char *icon_uri) {
         strncpy(req.message + (1069 - 45), icon_uri,
                 sizeof(req.message) - (1069 - 45) - 1);
     }
+    dbg_log("notify> kernel call\n");
     sceKernelSendNotificationRequest(0, &req, sizeof(req), 0);
+    dbg_log("notify< ok\n");
 }
 
 void send_notification(const char *msg) {
@@ -3433,25 +3517,15 @@ static int process_game(const char* game_path, char* game_name_out, size_t name_
     snprintf(src_sce_sys, sizeof(src_sce_sys),
              "%s/sce_sys", game_path);
 
-    // Step 1: Initialize + UnInstall (dump_installer: lines 411-412)
-    {
-        char chk[128];
-        snprintf(chk, sizeof(chk), "%s: fixing config...", title_id);
-        send_progress_message(chk);
-    }
-    // Daemon calls only exist under etaHEN — under kstuff-light this IPC
-    // wedges the whole process. Skip cleanly and let the mount proceed
-    // without the registry fix (icon may be stale, console stays alive).
-    if (etahen_present()) {
-        wdg_fn_call((void*)sceAppInstUtilInitialize, NULL, NULL, NULL, NULL, 30000);
-        char *tid = strdup(title_id);   // leaked if the call parks — by design
-        int urc = wdg_fn_call((void*)sceAppInstUtilAppUnInstall, (void*)tid, NULL, NULL, NULL, 60000);
-        if (urc != -2) free(tid);
-    } else {
-        char chk[128];
-        snprintf(chk, sizeof(chk), "%s: etaHEN absent — skipping daemon unregister", title_id);
-        send_progress_message(chk);
-    }
+    // v7.2.4: Removed pre-mount Initialize + UnInstall calls.
+    // These daemon IPC calls triggered ShellCore to refresh the home screen,
+    // causing visible flicker even when mounting a single game.
+    // the mount bridge doesn't use them — AppInstallTitleDir handles duplicates
+    // internally, and our direct SQLite path already DELETEs before INSERT.
+    // The old calls were:
+    //   sceAppInstUtilInitialize()
+    //   sceAppInstUtilAppUnInstall(title_id)
+    // Keeping this comment for history.
 
     // Step 2: Update trophy and sound data (dump_installer: lines 413-414)
     update_trophy(title_id, src_sce_sys);
@@ -3949,6 +4023,7 @@ int count_files_recursive(const char *path) {
 // within 300 ms, drop this message and detach the socket so later messages
 // stop trying instantly.
 void send_progress_message(const char *msg) {
+    dbg_log("prog> "); dbg_log(msg); dbg_log("\n");
     pthread_mutex_lock(&g_progress_mutex);
     int s = g_client_sock;
     if (s > 0) {
@@ -5396,10 +5471,7 @@ void handle_get_system_info(client_session_t *session) {
     if (statfs("/system_ex", &sf) == 0)
         free_bytes += (sf.f_bavail > 0) ? (uint64_t)sf.f_bavail * sf.f_bsize : (uint64_t)sf.f_bfree * sf.f_bsize;
 
-    int mounted_count = 0;
-    lock_mounted_ids();
-    mounted_count = g_mounted_count;
-    unlock_mounted_ids();
+    int mounted_count = __atomic_load_n(&g_mounted_count, __ATOMIC_SEQ_CST);
 
     pthread_mutex_lock(&g_index.mutex);
     int idx_files = g_index.total_files;
@@ -5473,6 +5545,12 @@ typedef struct {
     char title_filter[16]; // empty = mount all; else only dirs starting with it
 } mount_job_t;
 
+// v7.2.4: only ONE mount job may run at a time. A second concurrent worker
+// runs process_game in parallel — racing nmount/app.db writes/list handling
+// can wedge or corrupt the whole process. spawn_mount_job CAS-guards entry;
+// the worker clears the flag on both the normal and crash paths.
+static int g_mount_running = 0;
+
 // The real scan/mount/registration body — runs inside the crash guard of
 // mount_games_worker so a faulting Sce call can never take the server down.
 static void mount_games_body(mount_job_t* job, int sock);
@@ -5489,15 +5567,21 @@ static void* mount_games_worker(void* arg) {
         mount_games_body(job, sock);
         t_wdg_armed = 0;
     } else {
-        // Crash path: release locks this thread may have been holding so the
-        // process stays responsive for the next command.
+        // Crash path. NOTE: do NOT blindly unlock mutexes here — unlocking a
+        // mutex this thread does not own is UB and crashed the process right
+        // after the longjmp (observed: second SIGBUS -> SIG_DFL -> dead
+        // payload). The body's only mutex window is the short list-reset, and
+        // g_extendedinfo_lock is never taken on this path at all.
+        dbg_log("mount WORKER CRASHED (longjmp)\n");
         t_wdg_armed = 0;
-        unlock_mounted_ids();
-        pthread_mutex_unlock(&g_extendedinfo_lock);
         __atomic_store_n(&job->done, 1, __ATOMIC_SEQ_CST);
+        dbg_log("cp> send_resp\n");
         send_resp_locked(sock, RESP_ERROR, "Mount worker crashed (contained)", 31);
+        dbg_log("cp< sent\n");
         progress_socket_clear(sock);
     }
+    dbg_log("mount worker exit\n");
+    __atomic_store_n(&g_mount_running, 0, __ATOMIC_SEQ_CST);
     // job intentionally NOT freed: the heartbeat thread may still be reading
     // job->done (pre-existing pattern, tiny leak).
     return NULL;
@@ -5541,24 +5625,24 @@ static void restart_shellui(void) {
 }
 
 static void mount_games_body(mount_job_t* job, int sock) {
-    // Serialize concurrent mounts: g_mounted_ids is reset here and consumed by
-    // process_game() - two simultaneous Mount Games runs would corrupt it.
-    lock_mounted_ids();
+    dbg_log("mount_body enter\n");
+    dbg_kx("  wtid=0x", (unsigned long)pthread_self());
+    // Reset dedup table: the mount worker is the only writer (serialized by
+    // g_mount_running); readers only sample the count atomically.
+    __atomic_store_n(&g_mounted_count, 0, __ATOMIC_SEQ_CST);
+    dbg_log("mb list cleared\n");
 
-    // Free previous tracking list and start fresh
-    mounted_id_node_t *n = g_mounted_ids;
-    while (n) { mounted_id_node_t *nx = n->next; free(n); n = nx; }
-    g_mounted_ids = NULL;
-    g_mounted_count = 0;
-    unlock_mounted_ids();
-    
     // (AppInstUtil Initialize happens lazily inside register_title() — one
     // shot, watchdog-guarded.)
-    
+
     // Remount /system_ex as writable
+    dbg_log("mb remount>\n");
     remount_system_ex();
-    
+    dbg_log("mb remount<\n");
+
+    dbg_log("mb aum>\n");
     int cleaned = auto_unmount_deleted_games();
+    dbg_kv("mount_body cleaned=", (unsigned long)cleaned);
 
     int mounted_count = 0;
     int skipped_count = 0;
@@ -5620,9 +5704,11 @@ static void mount_games_body(mount_job_t* job, int sock) {
                 continue;
 
             current_game++;
+            dbg_log("pg> "); dbg_log(e->d_name); dbg_log("\n");
             char game_name[256] = {};
             char title_id[12] = {};
             int result = process_game(game_path, game_name, sizeof(game_name), title_id, sizeof(title_id));
+            dbg_kv("pg< result=", (unsigned long)result);
             
             if (result == 0) {
                 // Successfully mounted
@@ -5709,8 +5795,10 @@ static void mount_games_body(mount_job_t* job, int sock) {
     // done BEFORE the final OK so the heartbeat can never interleave a
     // progress frame with the response (mirrors the unmount worker).
     __atomic_store_n(&job->done, 1, __ATOMIC_SEQ_CST);
+    dbg_log("mount_body sending final OK\n");
     send_ok(sock, response);
     progress_socket_clear(sock);
+    dbg_log("mount_body done\n");
 
     // Direct-DB registration bypasses the daemon, so nothing tells the UI
     // that the registry changed — bounce SceShellUI so new icons appear (and
@@ -5746,8 +5834,15 @@ static void* mount_games_heartbeat(void* arg) {
 // dead and had to be killed from the Toolbox. Now the command loop returns
 // immediately and RESP_PROGRESS lines keep the client fed.
 static void spawn_mount_job(client_session_t *session, const char *title_filter) {
+    // One mount at a time — a second click while one runs must not spawn a
+    // parallel worker (see g_mount_running above).
+    if (__atomic_exchange_n(&g_mount_running, 1, __ATOMIC_SEQ_CST)) {
+        send_error(session->sock, "Mount already in progress");
+        return;
+    }
     mount_job_t* job = (mount_job_t*)malloc(sizeof(mount_job_t));
     if (!job) {
+        __atomic_store_n(&g_mount_running, 0, __ATOMIC_SEQ_CST);
         send_error(session->sock, "Out of memory");
         return;
     }
@@ -5772,6 +5867,7 @@ static void spawn_mount_job(client_session_t *session, const char *title_filter)
         if (hb_ok) pthread_cancel(hb_tid);
         pthread_attr_destroy(&at);
         free(job);
+        __atomic_store_n(&g_mount_running, 0, __ATOMIC_SEQ_CST);
         progress_socket_clear(session->sock);
         send_error(session->sock, "Failed to start mount worker");
         return;
@@ -5799,6 +5895,13 @@ void handle_mount_game(client_session_t *session, const char *title_id) {
 
 // Handle GET_GAME_LIST - Get list of all mounted games with details
 void handle_get_game_list(client_session_t *session) {
+    // While a mount/unmount worker runs, concurrent tree walks (this handler
+    // stats paths that nmount is actively binding) can park the thread inside
+    // a vnode lock — refuse early instead.
+    if (__atomic_load_n(&g_mount_running, __ATOMIC_SEQ_CST)) {
+        send_error(session->sock, "Mount in progress");
+        return;
+    }
     char *response = malloc(65536);  // 64KB for game list
     if (!response) {
         send_error(session->sock, "Out of memory");
@@ -5942,6 +6045,10 @@ void handle_get_game_list(client_session_t *session) {
 
 // Handle GET_GAME_ICON - Send icon0.png binary for a given title_id
 void handle_get_game_icon(client_session_t *session, const char *title_id) {
+    if (__atomic_load_n(&g_mount_running, __ATOMIC_SEQ_CST)) {
+        send_error(session->sock, "Mount in progress");
+        return;
+    }
     if (!title_id || strlen(title_id) == 0) {
         send_error(session->sock, "No title ID provided");
         return;
@@ -7207,8 +7314,9 @@ void handle_mem_read(client_session_t *session, const char *arg) {
     uint8_t *buf = malloc(len);
     if (!buf) { send_error(session->sock, "no memory"); return; }
 
-    int got = -3;
-    if (mem_attach(pid) == 0) {
+    int got = kernel_proc_copyout(pid, (intptr_t)addr, buf, len) == 0
+              ? (int)len : -3;
+    if (got <= 0 && mem_attach(pid) == 0) {
         got = mem_io(pid, addr, buf, (size_t)len, PIOD_READ_D);
         mem_detach(pid);
     }
@@ -7233,8 +7341,9 @@ void handle_mem_write(client_session_t *session, const char *arg) {
     int n = hex_decode(a3, buf, strlen(a3) / 2 + 1);
     if (n <= 0) { free(buf); send_error(session->sock, "Empty/invalid hex data"); return; }
 
-    int rc = -3;
-    if (mem_attach(pid) == 0) {
+    int rc = kernel_proc_copyin(pid, buf, (intptr_t)addr, n);
+    if (rc == 0) rc = n;
+    if (rc <= 0 && mem_attach(pid) == 0) {
         rc = mem_io(pid, addr, buf, (size_t)n, PIOD_WRITE_D);
         mem_detach(pid);
     }
@@ -7303,7 +7412,16 @@ void handle_mem_search(client_session_t *session, const char *arg) {
     int plen = hex_decode(a4, pat, sizeof(pat));
     if (plen <= 0) { send_error(session->sock, "Empty/invalid hex pattern"); return; }
 
-    if (mem_attach(pid) != 0) { send_error(session->sock, "Attach failed"); return; }
+    // Try kernel copyout first — works on system procs (SceShellCore) and
+    // execute-only pages where ptrace attach fails.
+    uint8_t buf0[16];
+    int use_kcopy = (kernel_proc_copyout(pid, (intptr_t)start, buf0,
+                     16) == 0);
+    int attached = 0;
+    if (!use_kcopy) {
+        if (mem_attach(pid) != 0) { send_error(session->sock, "Attach failed"); return; }
+        attached = 1;
+    }
 
     const size_t CHUNK = 256 * 1024;
     uint8_t *buf = malloc(CHUNK + 63);
@@ -7315,7 +7433,12 @@ void handle_mem_search(client_session_t *session, const char *arg) {
 
     for (uint64_t pos = start; pos < end && buf && out && off < (int)out_cap - 64; ) {
         size_t want = (size_t)((end - pos) > CHUNK ? CHUNK : (end - pos));
-        int got = mem_io(pid, pos, buf + tail, want, PIOD_READ_D);
+        int got;
+        if (use_kcopy)
+            got = (kernel_proc_copyout(pid, (intptr_t)pos, buf + tail,
+                   want) == 0) ? (int)want : 0;
+        else
+            got = mem_io(pid, pos, buf + tail, want, PIOD_READ_D);
         if (got > 0) {
             size_t span = tail + (size_t)got;
             uint8_t *scan = buf, *hit;
@@ -7335,7 +7458,7 @@ void handle_mem_search(client_session_t *session, const char *arg) {
         pos += want;
         if (truncated || time(NULL) > deadline) { if (!truncated) truncated = 2; break; }
     }
-    mem_detach(pid);
+    if (attached) mem_detach(pid);
     if (truncated == 1) off += snprintf(out + off, out_cap - off, "TRUNCATED\n");
     else if (truncated == 2) off += snprintf(out + off, out_cap - off, "TIMEOUT\n");
     if (found == 0 && off == 0)
@@ -8373,148 +8496,6 @@ void handle_pad_info(client_session_t *session) {
 }
 
 // ============================================================================
-// DISC DUMP — copy an inserted disc (/mnt/disc*) to /user/data/disc_dumps on
-// a background thread. Pure filesystem work — no daemon IPC — so it is safe
-// under every loader. Progress is polled through "status"; "cancel" stops it.
-// ============================================================================
-static volatile int g_dump_active = 0, g_dump_cancel = 0;
-static uint64_t g_dump_done = 0, g_dump_total = 0;
-static int g_dump_files = 0;
-static char g_dump_file[1024] = {0};
-static char g_dump_err[256] = {0};
-static char g_dump_dest[1024] = {0};
-
-static int find_disc_mount(char *out, size_t n) {
-    static const char *cand[] = {
-        "/mnt/disc", "/mnt/disc0", "/mnt/disc1", "/disc", "/mnt/cdrom", NULL
-    };
-    for (int i = 0; cand[i]; i++) {
-        DIR *d = opendir(cand[i]);
-        if (d) { closedir(d); snprintf(out, n, "%s", cand[i]); return 0; }
-    }
-    return -1;
-}
-
-static int mkdir_p(const char *path) {
-    char tmp[2048];
-    snprintf(tmp, sizeof(tmp), "%s", path);
-    for (char *p = tmp + 1; *p; p++) {
-        if (*p == '/') { *p = 0; mkdir(tmp, 0755); *p = '/'; }
-    }
-    return mkdir(tmp, 0755);
-}
-
-static void count_tree(const char *src, uint64_t *bytes) {
-    DIR *d = opendir(src);
-    if (!d) return;
-    struct dirent *e;
-    while ((e = readdir(d)) && !g_dump_cancel) {
-        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
-        char p[2048];
-        snprintf(p, sizeof(p), "%s/%s", src, e->d_name);
-        struct stat st;
-        if (stat(p, &st) != 0) continue;
-        if (S_ISDIR(st.st_mode)) count_tree(p, bytes);
-        else *bytes += (uint64_t)st.st_size;
-    }
-    closedir(d);
-}
-
-static void dump_tree(const char *src, const char *dst) {
-    if (g_dump_cancel) return;
-    DIR *d = opendir(src);
-    if (!d) return;
-    mkdir_p(dst);
-    struct dirent *e;
-    uint8_t *buf = malloc(256 * 1024);
-    while ((e = readdir(d)) && !g_dump_cancel) {
-        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
-        char sp[2048], dp[2048];
-        snprintf(sp, sizeof(sp), "%s/%s", src, e->d_name);
-        snprintf(dp, sizeof(dp), "%s/%s", dst, e->d_name);
-        struct stat st;
-        if (stat(sp, &st) != 0) continue;
-        if (S_ISDIR(st.st_mode)) { dump_tree(sp, dp); continue; }
-        int in = open(sp, O_RDONLY);
-        if (in < 0) continue;
-        int out = open(dp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (out < 0) { close(in); continue; }
-        snprintf(g_dump_file, sizeof(g_dump_file), "%s", e->d_name);
-        g_dump_files++;
-        ssize_t r;
-        while ((r = read(in, buf, 256 * 1024)) > 0) {
-            if (g_dump_cancel) break;
-            ssize_t w = 0;
-            while (w < r) {
-                ssize_t x = write(out, buf + w, r - w);
-                if (x <= 0) break;
-                w += x;
-            }
-            g_dump_done += (uint64_t)r;
-        }
-        close(in);
-        close(out);
-    }
-    free(buf);
-    closedir(d);
-}
-
-static void *disc_dump_worker(void *arg) {
-    char *src = (char *)arg;
-    count_tree(src, &g_dump_total);
-    dump_tree(src, g_dump_dest);
-    g_dump_active = 0;
-    free(src);
-    return NULL;
-}
-
-void handle_disc_dump(client_session_t *session, const char *arg) {
-    if (!arg || !*arg) { send_error(session->sock, "usage: start|status|cancel"); return; }
-    if (!strcmp(arg, "status")) {
-        char st[1600];
-        int n = snprintf(st, sizeof(st), "active=%d|done=%llu|total=%llu|files=%d|file=%s|err=%s|dest=%s",
-            g_dump_active, (unsigned long long)g_dump_done,
-            (unsigned long long)g_dump_total, g_dump_files, g_dump_file,
-            g_dump_err, g_dump_dest);
-        send_response(session->sock, RESP_DATA, st, n);
-        return;
-    }
-    if (!strcmp(arg, "cancel")) {
-        g_dump_cancel = 1;
-        send_response(session->sock, RESP_OK, "cancelled", 9);
-        return;
-    }
-    if (!strcmp(arg, "start")) {
-        if (g_dump_active) { send_error(session->sock, "dump already running"); return; }
-        char src[64];
-        if (find_disc_mount(src, sizeof(src)) != 0) {
-            send_error(session->sock, "no disc mounted (insert a disc)");
-            return;
-        }
-        const char *base = strrchr(src, '/');
-        base = base ? base + 1 : src;
-        snprintf(g_dump_dest, sizeof(g_dump_dest), "/user/data/disc_dumps/%s", base);
-        g_dump_done = g_dump_total = 0;
-        g_dump_files = 0;
-        g_dump_err[0] = g_dump_file[0] = 0;
-        g_dump_cancel = 0;
-        g_dump_active = 1;
-        pthread_t t;
-        char *arg_copy = strdup(src);
-        if (pthread_create(&t, NULL, disc_dump_worker, arg_copy) != 0) {
-            g_dump_active = 0;
-            free(arg_copy);
-            send_error(session->sock, "thread start failed");
-            return;
-        }
-        pthread_detach(t);
-        send_response(session->sock, RESP_OK, g_dump_dest, strlen(g_dump_dest));
-        return;
-    }
-    send_error(session->sock, "usage: start|status|cancel");
-}
-
-// ============================================================================
 // SCREENSHOT — sceScreenShotCapture() asks ShellUI to grab whatever is on
 // screen right now. Daemon IPC → etaHEN guard + watchdog worker.
 // ============================================================================
@@ -9310,15 +9291,18 @@ static void* unmount_worker(void* arg) {
         unmount_body(job);
         t_wdg_armed = 0;
     } else {
-        // Crash path: keep the process alive and release locks we might hold.
+        dbg_log("unmount WORKER CRASHED (longjmp)\n");
+        // Crash path: keep the process alive. No blind mutex unlocks —
+        // unlocking an unowned mutex is UB and can kill the process here.
         t_wdg_armed = 0;
-        pthread_mutex_unlock(&g_extendedinfo_lock);
         char msg[256];
         snprintf(msg, sizeof(msg), "Unmount of %s crashed (contained)", job->title_id);
         __atomic_store_n(&job->done, 1, __ATOMIC_SEQ_CST);
         send_resp_locked(sock, RESP_ERROR, msg, (uint32_t)strlen(msg) + 1);
         progress_socket_clear(sock);
     }
+    dbg_log("unmount worker exit\n");
+    __atomic_store_n(&g_mount_running, 0, __ATOMIC_SEQ_CST);
     free(job);
     return NULL;
 }
@@ -9327,9 +9311,11 @@ static void unmount_body(unmount_job_t* job) {
     const char* title_id = job->title_id;
     int sock = job->client_sock;
 
+    dbg_log("unmount_body enter\n");
     // game_mounter model — unmount the nullfs FIRST, then delete the
     // /user/app + /user/appmeta dirs. No registry IPC at all.
     int busy = full_title_cleanup(title_id, send_progress_message);
+    dbg_kv("unmount_body busy=", (unsigned long)busy);
 
     char msg[256];
     if (busy) {
@@ -9384,8 +9370,16 @@ void handle_unmount_game(client_session_t *session, const char *title_id) {
         return;
     }
 
+    // Same one-FS-op-at-a-time rule as mount — a concurrent unmount+mount
+    // races on the same vnodes/registry rows.
+    if (__atomic_exchange_n(&g_mount_running, 1, __ATOMIC_SEQ_CST)) {
+        send_error(session->sock, "Mount/unmount already in progress");
+        return;
+    }
+
     unmount_job_t* job = (unmount_job_t*)malloc(sizeof(unmount_job_t));
     if (!job) {
+        __atomic_store_n(&g_mount_running, 0, __ATOMIC_SEQ_CST);
         send_error(session->sock, "Out of memory");
         return;
     }
@@ -9409,6 +9403,7 @@ void handle_unmount_game(client_session_t *session, const char *title_id) {
         if (hb_ok) pthread_cancel(hb_tid);
         pthread_attr_destroy(&at);
         free(job);
+        __atomic_store_n(&g_mount_running, 0, __ATOMIC_SEQ_CST);
         progress_socket_clear(session->sock);
         send_error(session->sock, "Failed to start unmount worker");
         return;
@@ -10991,6 +10986,2671 @@ void handle_shell_close(client_session_t *session) {
     send_ok(session->sock, "Shell session closed");
 }
 
+// ============================================================================
+// TROPHY VIEWER (NpTrophy V2) — read-only listing of registered trophy sets.
+// On-device layout (verified):
+//   /user/trophy2/nobackup/conf/<NPWR>/TROPHY.UCP        per-set archive
+//   /system_data/priv/appmeta/<TID>/trophy2/npbind.dat   embeds "NPWRxxxxx_00"
+//   /user/app/<TID>/sce_sys/trophy2/npbind.dat           fallback map source
+//   /user/home/<uid>/trophy2/nobackup/data/<NPWR>/TRPTITLE.DAT  per-user state
+// ============================================================================
+
+static uint32_t rd32be(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+static uint64_t rd64be(const uint8_t *p) {
+    return ((uint64_t)rd32be(p) << 32) | rd32be(p + 4);
+}
+
+// Extract one entry from a UCP archive. name == NULL → no-op; prefix mode via
+// ucp_extract_prefix. Returns malloc'd blob (caller frees) or -1.
+static int ucp_extract(const char *path, const char *name, uint8_t **out, size_t *out_sz) {
+    *out = NULL; *out_sz = 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    uint8_t hdr[0x40];
+    if (fread(hdr, 1, sizeof(hdr), f) != sizeof(hdr) || rd32be(hdr) != 0xB228C60A) {
+        fclose(f); return -1;
+    }
+    uint32_t n = rd32be(hdr + 0x10), toc = rd32be(hdr + 0x14);
+    if (n > 4096 || toc < 0x40 || toc > 0x1000000) { fclose(f); return -1; }
+    for (uint32_t i = 0; i < n; i++) {
+        uint8_t e[0x40];
+        if (fseek(f, (long)(toc + 0x20 + i * 0x40), SEEK_SET) != 0) break;
+        if (fread(e, 1, 0x40, f) != 0x40) break;
+        char nm[0x21];
+        memcpy(nm, e, 0x20); nm[0x20] = 0;
+        if (strcmp(nm, name) != 0) continue;
+        uint64_t fo = rd64be(e + 0x20), fs = rd64be(e + 0x28);
+        if (fs == 0 || fs > 16u * 1024 * 1024) { fclose(f); return -1; }
+        uint8_t *b = (uint8_t *)malloc((size_t)fs + 1);
+        if (!b) { fclose(f); return -1; }
+        if (fseek(f, (long)fo, SEEK_SET) != 0 || fread(b, 1, (size_t)fs, f) != fs) {
+            free(b); fclose(f); return -1;
+        }
+        fclose(f);
+        b[fs] = 0;
+        *out = b; *out_sz = (size_t)fs;
+        return 0;
+    }
+    fclose(f);
+    return -1;
+}
+
+// First entry whose name starts with `prefix` (e.g. "tropmeta_" when the
+// preferred language file is absent).
+static int ucp_extract_prefix(const char *path, const char *prefix,
+                              uint8_t **out, size_t *out_sz, char *found_name, size_t fn_sz) {
+    *out = NULL; *out_sz = 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    uint8_t hdr[0x40];
+    if (fread(hdr, 1, sizeof(hdr), f) != sizeof(hdr) || rd32be(hdr) != 0xB228C60A) {
+        fclose(f); return -1;
+    }
+    uint32_t n = rd32be(hdr + 0x10), toc = rd32be(hdr + 0x14);
+    if (n > 4096 || toc < 0x40 || toc > 0x1000000) { fclose(f); return -1; }
+    for (uint32_t i = 0; i < n; i++) {
+        uint8_t e[0x40];
+        if (fseek(f, (long)(toc + 0x20 + i * 0x40), SEEK_SET) != 0) break;
+        if (fread(e, 1, 0x40, f) != 0x40) break;
+        char nm[0x21];
+        memcpy(nm, e, 0x20); nm[0x20] = 0;
+        if (strncmp(nm, prefix, strlen(prefix)) != 0) continue;
+        uint64_t fo = rd64be(e + 0x20), fs = rd64be(e + 0x28);
+        if (fs == 0 || fs > 16u * 1024 * 1024) { fclose(f); return -1; }
+        uint8_t *b = (uint8_t *)malloc((size_t)fs + 1);
+        if (!b) { fclose(f); return -1; }
+        if (fseek(f, (long)fo, SEEK_SET) != 0 || fread(b, 1, (size_t)fs, f) != fs) {
+            free(b); fclose(f); return -1;
+        }
+        fclose(f);
+        b[fs] = 0;
+        if (found_name && fn_sz) snprintf(found_name, fn_sz, "%s", nm);
+        *out = b; *out_sz = (size_t)fs;
+        return 0;
+    }
+    fclose(f);
+    return -1;
+}
+
+// Pull "NPWRxxxxx_00" out of an npbind.dat blob. Returns 1 if found.
+static int npbind_npwr(const char *path, char out[16]) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    uint8_t buf[4096];
+    size_t n = fread(buf, 1, sizeof(buf), f);
+    fclose(f);
+    for (size_t i = 0; i + 12 <= n; i++) {
+        if (!memcmp(buf + i, "NPWR", 4)) {
+            memcpy(out, buf + i, 12);
+            out[12] = 0;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// NPWR → title_id map built from npbind.dat files (appmeta + live game dirs).
+typedef struct { char npwr[16]; char tid[16]; } npwr_map_t;
+static int build_npwr_map(npwr_map_t *map, int max) {
+    int count = 0;
+    const char *roots[] = {
+        "/system_data/priv/appmeta",
+        "/user/app",
+        NULL
+    };
+    for (int r = 0; roots[r] && count < max; r++) {
+        DIR *d = opendir(roots[r]);
+        if (!d) continue;
+        struct dirent *e;
+        while ((e = readdir(d)) && count < max) {
+            if (e->d_name[0] == '.') continue;
+            char p[PATH_MAX];
+            snprintf(p, sizeof(p), "%s/%s/trophy2/npbind.dat", roots[r], e->d_name);
+            char npwr[16];
+            if (npbind_npwr(p, npwr)) {
+                snprintf(map[count].npwr, sizeof(map[count].npwr), "%s", npwr);
+                snprintf(map[count].tid, sizeof(map[count].tid), "%s", e->d_name);
+                count++;
+            }
+        }
+        closedir(d);
+    }
+    return count;
+}
+
+static const char *npwr_to_tid(npwr_map_t *map, int n, const char *npwr) {
+    for (int i = 0; i < n; i++)
+        if (!strcmp(map[i].npwr, npwr)) return map[i].tid;
+    return "";
+}
+
+// access() lies in this sandboxed runtime — stat() is the reliable probe.
+static int file_exists(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+// Locate the TROPHY.UCP for an NPWR id. Prefers the registered conf copy;
+// falls back to the installed appmeta copy, then the live game dir.
+static int find_trophy_ucp(const char *npwr, const char *tid, char *out, size_t out_sz) {
+    snprintf(out, out_sz, "/user/trophy2/nobackup/conf/%s/TROPHY.UCP", npwr);
+    if (file_exists(out)) return 0;
+    if (tid && *tid) {
+        snprintf(out, out_sz, "/system_data/priv/appmeta/%s/trophy2/trophy00.ucp", tid);
+        if (file_exists(out)) return 0;
+        snprintf(out, out_sz, "/user/app/%s/sce_sys/trophy2/trophy00.ucp", tid);
+        if (file_exists(out)) return 0;
+    }
+    return -1;
+}
+
+// Read a whole file (cap 1 MB) into malloc'd buffer — TRPTITLE.DAT is ~10-20KB.
+static int read_whole_file(const char *path, uint8_t **out, size_t *out_sz) {
+    *out = NULL; *out_sz = 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    if (sz <= 0 || sz > 1024 * 1024) { fclose(f); return -1; }
+    rewind(f);
+    uint8_t *b = (uint8_t *)malloc((size_t)sz);
+    if (!b) { fclose(f); return -1; }
+    if (fread(b, 1, (size_t)sz, f) != (size_t)sz) { free(b); fclose(f); return -1; }
+    fclose(f);
+    *out = b; *out_sz = (size_t)sz;
+    return 0;
+}
+
+// Response body layout (all integers little-endian, network order of our
+// protocol):
+//   u16 count
+//   per set: u8 npwrLen|npwr, u8 tidLen|tid, u8 uidLen|uid,
+//            u32 confLen|tropconf.json, u32 metaLen|tropmeta.json,
+//            u32 trpLen|TRPTITLE.DAT (0 if the user never registered it)
+void handle_trophy_list(client_session_t *session) {
+    // Collect NPWR ids that actually have a conf archive (registered sets).
+    DIR *conf = opendir("/user/trophy2/nobackup/conf");
+    if (!conf) { send_error(session->sock, "No trophy storage found"); return; }
+    dbg_log("tl conf open\n");
+
+    npwr_map_t map[96];
+    int mapn = build_npwr_map(map, 96);
+    dbg_kv("tl mapn=", (unsigned long)mapn);
+
+    // Worst case per set: ~600KB (ucp blobs + trptitle) — 64 sets cap.
+    size_t cap = 16u * 1024 * 1024;
+    uint8_t *buf = (uint8_t *)malloc(cap);
+    if (!buf) { closedir(conf); send_error(session->sock, "Out of memory"); return; }
+    size_t off = 2;   // count backfilled at the end
+    int count = 0;
+
+    struct dirent *e;
+    while ((e = readdir(conf)) && count < 64) {
+        dbg_log("tl ent "); dbg_log(e->d_name); dbg_log("\n");
+        if (strncmp(e->d_name, "NPWR", 4) != 0) continue;
+        const char *npwr = e->d_name;
+
+        char ucp_path[PATH_MAX];
+        snprintf(ucp_path, sizeof(ucp_path),
+                 "/user/trophy2/nobackup/conf/%s/TROPHY.UCP", npwr);
+        if (!file_exists(ucp_path)) {
+            const char *tid0 = npwr_to_tid(map, mapn, npwr);
+            if (find_trophy_ucp(npwr, tid0, ucp_path, sizeof(ucp_path)) != 0) {
+                dbg_log("tl skip ucp\n"); continue;
+            }
+        }
+        const char *tid = npwr_to_tid(map, mapn, npwr);
+
+        uint8_t *cf = NULL, *mt = NULL; size_t cfs = 0, mts = 0;
+        if (ucp_extract(ucp_path, "tropconf.json", &cf, &cfs) != 0) {
+            dbg_log("tl skip conf\n"); continue;
+        }
+
+        // Language pick: conf's defaultLanguage → tropmeta_<lang>.json, else
+        // en-US, else first tropmeta_* present.
+        char meta_name[64] = "tropmeta_en-US.json";
+        const char *dl = cf ? strstr((const char *)cf, "\"defaultLanguage\":\"") : NULL;
+        if (dl) {
+            dl += 18;
+            const char *end = strchr(dl, '"');
+            if (end && end - dl < 16)
+                snprintf(meta_name, sizeof(meta_name), "tropmeta_%.*s.json", (int)(end - dl), dl);
+        }
+        if (ucp_extract(ucp_path, meta_name, &mt, &mts) != 0) {
+            if (strcmp(meta_name, "tropmeta_en-US.json") != 0)
+                ucp_extract(ucp_path, "tropmeta_en-US.json", &mt, &mts);
+            if (!mt)
+                ucp_extract_prefix(ucp_path, "tropmeta_", &mt, &mts, NULL, 0);
+        }
+
+        // Per-user unlock state (T2PD/TRPTITLE.DAT) — first uid that has it.
+        uint8_t *trp = NULL; size_t trp_sz = 0;
+        char uid[32] = "";
+        DIR *home = opendir("/user/home");
+        if (home) {
+            struct dirent *he;
+            while ((he = readdir(home))) {
+                if (he->d_name[0] == '.') continue;
+                char tp[PATH_MAX];
+                snprintf(tp, sizeof(tp),
+                         "/user/home/%s/trophy2/nobackup/data/%s/TRPTITLE.DAT",
+                         he->d_name, npwr);
+                if (read_whole_file(tp, &trp, &trp_sz) == 0) {
+                    snprintf(uid, sizeof(uid), "%s", he->d_name);
+                    break;
+                }
+            }
+            closedir(home);
+        }
+
+        size_t need = 1 + strlen(npwr) + 1 + strlen(tid) + 1 + strlen(uid)
+                    + 4 + cfs + 4 + mts + 4 + trp_sz;
+        if (off + need >= cap) { free(cf); free(mt); free(trp); break; }
+
+        buf[off++] = (uint8_t)strlen(npwr); memcpy(buf + off, npwr, strlen(npwr)); off += strlen(npwr);
+        buf[off++] = (uint8_t)strlen(tid);  memcpy(buf + off, tid, strlen(tid));   off += strlen(tid);
+        buf[off++] = (uint8_t)strlen(uid);  memcpy(buf + off, uid, strlen(uid));   off += strlen(uid);
+        uint32_t l;
+        l = (uint32_t)cfs;   memcpy(buf + off, &l, 4); off += 4; memcpy(buf + off, cf, cfs); off += cfs;
+        l = (uint32_t)mts;   memcpy(buf + off, &l, 4); off += 4; if (mt) { memcpy(buf + off, mt, mts); off += mts; }
+        l = (uint32_t)trp_sz;memcpy(buf + off, &l, 4); off += 4; if (trp) { memcpy(buf + off, trp, trp_sz); off += trp_sz; }
+        free(cf); free(mt); free(trp);
+        count++;
+    }
+    closedir(conf);
+
+    uint16_t c16 = (uint16_t)count;
+    memcpy(buf, &c16, 2);
+    dbg_kv("tl count=", (unsigned long)count);
+    dbg_kv("tl bytes=", (unsigned long)off);
+    send_response(session->sock, RESP_DATA, buf, (uint32_t)off);
+    free(buf);
+}
+
+// "NPWR|entry.png" — raw PNG bytes from the set's UCP (icons on demand).
+void handle_trophy_icon(client_session_t *session, const char *arg) {
+    if (!arg || !*arg) { send_error(session->sock, "Usage: NPWR|file.png"); return; }
+    char npwr[16] = {0};
+    const char *bar = strchr(arg, '|');
+    if (!bar || bar - arg >= 15) { send_error(session->sock, "Usage: NPWR|file.png"); return; }
+    memcpy(npwr, arg, bar - arg);
+    const char *entry = bar + 1;
+    // Path traversal guard — entry names are flat PNG filenames only.
+    if (strchr(entry, '/') || strstr(entry, "..") || !*entry) {
+        send_error(session->sock, "Bad entry name");
+        return;
+    }
+    char ucp_path[PATH_MAX];
+    if (find_trophy_ucp(npwr, "", ucp_path, sizeof(ucp_path)) != 0) {
+        send_error(session->sock, "Trophy set not found");
+        return;
+    }
+    uint8_t *png = NULL; size_t sz = 0;
+    if (ucp_extract(ucp_path, entry, &png, &sz) != 0) {
+        // Localized icon variants (icon0_ja-JP.png etc.) — fall back to the
+        // first icon0* entry when the exact name misses.
+        if (strncmp(entry, "icon0", 5) == 0 &&
+            ucp_extract_prefix(ucp_path, "icon0", &png, &sz, NULL, 0) != 0) {
+            send_error(session->sock, "Icon not found in archive");
+            return;
+        } else if (strncmp(entry, "icon0", 5) != 0) {
+            send_error(session->sock, "Icon not found in archive");
+            return;
+        }
+    }
+    send_response(session->sock, RESP_DATA, png, (uint32_t)sz);
+    free(png);
+}
+
+// ============================================================================
+// TROPHY UNLOCK (CMD 0x82) — "unlock:<id|all>" / "lock:<id>"
+// Routes through the trophy daemon's own debug API
+// (sceNpTrophy2SystemDebugUnlockTrophy → IPMI unlock job) so TRPTITLE.DAT is
+// updated by Sony's code path — correct mask, timestamps and section hashes.
+//
+// The daemon binds the npCommunicationId from the CALLING process, so the
+// target game must be RUNNING: we borrow its address space with the same
+// PT_ATTACH/register-hijack remote-call machinery as the ShellCore pad borrow.
+// ============================================================================
+static int trp_find_trophy_proc(uint32_t *tr2h_out, char *diag, size_t dsz) {
+    if (diag) diag[0] = 0;
+    // Prefer the game executable names.
+    static const char *names[] = { "eboot.bin", "eboot", NULL };
+    for (int i = 0; names[i]; i++) {
+        pid_t p = proc_find_name(names[i]);
+        if (p > 0) {
+            uint32_t h = 0;
+            if (krpc_dynlib_handle(p, "libSceNpTrophy2.sprx", &h) == 0 && h) {
+                *tr2h_out = h;
+                return p;
+            }
+            if (diag) snprintf(diag + strlen(diag), dsz - strlen(diag),
+                               " eboot:%d(noLib)", (int)p);
+        }
+    }
+    // Walk all processes; collect every candidate, prefer an eboot-like comm.
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
+    size_t len = 0;
+    if (sysctl(mib, 4, NULL, &len, NULL, 0) != 0 || !len) return -1;
+    uint8_t *buf = malloc(len);
+    pid_t found = -1;
+    if (buf && sysctl(mib, 4, buf, &len, NULL, 0) == 0) {
+        size_t sz = ((struct kinfo_proc *)buf)->ki_structsize;
+        for (uint8_t *p = buf; p < buf + len && sz; p += sz) {
+            struct kinfo_proc *ki = (struct kinfo_proc *)p;
+            if (ki->ki_pid == getpid() || ki->ki_pid <= 0) continue;
+            uint32_t h = 0;
+            if (krpc_dynlib_handle(ki->ki_pid, "libSceNpTrophy2.sprx", &h) == 0 && h) {
+                if (diag && strlen(diag) < dsz - 48)
+                    snprintf(diag + strlen(diag), dsz - strlen(diag),
+                             " %d:%s", (int)ki->ki_pid, ki->ki_comm);
+                if (found < 0) { found = ki->ki_pid; *tr2h_out = h; }
+                if (ki->ki_comm[0] && strstr(ki->ki_comm, "eboot")) {
+                    found = ki->ki_pid; *tr2h_out = h; break;
+                }
+            }
+        }
+    }
+    free(buf);
+    return found;
+}
+
+// Async libSceNpTrophy unlock job. Every NP API call below can wedge inside
+// kernel IPC (module load, daemon roundtrip) — they must NEVER run on the
+// command thread. The worker writes progress to a shared buffer so a hung
+// worker still shows exactly which step blocked.
+struct nplib_job {
+    volatile int running;
+    volatile int step;
+    volatile int done;
+    int single;                 // -1 = all
+    char commid[16];            // optional explicit commId ("" = auto)
+    char buf[3072];
+    volatile int len;
+};
+static struct nplib_job g_nplib;
+
+static void nplib_log(const char *fmt, ...) {
+    if (g_nplib.len >= (int)sizeof(g_nplib.buf) - 160) return;
+    va_list ap; va_start(ap, fmt);
+    int n = vsnprintf(g_nplib.buf + g_nplib.len, sizeof(g_nplib.buf) - g_nplib.len, fmt, ap);
+    va_end(ap);
+    if (n > 0) g_nplib.len += n;
+}
+
+static void *nplib_worker(void *unused) {
+    (void)unused;
+    pid_t me = getpid();
+    uint64_t oa = kernel_get_ucred_authid(me);
+    kernel_set_ucred_authid(me, 0x4800000000010003ULL);
+
+    // crash pad: a bad signature/segv bounces back here instead of killing
+    // the whole payload process.
+    wdg_install_handler();
+    if (sigsetjmp(t_wdg_jmp, 1) != 0) {
+        t_wdg_armed = 0;
+        nplib_log("CRASHED at step %d\n", g_nplib.step);
+        kernel_set_ucred_authid(me, oa);
+        g_nplib.done = 1;
+        return NULL;
+    }
+    t_wdg_armed = 1;
+
+    // hoisted so nplib_out cleanup is safe from every goto
+    int (*pGetRunning)(int, void*) = NULL;
+    int (*pCreateCtx)(int*, const void*, void*, int) = NULL;
+    int (*pCreateHnd)(int*) = NULL;
+    int (*pRegister)(int, int, int, int) = NULL;
+    int (*pGameInfo)(int, int, void*, int) = NULL;
+    int (*pUnlock)(int, int, int, int*) = NULL;
+    int (*pDestroyH)(int) = NULL;
+    int (*pDestroyC)(int) = NULL;
+    int ctx = -1, hnd = -1;
+
+    // --- step 1: resolve helpers. NEVER call sceKernelLoadStartModule — it
+    // wedges the whole process in kernel IPC (see get_module_handle note). ---
+    g_nplib.step = 1;
+    resolve_extendedinfo_functions();
+    uint32_t kh = find_kernel_module_handle();
+    int (*pKDlsym)(int, const char*, void*) = NULL;
+    if (kh) {
+        char nb[12]; nid_encode("sceKernelDlsym", nb);
+        pKDlsym = (void*)krpc_resolve_sym(me, kh, nb);
+        if (!pKDlsym) pKDlsym = (void*)krpc_dlsym_checked(me, kh, "sceKernelDlsym");
+    }
+    int (*pSysmodLoad)(int) = NULL;
+    int (*pSysmodHandle)(int, int*) = NULL;
+    uint32_t smh = 0;
+    if (krpc_dynlib_handle(me, "libSceSysmodule.sprx", &smh) == 0 && smh) {
+        pSysmodLoad   = (void*)krpc_dlsym_checked(me, smh, "sceSysmoduleLoadModuleInternal");
+        pSysmodHandle = (void*)krpc_dlsym_checked(me, smh, "sceSysmoduleGetModuleHandleInternal");
+    }
+    nplib_log("kh=%u dlsym=%p sysmod(load=%p geth=%p) modlist=%p modinfo=%p\n",
+              kh, (void*)pKDlsym, (void*)pSysmodLoad, (void*)pSysmodHandle,
+              (void*)g_sceKernelGetModuleList, (void*)g_sceKernelGetModuleInfo);
+
+    // --- step 2: sysmodule loads ONLY (LoadStartModule wedges the process) ---
+    g_nplib.step = 2;
+    int smh22 = 0, smh20 = 0;
+    if (pSysmodLoad) {
+        int rc;
+        rc = pSysmodLoad(0x80000022);
+        nplib_log("sysmodLoad(0x80000022)=0x%x\n", rc);
+        if (rc == 0 && pSysmodHandle) pSysmodHandle(0x80000022, &smh22);
+        rc = pSysmodLoad(0x80000020);
+        nplib_log("sysmodLoad(0x80000020)=0x%x\n", rc);
+        if (rc == 0 && pSysmodHandle) pSysmodHandle(0x80000020, &smh20);
+    }
+
+    // --- step 2b: find dynlib handles. GetModuleList/GetModuleInfo are direct
+    // in-process syscalls (no RPC channel) — safe after sysmodule load. ---
+    uint32_t th = 0, th1 = 0, th2 = 0;
+    if (g_sceKernelGetModuleList && g_sceKernelGetModuleInfo) {
+        uint32_t hs[256]; size_t cnt = 0;
+        int lrc = g_sceKernelGetModuleList(hs, 256, &cnt);
+        nplib_log("GetModuleList rc=%d cnt=%zu\n", lrc, cnt);
+        if (lrc == 0) {
+            for (size_t i = 0; i < cnt && i < 256; i++) {
+                unsigned char mi[0x200]; memset(mi, 0, sizeof(mi));
+                *(uint64_t*)mi = sizeof(mi);
+                if (g_sceKernelGetModuleInfo(hs[i], mi, sizeof(mi)) != 0) continue;
+                const char *nm = (const char*)mi + 8;
+                nplib_log("  mod h=%u '%s'\n", hs[i], nm);
+                if (strstr(nm, "Trophy2")) { if (!th2) th2 = hs[i]; }
+                else if (strstr(nm, "Trophy") || strstr(nm, "trophy")) { if (!th1) th1 = hs[i]; }
+            }
+        }
+    }
+    // walk own vmmap — sysmodule-loaded libs appear as file-backed regions
+    {
+        int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_VMMAP, me };
+        size_t vsize = 0;
+        if (sysctl(mib, 4, NULL, &vsize, NULL, 0) == 0 && vsize) {
+            char *vb = malloc(vsize + vsize / 4);
+            if (vb) {
+                size_t vs2 = vsize + vsize / 4;
+                if (sysctl(mib, 4, vb, &vs2, NULL, 0) == 0) {
+                    for (char *pp = vb; pp + sizeof(int) <= vb + vs2; ) {
+                        struct kinfo_vmentry *kv = (struct kinfo_vmentry *)pp;
+                        if (kv->kve_structsize <= 0) break;
+                        pp += kv->kve_structsize;
+                        if (kv->kve_path[0])
+                            nplib_log("  vmmap %llx-%llx '%s' p=%x\n",
+                                (unsigned long long)kv->kve_start,
+                                (unsigned long long)kv->kve_end,
+                                kv->kve_path, kv->kve_protection);
+                    }
+                }
+                free(vb);
+            }
+        }
+    }
+    if (!th1) krpc_dynlib_handle(me, "libSceNpTrophy.sprx", &th1);
+    if (!th2) krpc_dynlib_handle(me, "libSceNpTrophy2.sprx", &th2);
+    nplib_log("handles: trophy=%u trophy2=%u\n", th1, th2);
+
+    // --- step 2c: probe exports via sceKernelDlsym (direct, in-process) ---
+    // Candidates: dynlib handles AND the raw sysmodule handles — the kernel
+    // dlsym may accept the sysmodule handle namespace directly.
+    const char *fam = NULL;
+    int cand_h[4] = { (int)th1, (int)th2, smh22, smh20 };
+    const char *cand_tag[4] = { "trophy", "trophy2", "sm22", "sm20" };
+    if (pKDlsym) {
+        for (int i = 0; i < 4; i++) {
+            if (!cand_h[i]) continue;
+            void *pp = NULL;
+            int drc = pKDlsym(cand_h[i], "sceNpTrophyCreateContext", &pp);
+            nplib_log("dlsym %s(%d,CreateCtx)=0x%x p=%p\n", cand_tag[i], cand_h[i], drc, pp);
+            if (!pp) {
+                drc = pKDlsym(cand_h[i], "sceNpTrophy2CreateContext", &pp);
+                nplib_log("dlsym %s(%d,2CreateCtx)=0x%x p=%p\n", cand_tag[i], cand_h[i], drc, pp);
+                if (pp) { th = cand_h[i]; fam = "sceNpTrophy2"; }
+            } else { th = cand_h[i]; fam = "sceNpTrophy"; }
+            if (fam) break;
+        }
+    }
+    // last resort: krpc dlsym on the handles we found
+    if (!fam) {
+        for (int i = 0; i < 4; i++) {
+            if (!cand_h[i]) continue;
+            intptr_t p1 = (intptr_t)krpc_dlsym_checked(me, cand_h[i], "sceNpTrophyCreateContext");
+            intptr_t p2 = (intptr_t)krpc_dlsym_checked(me, cand_h[i], "sceNpTrophy2CreateContext");
+            nplib_log("krpc probe %s(h=%d): v1=%lx v2=%lx\n", cand_tag[i], cand_h[i], (long)p1, (long)p2);
+            if (p1) { th = cand_h[i]; fam = "sceNpTrophy"; break; }
+            if (p2) { th = cand_h[i]; fam = "sceNpTrophy2"; break; }
+        }
+    }
+    nplib_log("th=%u fam=%s\n", th, fam ? fam : "none");
+    if (!th || !fam) goto nplib_out;
+
+    // --- step 3: resolve the exports in the detected family ---
+
+    g_nplib.step = 3;
+    char sn[96];
+    #define NPSYM(field, suffix, proto) do { \
+        snprintf(sn, sizeof(sn), "%s%s", fam, suffix); \
+        void *pp_ = NULL; \
+        int drc_ = pKDlsym ? pKDlsym((int)th, sn, &pp_) : -1; \
+        if (!pp_) pp_ = krpc_dlsym_checked(me, th, sn); \
+        field = (proto)pp_; \
+        nplib_log("  %s rc=%d p=%p\n", sn, drc_, pp_); \
+    } while (0)
+    NPSYM(pGetRunning, "IntGetRunningTitle", int(*)(int,void*));
+    NPSYM(pCreateCtx, "CreateContext", int(*)(int*,const void*,void*,int));
+    NPSYM(pCreateHnd, "CreateHandle", int(*)(int*));
+    NPSYM(pRegister,  "RegisterContext", int(*)(int,int,int,int));
+    NPSYM(pGameInfo,  "GetGameInfo", int(*)(int,int,void*,int));
+    NPSYM(pUnlock,    "UnlockTrophy", int(*)(int,int,int,int*));
+    NPSYM(pDestroyH,  "DestroyHandle", int(*)(int));
+    NPSYM(pDestroyC,  "DestroyContext", int(*)(int));
+    #undef NPSYM
+    nplib_log("getrun=%p cctx=%p chnd=%p reg=%p ginfo=%p unl=%p dh=%p dc=%p\n",
+              (void*)pGetRunning, (void*)pCreateCtx, (void*)pCreateHnd,
+              (void*)pRegister, (void*)pGameInfo, (void*)pUnlock,
+              (void*)pDestroyH, (void*)pDestroyC);
+    if (!pCreateCtx || !pCreateHnd || !pRegister || !pUnlock) goto nplib_out;
+
+    // --- step 4: commId ---
+    g_nplib.step = 4;
+    unsigned char commid[12];
+    memset(commid, 0, sizeof(commid));
+    if (g_nplib.commid[0]) {
+        size_t cl = strlen(g_nplib.commid);
+        memcpy(commid, g_nplib.commid, cl > 11 ? 11 : cl);
+        nplib_log("commId='%s' (explicit)\n", g_nplib.commid);
+    } else {
+        int grc = pGetRunning ? pGetRunning(0, commid) : -1;
+        nplib_log("GetRunningTitle=0x%x comm='%.9s' num=%u\n", grc, commid, commid[10]);
+        if (grc || !commid[0]) goto nplib_out;
+    }
+
+    // --- step 5: context + handle + register ---
+    g_nplib.step = 5;
+    unsigned char unk[0xa0]; memset(unk, 0, sizeof(unk));
+    int rc = pCreateCtx(&ctx, commid, unk, 0);
+    nplib_log("CreateContext=0x%x ctx=%d\n", rc, ctx);
+    if (rc) goto nplib_out;
+    rc = pCreateHnd(&hnd);
+    nplib_log("CreateHandle=0x%x hnd=%d\n", rc, hnd);
+    if (rc) goto nplib_out;
+    rc = pRegister(ctx, hnd, 0, 0);
+    nplib_log("RegisterContext=0x%x\n", rc);
+    // 0x80553921 = already registered — context still usable, continue.
+
+    // --- step 6: unlock ---
+    g_nplib.step = 6;
+    int first2 = g_nplib.single, last2 = g_nplib.single;
+    if (g_nplib.single < 0) {
+        unsigned char gi[0x4a0]; memset(gi, 0, sizeof(gi));
+        *(uint32_t*)gi = sizeof(gi);
+        int grc2 = pGameInfo ? pGameInfo(ctx, hnd, gi, 0) : -1;
+        int count = grc2 == 0 ? (int)*(uint32_t*)(gi + 0xc) : 0;
+        nplib_log("GetGameInfo=0x%x count=%d title='%.40s'\n", grc2, count, gi + 0x20);
+        first2 = 0; last2 = (count > 0 && count <= 128) ? count - 1 : 127;
+    }
+    int ok = 0, already = 0, err = 0;
+    for (int id = first2; id <= last2; id++) {
+        int plat = -1;
+        int urc = pUnlock(ctx, hnd, id, &plat);
+        if (urc == 0) { ok++; nplib_log("  [%d] UNLOCKED plat=%d\n", id, plat); }
+        else if (urc == (int)0x80551611) already++;
+        else if (urc == (int)0x80551606) { }
+        else { err++; nplib_log("  [%d] rc=0x%x\n", id, urc); }
+    }
+    nplib_log("done: %d unlocked, %d already, %d err\n", ok, already, err);
+
+nplib_out:
+    t_wdg_armed = 0;
+    if (pDestroyH && hnd >= 0) pDestroyH(hnd);
+    if (pDestroyC && ctx >= 0) pDestroyC(ctx);
+    kernel_set_ucred_authid(me, oa);
+    g_nplib.done = 1;
+    return NULL;
+}
+
+// ============================================================================
+// REAL TROPHY UNLOCK via the game's own UDS event pipeline.
+// Verified on-device: a properly serialized _UnlockTrophy /
+// _UpdateTrophyProgress event posted through libSceNpUniversalDataSystem is
+// extracted by the UDS daemon into a stat update; the trophy evaluator then
+// grants the trophy and fires a real system notification. Critical detail:
+// the trophy id must live INSIDE the event's properties object — CreateEvent
+// returns that object through its 4th argument (out-param), and the property
+// setters must target it. Fields set on the event itself land at the
+// messagepack root where the extractor never looks (silent drop).
+// ============================================================================
+
+// Bounded substring find — no memmem() in this libc.
+static const char *memfind(const char *h, const char *hend, const char *nd) {
+    size_t nl = strlen(nd);
+    if (!nl) return h;
+    for (; h && h + nl <= hend; h++)
+        if (!memcmp(h, nd, nl)) return h;
+    return NULL;
+}
+
+// Per-trophy unlock plan. The event that unlocks a trophy is resolved from
+// the game's own stats_extraction.json — NOT hardcoded: Astro Bot feeds
+// progressive trophies from custom COUNT__* events with a uint64 "counter"
+// property, while Little Nightmares uses _UnlockTrophy/_UpdateTrophyProgress.
+// evkind: 0=_UnlockTrophy, 1=_UpdateTrophyProgress, 2=custom event, -1 unknown
+typedef struct {
+    int id, prog, target, statid;
+    int evkind, evwide;
+    char evname[64], evprop[64];
+} trop_ent_t;
+
+// Scan the "trophies" array. Each entry that carries an "unlockCondition" is
+// a trophy (group records share the "id" key but lack it). Returns count or -1.
+static int tropconf_parse(const uint8_t *j, size_t n, trop_ent_t *out, int cap) {
+    const char *end = (const char *)j + n;
+    const char *s = memfind((const char *)j, end, "\"trophies\"");
+    if (!s) return -1;
+    int cnt = 0;
+    while (cnt < cap && (s = memfind(s, end, "\"id\":\"")) != NULL) {
+        const char *q = s + 6;
+        const char *nx = memfind(q, end, "\"id\":\"");
+        const char *lim = nx ? nx : end;
+        if (!memfind(q, lim, "\"unlockCondition\"")) { s = q; continue; }
+        out[cnt].id = atoi(q);
+        out[cnt].prog = memfind(q, lim, "\"progressive\":true") != NULL;
+        out[cnt].target = 1;
+        out[cnt].statid = -1;
+        const char *tv = memfind(q, lim, "\"targetValue\":\"");
+        if (tv) { int t = atoi(tv + 15); if (t > 0) out[cnt].target = t; }
+        const char *si = memfind(q, lim, "\"udsStatId\":\"");
+        if (si) out[cnt].statid = atoi(si + 13);
+        out[cnt].evkind = -1; out[cnt].evwide = 0;
+        out[cnt].evname[0] = 0; out[cnt].evprop[0] = 0;
+        cnt++;
+        s = q;
+    }
+    return cnt;
+}
+
+// stats_extraction.json: locate the rule that feeds stat `sid` — a rule's
+// action.output.statId == sid — and return its condition.eventName plus the
+// action.input property path (e.g. "counter" from "$.counter"). Prefers the
+// standard trophy events over custom ones, skips reset/clear rules.
+// Returns 1 on hit.
+static int udsrule_for_stat(const uint8_t *j, size_t n, int sid,
+                            char *evname, size_t esz, char *prop, size_t psz) {
+    const char *end = (const char *)j + n;
+    const char *s = (const char *)j;
+    int kind = -1;
+    char best_ev[64] = "", best_prop[64] = "";
+    while ((s = memfind(s, end, "\"statId\"")) != NULL) {
+        const char *q = s + 8;
+        while (q < end && (*q == ' ' || *q == ':')) q++;
+        if (atoi(q) != sid) { s = q; continue; }
+        // rule starts at the nearest "ruleId" before this statId
+        const char *rs = (const char *)j;
+        for (const char *m = memfind(rs, s, "\"ruleId\""); m;
+             m = memfind(m + 1, s, "\"ruleId\""))
+            rs = m;
+        // eventName: the last "eventName" string value within [rs, s)
+        const char *ev = NULL;
+        for (const char *m = memfind(rs, s, "\"eventName\""); m;
+             m = memfind(m + 1, s, "\"eventName\"")) {
+            const char *v = m + 11;
+            while (v < end && (*v == ' ' || *v == ':')) v++;
+            if (v < end && *v == '"') ev = v + 1;
+        }
+        if (!ev) { s = q; continue; }
+        const char *ne = strchr(ev, '"');
+        if (!ne || ne - ev >= 64) { s = q; continue; }
+        char en[64]; memcpy(en, ev, ne - ev); en[ne - ev] = 0;
+        if (strstr(en, "eset") || strstr(en, "lear")) { s = q; continue; }
+        // input prop: the last "input": "$.X" within [rs, s)
+        const char *ip = NULL;
+        for (const char *m = memfind(rs, s, "\"input\""); m;
+             m = memfind(m + 1, s, "\"input\"")) {
+            const char *v = m + 7;
+            while (v < end && (*v == ' ' || *v == ':')) v++;
+            if (v + 2 < end && v[0] == '"' && v[1] == '$' && v[2] == '.')
+                ip = v + 3;
+        }
+        char pp[64] = "";
+        if (ip) {
+            const char *pe = strchr(ip, '"');
+            if (pe && pe - ip < 64) { memcpy(pp, ip, pe - ip); pp[pe - ip] = 0; }
+        }
+        int k = !strcmp(en, "_UnlockTrophy") ? 0
+              : !strcmp(en, "_UpdateTrophyProgress") ? 1 : 2;
+        if (kind < 0 || k < kind) {
+            kind = k;
+            snprintf(best_ev, sizeof(best_ev), "%s", en);
+            snprintf(best_prop, sizeof(best_prop), "%s", pp);
+        }
+        s = q;
+    }
+    if (kind < 0) return 0;
+    snprintf(evname, esz, "%s", best_ev);
+    snprintf(prop, psz, "%s", best_prop);
+    return 1;
+}
+
+// events_definition.json: is property `prop` of event `ev` declared 64-bit
+// (int64/uint64)? Needed to pick SetInt32 vs SetInt64 — the daemon validates
+// the messagepack type against the schema.
+static int udsprop_is_wide(const uint8_t *j, size_t n,
+                           const char *ev, const char *prop) {
+    const char *end = (const char *)j + n;
+    char nk[96];
+    snprintf(nk, sizeof(nk), "\"%s\"", ev);
+    const char *e = memfind((const char *)j, end, nk);   // matches eventName value
+    if (!e) return 0;
+    snprintf(nk, sizeof(nk), "\"$.%s\"", prop);
+    const char *pp = memfind(e, end, nk);
+    if (!pp) return 0;
+    const char *lim = pp + 200 < end ? pp + 200 : end;
+    const char *dt = memfind(pp, lim, "\"dataType\"");
+    if (!dt) return 0;
+    return memfind(dt, dt + 40 < end ? dt + 40 : end, "64") != NULL;
+}
+
+// pid → title_id via sceKernelGetAppInfo. The field offset varies across
+// app_info layouts — find the "AAAA#####" pattern (PPSA/CUSA/NPXS…) inside
+// the returned struct instead of trusting a fixed offset.
+static int running_game_tid(pid_t pid, char tid[16], char *diag, size_t dsz) {
+    resolve_appmgr_functions();
+    if (!g_sceKernelGetAppInfo) {
+        snprintf(diag, dsz, "noGetAppInfo"); return -1;
+    }
+    app_info_t ai; memset(&ai, 0, sizeof(ai));
+    int grc = g_sceKernelGetAppInfo(pid, &ai);
+    tid[0] = 0;
+    const uint8_t *raw = (const uint8_t *)&ai;
+    for (size_t i = 0; i + 9 <= sizeof(ai) && !tid[0]; i++) {
+        int ok = 1;
+        for (int k = 0; k < 4; k++)
+            if (raw[i + k] < 'A' || raw[i + k] > 'Z') { ok = 0; break; }
+        if (!ok) continue;
+        for (int k = 4; k < 9; k++)
+            if (raw[i + k] < '0' || raw[i + k] > '9') { ok = 0; break; }
+        if (ok) { memcpy(tid, raw + i, 9); tid[9] = 0; }
+    }
+    if (grc != 0 || !tid[0]) {
+        snprintf(diag, dsz, "appinfo rc=%d raw='%.24s'", grc, (const char *)raw);
+        return -1;
+    }
+    return 0;
+}
+
+// The running game's tropconf.json: tid → npbind.dat → NPWR → registered
+// TROPHY.UCP (appmeta/user-app fallbacks).
+static int running_game_tropconf(pid_t pid, uint8_t **out, size_t *out_sz,
+                                 char *diag, size_t dsz) {
+    *out = NULL; *out_sz = 0;
+    char tid[16];
+    if (running_game_tid(pid, tid, diag, dsz) != 0) return -1;
+    char npwr[16] = {0}, pb[PATH_MAX];
+    snprintf(pb, sizeof(pb), "/system_data/priv/appmeta/%s/trophy2/npbind.dat", tid);
+    if (!npbind_npwr(pb, npwr)) {
+        snprintf(pb, sizeof(pb), "/user/app/%s/sce_sys/trophy2/npbind.dat", tid);
+        npbind_npwr(pb, npwr);
+    }
+    char ucp[PATH_MAX];
+    if (find_trophy_ucp(npwr, tid, ucp, sizeof(ucp)) != 0) {
+        snprintf(diag, dsz, "noUCP tid=%s npwr=%s", tid, npwr); return -1;
+    }
+    int rc = ucp_extract(ucp, "tropconf.json", out, out_sz);
+    if (rc != 0) snprintf(diag, dsz, "ucp=%s noTropconf", ucp);
+    else snprintf(diag, dsz, "ucp=%s sz=%zu", ucp, *out_sz);
+    return rc;
+}
+
+// The running game's uds00.ucp member (stats_extraction.json etc.) —
+// /user/app/<tid>/sce_sys/uds/ or the appmeta copy.
+static int running_game_uds_member(pid_t pid, const char *name,
+                                   uint8_t **out, size_t *out_sz) {
+    *out = NULL; *out_sz = 0;
+    char tid[16], diag[64];
+    if (running_game_tid(pid, tid, diag, sizeof(diag)) != 0) return -1;
+    char ucp[PATH_MAX];
+    snprintf(ucp, sizeof(ucp), "/system_data/priv/appmeta/%s/uds/uds00.ucp", tid);
+    if (!file_exists(ucp))
+        snprintf(ucp, sizeof(ucp), "/user/app/%s/sce_sys/uds/uds00.ucp", tid);
+    if (!file_exists(ucp)) return -1;
+    return ucp_extract(ucp, name, out, out_sz);
+}
+
+// One UDS session in the game process → per-trophy events. want_all posts
+// every entry in the game's tropconf (each with its own event type/target);
+// a single id uses its tropconf entry, or — if the config can't be read —
+// both event shapes in turn (the extractor only applies the rule whose
+// eventName matches that trophy's stat, so the unmatched post is a no-op).
+static void uds_trophy_unlock(client_session_t *session, int want_all, int want_id) {
+    pid_t me = getpid();
+    uint64_t oa = kernel_get_ucred_authid(me);
+    kernel_set_ucred_authid(me, 0x4800000000010003ULL);
+    char cand[256]; uint32_t th = 0;
+    pid_t pid = trp_find_trophy_proc(&th, cand, sizeof(cand));
+    if (pid <= 0) {
+        kernel_set_ucred_authid(me, oa);
+        send_error(session->sock, "no trophy-capable game running — launch the title first");
+        return;
+    }
+    uint32_t uh = 0;
+    krpc_dynlib_handle(pid, "libSceNpUniversalDataSystem.sprx", &uh);
+    intptr_t f_init = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemInitialize") : 0;
+    intptr_t f_cctx = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemCreateContext") : 0;
+    intptr_t f_chnd = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemCreateHandle") : 0;
+    intptr_t f_reg  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemRegisterContext") : 0;
+    intptr_t f_cev  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemCreateEvent") : 0;
+    intptr_t f_si3  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemEventPropertyObjectSetInt32") : 0;
+    if (f_si3 <= 0 && uh)
+        f_si3 = (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemEventPropertyObjectSetInt64");
+    intptr_t f_post = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemPostEvent") : 0;
+    intptr_t f_dev  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemDestroyEvent") : 0;
+    intptr_t f_dh   = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemDestroyHandle") : 0;
+    intptr_t f_dc   = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemDestroyContext") : 0;
+    intptr_t f_si64 = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemEventPropertyObjectSetInt64") : 0;
+    if (!uh || f_cctx <= 0 || f_chnd <= 0 || f_cev <= 0 || f_si3 <= 0 || f_post <= 0) {
+        kernel_set_ucred_authid(me, oa);
+        send_error(session->sock, "running game has no usable libSceNpUniversalDataSystem");
+        return;
+    }
+    rpc_sess_t s;
+    if (rpc_attach(&s, pid, f_cctx) != 0 || s.dead) {
+        kernel_set_ucred_authid(me, oa);
+        send_error(session->sock, "remote attach to game process failed");
+        return;
+    }
+    // foreground user — the trophy profile the events must credit
+    uint32_t uid = 0;
+    uint32_t ush = 0;
+    if (krpc_dynlib_handle(pid, "libSceUserService.sprx", &ush) == 0 && ush) {
+        intptr_t f_fg = (intptr_t)krpc_dlsym_checked(pid, ush, "sceUserServiceGetForegroundUser");
+        if (f_fg && !s.dead) {
+            rpc_call(&s, f_fg, s.scratch + 0x40, 0, 0, 0, 0, 0);
+            rpc_read(pid, s.scratch + 0x40, &uid, 4);
+        }
+    }
+    if (!uid) {
+        DIR *home = opendir("/user/home");
+        if (home) {
+            struct dirent *he;
+            while ((he = readdir(home))) {
+                if (he->d_name[0] == '.') continue;
+                uid = (uint32_t)strtoul(he->d_name, NULL, 16);
+                if (uid) break;
+            }
+            closedir(home);
+        }
+    }
+    if (f_init > 0 && !s.dead) rpc_call(&s, f_init, s.scratch + 0x60, 0, 0, 0, 0, 0);
+    int32_t ctx = 0, hnd = 0;
+    if (!s.dead) rpc_call(&s, f_cctx, s.scratch, uid, 0, 0, 0, 0);
+    if (!s.dead) rpc_read(pid, s.scratch, &ctx, 4);
+    if (!s.dead) rpc_call(&s, f_chnd, s.scratch + 8, 0, 0, 0, 0, 0);
+    if (!s.dead) rpc_read(pid, s.scratch + 8, &hnd, 4);
+    if (ctx > 0 && hnd > 0 && !s.dead) rpc_call(&s, f_reg, ctx, hnd, 0, 0, 0, 0);
+    if (ctx <= 0 || hnd <= 0 || s.dead) {
+        if (hnd > 0 && f_dh > 0 && !s.dead) rpc_call(&s, f_dh, hnd, 0, 0, 0, 0, 0);
+        if (ctx > 0 && f_dc > 0 && !s.dead) rpc_call(&s, f_dc, ctx, 0, 0, 0, 0, 0);
+        rpc_detach(&s);
+        kernel_set_ucred_authid(me, oa);
+        send_error(session->sock, "UDS context/handle setup failed in game process");
+        return;
+    }
+    // event name + property key strings, staged in the remote scratch page
+    intptr_t st_unl = s.scratch + 0x100, st_tid = s.scratch + 0x120;
+    intptr_t st_upg = s.scratch + 0x160, st_tpg = s.scratch + 0x180;
+    rpc_write(pid, st_unl, "_UnlockTrophy", 14);
+    rpc_write(pid, st_tid, "_trophy_id", 11);
+    rpc_write(pid, st_upg, "_UpdateTrophyProgress", 22);
+    rpc_write(pid, st_tpg, "_trophy_progress", 17);
+
+    // Work list: the running game's own tropconf decides event type+target.
+    trop_ent_t *plan = (trop_ent_t *)malloc(256 * sizeof(trop_ent_t));
+    trop_ent_t *work = (trop_ent_t *)malloc(260 * sizeof(trop_ent_t));
+    if (!plan || !work) {
+        free(plan); free(work);
+        if (f_dh > 0) rpc_call(&s, f_dh, hnd, 0, 0, 0, 0, 0);
+        if (f_dc > 0) rpc_call(&s, f_dc, ctx, 0, 0, 0, 0, 0);
+        rpc_detach(&s);
+        kernel_set_ucred_authid(me, oa);
+        send_error(session->sock, "out of memory");
+        return;
+    }
+    char conf_diag[256] = "n/a";
+    int np = -1;
+    uint8_t *cf = NULL; size_t cfs = 0;
+    if (running_game_tropconf(pid, &cf, &cfs, conf_diag, sizeof(conf_diag)) == 0)
+        np = tropconf_parse(cf, cfs, plan, 256);
+    if (cf) free(cf);
+    if (want_all && np <= 0) {
+        free(plan); free(work);
+        if (f_dh > 0) rpc_call(&s, f_dh, hnd, 0, 0, 0, 0, 0);
+        if (f_dc > 0) rpc_call(&s, f_dc, ctx, 0, 0, 0, 0, 0);
+        rpc_detach(&s);
+        kernel_set_ucred_authid(me, oa);
+        send_error(session->sock,
+            "cannot read the running game's trophy config — unlock-all needs it");
+        return;
+    }
+
+    int nw = 0;
+    if (want_all) { memcpy(work, plan, np * sizeof(trop_ent_t)); nw = np; }
+    else {
+        work[0].id = want_id; work[0].prog = -1; work[0].target = 1;
+        work[0].statid = -1; work[0].evkind = -1;
+        work[0].evwide = 0; work[0].evname[0] = 0; work[0].evprop[0] = 0;
+        if (np > 0)
+            for (int i = 0; i < np; i++)
+                if (plan[i].id == want_id) { work[0] = plan[i]; break; }
+        nw = 1;
+    }
+    free(plan);
+
+    // Resolve each trophy's real extractor event from the game's own
+    // stats_extraction.json (uds00.ucp): udsStatId → eventName + input prop.
+    // Games differ — Astro Bot feeds progressive trophies from COUNT__*
+    // counter events, LNEE from _UnlockTrophy/_UpdateTrophyProgress. No rule
+    // → fall back to the conf's progressive flag, or both standard events.
+    uint8_t *xj = NULL, *ej = NULL; size_t xn = 0, ejn = 0;
+    running_game_uds_member(pid, "stats_extraction.json", &xj, &xn);
+    running_game_uds_member(pid, "events_definition.json", &ej, &ejn);
+    for (int i = 0; i < nw; i++) {
+        work[i].evkind = -1;
+        if (work[i].statid >= 0 && xj) {
+            char ev[64] = "", pr[64] = "";
+            if (udsrule_for_stat(xj, xn, work[i].statid,
+                                 ev, sizeof(ev), pr, sizeof(pr))) {
+                snprintf(work[i].evname, sizeof(work[i].evname), "%s", ev);
+                snprintf(work[i].evprop, sizeof(work[i].evprop), "%s", pr);
+                work[i].evkind = !strcmp(ev, "_UnlockTrophy") ? 0
+                               : !strcmp(ev, "_UpdateTrophyProgress") ? 1 : 2;
+                work[i].evwide = (ej && work[i].evprop[0])
+                    ? udsprop_is_wide(ej, ejn, ev, pr) : 0;
+            }
+        }
+        if (work[i].evkind < 0 && work[i].prog >= 0)
+            work[i].evkind = work[i].prog;
+    }
+    if (xj) free(xj); if (ej) free(ej);
+
+    intptr_t st_dev = s.scratch + 0x1a0;   // custom event name (per entry)
+    intptr_t st_dpp = s.scratch + 0x1e0;   // custom property name
+
+    char r2[3000];
+    int o2 = snprintf(r2, sizeof(r2), "pid=%d ctx=%d hnd=%d plan=%d conf=%s",
+                      (int)pid, ctx, hnd, np, conf_diag);
+    int ok = 0, fail = 0;
+    for (int i = 0; i < nw && !s.dead; i++) {
+        int id = work[i].id, target = work[i].target;
+        int posted = 0;
+        int kinds[2]; int natt = 0;
+        if (work[i].evkind >= 0) kinds[natt++] = work[i].evkind;
+        else { kinds[natt++] = 0; kinds[natt++] = 1; }
+        for (int t = 0; t < natt && !s.dead; t++) {
+            int k = kinds[t];
+            intptr_t nev = (k == 1) ? st_upg : st_unl;
+            if (k == 2) {
+                rpc_write(pid, st_dev, work[i].evname,
+                          strlen(work[i].evname) + 1);
+                nev = st_dev;
+            }
+            uint64_t ev = 0, pobj = 0;
+            rpc_call(&s, f_cev, nev, 0,
+                     s.scratch + 0x10, s.scratch + 0x60, 0, 0);
+            rpc_read(pid, s.scratch + 0x10, &ev, 8);
+            rpc_read(pid, s.scratch + 0x60, &pobj, 8);
+            if (!pobj) pobj = ev;
+            if (!ev || s.dead) {
+                o2 += snprintf(r2 + o2, sizeof(r2) - o2, " [id%d cev-fail]", id);
+                break;
+            }
+            const char *knm = k == 2 ? work[i].evname
+                            : (k == 1 ? "prog" : "unlock");
+            if (k == 2) {
+                rpc_write(pid, st_dpp, work[i].evprop,
+                          strlen(work[i].evprop) + 1);
+                intptr_t fset = work[i].evwide && f_si64 > 0 ? f_si64 : f_si3;
+                rpc_call(&s, fset, (long)pobj, st_dpp,
+                         target > 0 ? target : 1, 0, 0, 0);
+            } else {
+                rpc_call(&s, f_si3, (long)pobj, st_tid, id, 0, 0, 0);
+                if (k == 1)
+                    rpc_call(&s, f_si3, (long)pobj, st_tpg,
+                             target > 0 ? target : 255, 0, 0, 0);
+            }
+            long rp = rpc_call(&s, f_post, ctx, hnd, (long)ev, 0, 0, 0);
+            // let the daemon drain the queue before the event is destroyed
+            if (!s.dead) usleep(400000);
+            if (f_dev > 0 && !s.dead) rpc_call(&s, f_dev, (long)ev, 0, 0, 0, 0, 0);
+            if ((int32_t)rp >= 0) posted = 1;
+            if (o2 < (int)sizeof(r2) - 200)
+                o2 += snprintf(r2 + o2, sizeof(r2) - o2, " [id%d %.28s=%lx]",
+                               id, knm, rp);
+            if (work[i].evkind >= 0) break;
+        }
+        if (posted) ok++; else fail++;
+    }
+    free(work);
+    if (f_dh > 0 && !s.dead) rpc_call(&s, f_dh, hnd, 0, 0, 0, 0, 0);
+    if (f_dc > 0 && !s.dead) rpc_call(&s, f_dc, ctx, 0, 0, 0, 0, 0);
+    rpc_detach(&s);
+    kernel_set_ucred_authid(me, oa);
+    o2 += snprintf(r2 + o2, sizeof(r2) - o2, " ok=%d fail=%d dead=%d",
+                   ok, fail, s.dead);
+    send_response(session->sock, RESP_DATA, r2, (uint32_t)o2);
+}
+
+// ---------------------------------------------------------------------------
+// TROPHY LOCK — revert an unlocked trophy by editing TRPTITLE.DAT in place.
+// Unlike unlock (daemon-bound UDS events), this is a pure file rewrite:
+//   - clear bit <id> in the global unlock bitmask
+//   - clear bit <id> in every 0x700 group-mask record where it is set
+//   - zero the 0x800 per-trophy row flag (body+0x04) and timestamp (+0x10)
+// Wire format: "lock:<npwr>:<id>". The client knows the set's NPWR, so no
+// running game is required. The trophy daemon may hold the file cached — a
+// home-screen/game refresh may be needed for the UI to reflect the change.
+// ---------------------------------------------------------------------------
+static int trp_is_rec(const uint8_t *d, size_t len, size_t o,
+                      uint8_t type_hi, uint8_t sz_lo) {
+    return o + 8 <= len && d[o] == 0 && d[o + 1] == 0 &&
+           d[o + 2] == type_hi && d[o + 3] == 0 &&
+           d[o + 4] == 0 && d[o + 5] == 0 && d[o + 6] == 0 && d[o + 7] == sz_lo;
+}
+
+static uint32_t trp_u32be(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | p[3];
+}
+
+// Returns 0 on successful rewrite, -1 on parse failure, -2 on I/O failure,
+// 1 if the file parsed but the trophy was already locked.
+static int trp_lock_file(const char *path, int tid, char *diag, size_t dsz) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -2;
+    fseek(f, 0, SEEK_END);
+    long flen = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (flen < 0x200 || flen > 1024 * 1024) { fclose(f); return -1; }
+    uint8_t *d = malloc(flen);
+    if (!d) { fclose(f); return -2; }
+    if (fread(d, 1, flen, f) != (size_t)flen) { free(d); fclose(f); return -2; }
+    fclose(f);
+
+    if (d[0] != 'T' || d[1] != '2' || d[2] != 'P' || d[3] != 'D') {
+        free(d); return -1;
+    }
+
+    // 1) max trophy id from 0x500 definition records (id at rec+0x10 u32be)
+    int max_id = -1;
+    for (size_t o = 0x200; o + 0x14 <= (size_t)flen; o += 4) {
+        if (!trp_is_rec(d, flen, o, 5, 0xC0)) continue;
+        int id = (int)trp_u32be(d + o + 0x10);
+        if (id < 512 && id > max_id) max_id = id;
+    }
+    if (max_id < 0 || tid < 0 || tid > max_id) { free(d); return -1; }
+    int nbits = max_id + 1, nb = (nbits + 7) / 8;
+    int tbyte = tid >> 3, tbit = tid & 7;
+
+    // 2) union of the 0x700 group masks (mask at rec+0x40) + collect offsets
+    size_t group_mask_off[64]; int group_recs = 0;
+    uint8_t *union_mask = calloc(nb, 1);
+    if (!union_mask) { free(d); return -2; }
+    for (size_t o = 0x800; o + 0x10 + 0x30 + (size_t)nb <= (size_t)flen; o += 4) {
+        if (!trp_is_rec(d, flen, o, 7, 0xB0)) continue;
+        if (group_recs < 64) group_mask_off[group_recs++] = o + 0x10 + 0x30;
+        for (int j = 0; j < nb; j++) union_mask[j] |= d[o + 0x40 + j];
+    }
+    if (group_recs == 0) { free(union_mask); free(d); return -1; }
+
+    // "already locked" is decided by the UNION mask — the popcount-scan for a
+    // separate "global" mask is unreliable (ASCII strings like "P2M\x08" can
+    // match popcount+trailing-zero criteria and shadow the real mask).
+    if (!((union_mask[tbyte] >> tbit) & 1)) { free(union_mask); free(d); return 1; }
+
+    // 3) 0x800 state row for this trophy: flag at rec+0x14, ts at rec+0x20
+    size_t row_flag_off = 0, row_ts_off = 0; int have_row = 0;
+    for (size_t o = 0x800; o + 0x10 + 0x18 <= (size_t)flen; o += 4) {
+        if (!trp_is_rec(d, flen, o, 8, 0x50)) continue;
+        if ((int)trp_u32be(d + o + 0x10) == tid) {
+            row_flag_off = o + 0x14; row_ts_off = o + 0x20; have_row = 1;
+            break;
+        }
+    }
+
+    // 4) edits:
+    //   a) every 0x700 group-mask record where the bit is set
+    //   b) ANY other byte window identical to the union mask — catches a
+    //      separate global/copy mask without the fragile popcount signature
+    //   c) the 0x800 row flag + timestamp
+    int cleared_groups = 0, cleared_copies = 0;
+    for (int g = 0; g < group_recs; g++) {
+        uint8_t *m = d + group_mask_off[g];
+        if ((m[tbyte] >> tbit) & 1) { m[tbyte] &= (uint8_t)~(1 << tbit); cleared_groups++; }
+    }
+    for (size_t o = 0x200; o + (size_t)nb <= (size_t)flen; o += 4) {
+        if (memcmp(d + o, union_mask, nb) != 0) continue;
+        if ((d[o + tbyte] >> tbit) & 1) { d[o + tbyte] &= (uint8_t)~(1 << tbit); cleared_copies++; }
+    }
+    free(union_mask);
+    if (have_row) {
+        d[row_flag_off] = d[row_flag_off + 1] = d[row_flag_off + 2] = d[row_flag_off + 3] = 0;
+        memset(d + row_ts_off, 0, 8);
+    }
+
+    // 6) atomic-ish rewrite: tmp + rename so a crash mid-write can't leave a
+    //    truncated trophy file.
+    char tmp[PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    f = fopen(tmp, "wb");
+    if (!f) { free(d); return -2; }
+    int wok = fwrite(d, 1, flen, f) == (size_t)flen;
+    fclose(f);
+    free(d);
+    if (!wok) { unlink(tmp); return -2; }
+    if (rename(tmp, path) != 0) { unlink(tmp); return -2; }
+
+    if (diag) snprintf(diag, dsz, "cleared %d group masks + %d copies%s",
+                       cleared_groups, cleared_copies, have_row ? "" : ", no row");
+    return 0;
+}
+
+// Rewrite TRPTITLE.DAT for <npwr> under every user profile that has one.
+static void trophy_lock(client_session_t *session, const char *npwr, int tid) {
+    char resp[1024];
+    int off = snprintf(resp, sizeof(resp), "lock %s:%d", npwr, tid);
+    int edited = 0, errors = 0, already = 0;
+
+    DIR *home = opendir("/user/home");
+    if (!home) { send_error(session->sock, "cannot open /user/home"); return; }
+    struct dirent *e;
+    while ((e = readdir(home))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path),
+                 "/user/home/%s/trophy2/nobackup/data/%s/TRPTITLE.DAT",
+                 e->d_name, npwr);
+        // access() consults REAL creds while our jailbroken context swaps
+        // effective authid — fopen is what the list path proves works.
+        FILE *probe = fopen(path, "rb");
+        if (!probe) continue;   // this user never registered the set
+        fclose(probe);
+        char diag[128] = "";
+        int rc = trp_lock_file(path, tid, diag, sizeof(diag));
+        if (rc == 0) { edited++; off += snprintf(resp + off, sizeof(resp) - off, "\n  %s: %s", e->d_name, diag); }
+        else if (rc == 1) { already++; off += snprintf(resp + off, sizeof(resp) - off, "\n  %s: already locked", e->d_name); }
+        else { errors++; off += snprintf(resp + off, sizeof(resp) - off, "\n  %s: failed (%s)", e->d_name, diag[0] ? diag : "io/parse"); }
+    }
+    closedir(home);
+
+    if (!edited && !already && !errors) {
+        send_error(session->sock, "no TRPTITLE.DAT for this set (never registered?)");
+        return;
+    }
+    off += snprintf(resp + off, sizeof(resp) - off,
+                    "\n=> %d rewritten, %d already locked, %d failed", edited, already, errors);
+    if (edited) send_notification("Trophy re-locked — restart the game/home screen to refresh");
+    send_response(session->sock, RESP_DATA, resp, (uint32_t)off);
+}
+
+void handle_trophy_unlock(client_session_t *session, const char *arg) {
+    char resp[4096];
+    if (!arg || !*arg) { send_error(session->sock, "Usage: unlock:<id|all>"); return; }
+    int lock_mode = 0;
+    const char *p = arg;
+    if (!strncmp(p, "lock:", 5)) { lock_mode = 1; p += 5; }
+    else if (!strncmp(p, "unlock:", 7)) p += 7;
+    // "lock:<npwr>:<id>" — direct TRPTITLE.DAT rewrite, no running game needed.
+    if (lock_mode) {
+        const char *colon = strchr(p, ':');
+        if (!colon || colon == p || !colon[1]) {
+            send_error(session->sock, "usage: lock:<npwr>:<id>");
+            return;
+        }
+        char npwr[16];
+        size_t nl = (size_t)(colon - p);
+        if (nl >= sizeof(npwr)) nl = sizeof(npwr) - 1;
+        memcpy(npwr, p, nl); npwr[nl] = 0;
+        int id = atoi(colon + 1);
+        if (id < 0 || id > 255) { send_error(session->sock, "bad trophy id"); return; }
+        trophy_lock(session, npwr, id);
+        return;
+    }
+    if (!strcmp(p, "all")) { uds_trophy_unlock(session, 1, -1); return; }
+    if (p[0] >= '0' && p[0] <= '9') {
+        int id = atoi(p);
+        if (id < 0 || id > 255) { send_error(session->sock, "bad trophy id"); return; }
+        uds_trophy_unlock(session, 0, id);
+        return;
+    }
+    // "probe": report which trophy-related libs/exports exist in the game
+    // process. No remote calls — pure dynlib handle + dlsym resolution.
+    // "probe:<lib>|<sym1>,<sym2>,..." resolves arbitrary names (custom list).
+    if (!strncmp(p, "probe", 5) && (p[5] == 0 || p[5] == ':')) {
+        pid_t me2 = getpid();
+        uint64_t oa = kernel_get_ucred_authid(me2);
+        kernel_set_ucred_authid(me2, 0x4800000000010003ULL);
+        uint32_t th = 0;
+        char c2[256];
+        pid_t gp = trp_find_trophy_proc(&th, c2, sizeof(c2));
+        char r2[2048]; int o2 = snprintf(r2, sizeof(r2), "pid=%d%s", (int)gp, c2);
+        if (gp > 0 && p[5] == ':') {
+            // custom: probe:libname|sym1,sym2,...
+            char spec[1024];
+            snprintf(spec, sizeof(spec), "%s", p + 6);
+            char *bar = strchr(spec, '|');
+            if (bar) {
+                *bar = 0;
+                uint32_t h = 0;
+                if (krpc_dynlib_handle(gp, spec, &h) == 0 && h) {
+                    o2 += snprintf(r2 + o2, sizeof(r2) - o2, " %s=H%u[", spec, h);
+                    char *t = strtok(bar + 1, ",");
+                    while (t && o2 < (int)sizeof(r2) - 200) {
+                        intptr_t fn = (intptr_t)krpc_dlsym_checked(gp, h, t);
+                        if (fn > 0)
+                            o2 += snprintf(r2 + o2, sizeof(r2) - o2, "%s=%lx,", t, (long)fn);
+                        t = strtok(NULL, ",");
+                    }
+                    o2 += snprintf(r2 + o2, sizeof(r2) - o2, "]");
+                }
+            }
+            kernel_set_ucred_authid(me2, oa);
+            send_response(session->sock, RESP_DATA, r2, (uint32_t)o2);
+            return;
+        }
+        if (gp > 0) {
+            static const char *libs[] = {
+                "libSceNpTrophy2.sprx", "libSceNpTrophy.sprx",
+                "libSceNpManager.sprx", "libSceNpCommon.sprx",
+                "libSceNpUniversalDataSystem.sprx", "libSceNpUniversalDataSystemGameplay.sprx",
+                "libSceNpTus.sprx", "libSceNpProfile2.sprx", NULL };
+            static const char *syms[] = {
+                "sceNpTrophyUnlockTrophy", "sceNpTrophy2UnlockTrophy",
+                "sceNpTrophyUnlockTrophyGroup", "sceNpTrophy2UnlockTrophyGroup",
+                "sceNpTrophy2SystemDebugUnlockTrophy", "sceNpTrophy2SystemDebugLockTrophy",
+                "sceNpTrophyGetTrophyUnlockState", "sceNpTrophy2GetTrophyUnlockState",
+                "sceNpTrophyVshInit", "sceNpTrophy2VshInit", NULL };
+            for (int li = 0; libs[li] && o2 < (int)sizeof(r2) - 200; li++) {
+                uint32_t h = 0;
+                if (krpc_dynlib_handle(gp, libs[li], &h) != 0 || !h) continue;
+                o2 += snprintf(r2 + o2, sizeof(r2) - o2, " %s=H%u[", libs[li], h);
+                for (int si = 0; syms[si]; si++) {
+                    intptr_t fn = (intptr_t)krpc_dlsym_checked(gp, h, syms[si]);
+                    if (fn > 0)
+                        o2 += snprintf(r2 + o2, sizeof(r2) - o2, "%s=%lx,", syms[si], (long)fn);
+                }
+                o2 += snprintf(r2 + o2, sizeof(r2) - o2, "]");
+            }
+        }
+        kernel_set_ucred_authid(me2, oa);
+        send_response(session->sock, RESP_DATA, r2, (uint32_t)o2);
+        return;
+    }
+
+    // "nplib[:<id|all>[:<commId>]]" — run the legacy libSceNpTrophy sequence in
+    // OUR OWN process, inside a worker thread with progress + timeout. Any NP
+    // call can wedge in IPC; the command thread must never block on it.
+    if (!strncmp(p, "nplib", 5)) {
+        int single = -1;                      // -1 = all trophies
+        const char *commarg = NULL;
+        if (p[5] == ':') {
+            const char *a = p + 6;
+            const char *c2 = strchr(a, ':');
+            if (c2) { commarg = c2 + 1; }
+            if (strncmp(a, "all", 3)) {
+                single = atoi(a);
+                if (single < 0 || single > 127) { send_error(session->sock, "bad id"); return; }
+            }
+        } else if (p[5]) { send_error(session->sock, "usage: nplib[:id|all][:commId]"); return; }
+
+        if (g_nplib.running && !g_nplib.done) {
+            char rr[3400];
+            int n = snprintf(rr, sizeof(rr), "STILL RUNNING step=%d:\n%s",
+                             g_nplib.step, g_nplib.buf);
+            send_response(session->sock, RESP_DATA, rr, (uint32_t)n);
+            return;
+        }
+
+        memset(g_nplib.buf, 0, sizeof(g_nplib.buf));
+        g_nplib.len = 0;
+        g_nplib.step = 0;
+        g_nplib.done = 0;
+        g_nplib.single = single;
+        memset(g_nplib.commid, 0, sizeof(g_nplib.commid));
+        if (commarg) snprintf(g_nplib.commid, sizeof(g_nplib.commid), "%s", commarg);
+
+        pthread_t t;
+        pthread_attr_t at;
+        pthread_attr_init(&at);
+        pthread_attr_setstacksize(&at, 256 * 1024);
+        g_nplib.running = 1;
+        if (pthread_create(&t, &at, nplib_worker, NULL) != 0) {
+            g_nplib.running = 0;
+            send_error(session->sock, "nplib worker spawn failed");
+            return;
+        }
+        pthread_detach(t);
+
+        // poll up to ~40s; a wedged IPC leaves the worker parked but the
+        // payload stays alive and the partial log shows the blocking step.
+        for (int i = 0; i < 800 && !g_nplib.done; i++) usleep(50000);
+        if (g_nplib.done) g_nplib.running = 0;   // parked worker stays "running"
+        char rr[3400];
+        int n = snprintf(rr, sizeof(rr), "%s%s",
+                         g_nplib.done ? "" : "TIMED OUT — worker parked at step ",
+                         g_nplib.done ? "" : "");
+        if (!g_nplib.done)
+            n += snprintf(rr + n, sizeof(rr) - n, "%d\n", g_nplib.step);
+        n += snprintf(rr + n, sizeof(rr) - n, "%s", g_nplib.buf);
+        send_response(session->sock, RESP_DATA, rr, (uint32_t)n);
+        return;
+    }
+
+    // "lnc" — fast in-payload scan of SceShellCore text for the B5_LNC gate:
+    // `test/and ... & 6 ; jz` near an `0x8094000f` error return. Local
+    // kernel_proc_copyout — avoids holding the socket for a net-side scan.
+    // "lncp" — same scan but NOPs the JZ after each `test [r+x],6` site
+    // (B5_LNC bypass: lnc attr gate per PHU).
+    if (!strcmp(p, "lnc") || !strcmp(p, "lncp") || !strcmp(p, "lnca")) {
+        int do_patch = (p[3] == 'p');
+        pid_t sc = proc_find_name("SceShellCore");
+        if (sc <= 0) { send_error(session->sock, "ShellCore not found"); return; }
+        // exec regions
+        int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_VMMAP, sc };
+        size_t size = 0;
+        if (sysctl(mib, 4, NULL, &size, NULL, 0) != 0 || !size) {
+            send_error(session->sock, "vmmap fail"); return;
+        }
+        size += size / 4;
+        char *vmbuf = malloc(size);
+        if (!vmbuf || sysctl(mib, 4, vmbuf, &size, NULL, 0) != 0) {
+            if (vmbuf) free(vmbuf);
+            send_error(session->sock, "vmmap read fail"); return;
+        }
+        int all_sites = (p[3] == 'a');   // "lnca" — list every test&6 site
+        uint64_t xr[256][2]; int xn = 0;
+        for (char *pp = vmbuf; pp + sizeof(int) <= vmbuf + size && xn < 256; ) {
+            struct kinfo_vmentry *kv = (struct kinfo_vmentry *)pp;
+            if (kv->kve_structsize <= 0) break;
+            pp += kv->kve_structsize;
+            if ((kv->kve_protection & (PROT_READ|PROT_EXEC)) == (PROT_READ|PROT_EXEC)
+                || (kv->kve_protection & PROT_EXEC)) {
+                xr[xn][0] = kv->kve_start; xr[xn][1] = kv->kve_end; xn++;
+            }
+            (void)kv;
+        }
+        free(vmbuf);
+        char *out = malloc(16384); int o = 0;
+        o += snprintf(out, 16384, "pid=%d exec_regions=%d\n", (int)sc, xn);
+        const uint8_t imm[4] = { 0x0f, 0x00, 0x94, 0x80 };
+        static const size_t CH = 0x80000;
+        uint8_t *buf = malloc(CH + 96);
+        for (int r = 0; r < xn && buf; r++) {
+            for (uint64_t pos = xr[r][0]; pos < xr[r][1] && o < 15000; ) {
+                size_t want = (size_t)((xr[r][1] - pos) > CH ? CH : (xr[r][1] - pos));
+                if (kernel_proc_copyout(sc, (intptr_t)pos, buf, want) != 0) {
+                    pos += want; continue;
+                }
+                for (size_t i = 0; i + 4 <= want; i++) {
+                    if (all_sites) {
+                        // raw scan for `test/and &6` + conditional jump
+                        int t6 = -1;
+                        uint8_t b0 = buf[i], b1 = (i+1<want)?buf[i+1]:0;
+                        if (b0 == 0xa8 && b1 == 0x06) t6 = 2;
+                        else if (b0 == 0x83 && (b1 & 0xf8) == 0xe0 &&
+                                 i + 2 < want && buf[i+2] == 0x06) t6 = 3;
+                        else if (b0 == 0xf6 && (b1 == 0x46 || b1 == 0x86 ||
+                                 b1 == 0x8e || b1 == 0xbe || b1 == 0xa6) &&
+                                 i + 6 < want && buf[i+6] == 0x06) t6 = 7;
+                        else if (b0 == 0x41 && b1 == 0xf6 &&
+                                 i + 7 < want && buf[i+7] == 0x06) t6 = 8;
+                        if (t6 < 0) continue;
+                        size_t j = i + t6;
+                        const char *kind = NULL;
+                        if (j + 1 < want && buf[j] == 0x74) kind = "jz.s";
+                        else if (j + 1 < want && buf[j] == 0x75) kind = "jnz.s";
+                        else if (j + 5 < want && buf[j] == 0x0f && buf[j+1] == 0x84) kind = "jz.l";
+                        else if (j + 5 < want && buf[j] == 0x0f && buf[j+1] == 0x85) kind = "jnz.l";
+                        if (!kind) continue;
+                        o += snprintf(out + o, 16384 - o, "site @0x%llx %s: ",
+                            (unsigned long long)(pos + i), kind);
+                        for (int k = 0; k < 20 && i + k < want; k++)
+                            o += snprintf(out + o, 16384 - o, "%02x", buf[i + k]);
+                        o += snprintf(out + o, 16384 - o, "\n");
+                        if (o > 15000) break;
+                        continue;
+                    }
+                    if (memcmp(buf + i, imm, 4) != 0) continue;
+                    // check preceding ~96 bytes for a mask-6 test
+                    int found6 = -1;
+                    for (int j = (int)i - 96; j <= (int)i - 4; j++) {
+                        if (j < 0) continue;
+                        uint8_t b0 = buf[j], b1 = buf[j + 1];
+                        // f6 /4x|8x disp8/32 ,6   | 41 f6 ... | a8 06 | 83 eX 06
+                        if ((b0 == 0xf6 || b0 == 0xa8) && 0) {}
+                        if (b0 == 0xa8 && b1 == 0x06) { found6 = j; break; }
+                        if (b0 == 0x83 && (b1 & 0xf8) == 0xe0 && buf[j+2] == 0x06) { found6 = j; break; }
+                        if (b0 == 0xf6 && (b1 == 0x46 || b1 == 0x86 || b1 == 0x8e ||
+                            b1 == 0xbe || b1 == 0xa6) && buf[j+6] == 0x06) { found6 = j; break; }
+                        if (b0 == 0x41 && b1 == 0xf6 && buf[j+6] == 0x06) { found6 = j; break; }
+                    }
+                    if (found6 >= 0) {
+                        o += snprintf(out + o, 16384 - o,
+                            "hit @0x%llx test6@-0x%x: ",
+                            (unsigned long long)(pos + i), (unsigned)(i - found6));
+                        for (int k = found6; k < (int)i + 8 && k < (int)want; k++)
+                            o += snprintf(out + o, 16384 - o, "%02x", buf[k]);
+                        o += snprintf(out + o, 16384 - o, "\n");
+                        if (do_patch) {
+                            // JZ expected immediately after the test insn;
+                            // instruction length depends on the encoding form.
+                            uint8_t b0 = buf[found6];
+                            int tlen = 0;
+                            if (b0 == 0xa8) tlen = 2;                    // a8 06
+                            else if (b0 == 0x83) tlen = 3;               // 83 e? 06
+                            else if (b0 == 0xf6) tlen = 7;               // f6 86 d32 06
+                            else if (b0 == 0x41) tlen = 8;               // 41 f6 .. 06
+                            int j = found6 + tlen;
+                            int jzlen = 0;
+                            if (tlen && j + 1 < (int)want) {
+                                if (buf[j] == 0x74) jzlen = 2;
+                                else if (buf[j] == 0x0f && buf[j+1] == 0x84) jzlen = 6;
+                            }
+                            if (jzlen) {
+                                uint64_t va = pos + (uint64_t)j;
+                                uint8_t nops[6] = {0x90,0x90,0x90,0x90,0x90,0x90};
+                                int prc = kernel_proc_copyin(sc, nops, (intptr_t)va, jzlen);
+                                o += snprintf(out + o, 16384 - o,
+                                    "PATCH jz+%d @0x%llx rc=%d\n",
+                                    jzlen, (unsigned long long)va, prc);
+                            } else {
+                                o += snprintf(out + o, 16384 - o,
+                                    "NOPATCH no-jz (tlen=%d)\n", tlen);
+                            }
+                        }
+                    }
+                }
+                pos += (want > 96) ? want - 96 : want;
+            }
+        }
+        free(buf);
+        send_response(session->sock, RESP_DATA, out, (uint32_t)o);
+        free(out);
+        return;
+    }
+
+    // "kread:<pid>:<va_hex>:<len>" — raw kernel_proc_copyout hexdump of any
+    // process VA. mem_read (0x69) reads our own map; this path reads the
+    // target's real pages via the kernel.
+    if (!strncmp(p, "kread:", 6)) {
+        int kpid = 0; uint64_t kva = 0; int klen = 0;
+        sscanf(p + 6, "%d:%llx:%d", &kpid, (unsigned long long *)&kva, &klen);
+        if (kpid <= 0 || !kva || klen <= 0 || klen > 65536) {
+            send_error(session->sock, "usage kread:pid:va:len"); return;
+        }
+        pid_t me = getpid();
+        uint64_t oa = kernel_get_ucred_authid(me);
+        kernel_set_ucred_authid(me, 0x4800000000010003ULL);
+        uint8_t *kb = malloc(klen);
+        int rc = kb ? kernel_proc_copyout(kpid, (intptr_t)kva, kb, klen) : -1;
+        kernel_set_ucred_authid(me, oa);
+        if (rc != 0) { if (kb) free(kb); send_error(session->sock, "copyout fail"); return; }
+        send_response(session->sock, RESP_DATA, kb, (uint32_t)klen);
+        free(kb);
+        return;
+    }
+
+    // "kscan:<pid>:<hexpat>" — in-payload exec-region pattern scan via kernel
+    // copyout. Prints "hit @0x<va>" lines only (bounded).
+    if (!strncmp(p, "kscan:", 6)) {
+        int kpid = 0; char hbuf[64];
+        if (sscanf(p + 6, "%d:%63s", &kpid, hbuf) != 2 || kpid <= 0) {
+            send_error(session->sock, "usage kscan:pid:hexbytes"); return;
+        }
+        uint8_t pat[32]; int plen = 0;
+        for (const char *q = hbuf; *q && q[1] && plen < 32; q += 2) {
+            unsigned v; sscanf(q, "%02x", &v); pat[plen++] = (uint8_t)v;
+        }
+        int all_regions = (plen > 0 && pat[plen - 1] == 0x7e);   // trailing '~'
+        if (all_regions) plen--;
+        pid_t me = getpid();
+        uint64_t oa = kernel_get_ucred_authid(me);
+        kernel_set_ucred_authid(me, 0x4800000000010003ULL);
+        int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_VMMAP, kpid };
+        size_t size = 0;
+        sysctl(mib, 4, NULL, &size, NULL, 0);
+        size += size / 4;
+        char *vmbuf = malloc(size);
+        char *out = malloc(16384); int o = 0;
+        if (vmbuf && sysctl(mib, 4, vmbuf, &size, NULL, 0) == 0) {
+            const size_t CH = 0x80000;
+            uint8_t *buf = malloc(CH + 64);
+            for (char *pp = vmbuf; pp + sizeof(int) <= vmbuf + size && o < 15000; ) {
+                struct kinfo_vmentry *kv = (struct kinfo_vmentry *)pp;
+                if (kv->kve_structsize <= 0) break;
+                pp += kv->kve_structsize;
+                if (!(kv->kve_protection & (PROT_EXEC | PROT_READ)) ||
+                    (!all_regions && !(kv->kve_protection & PROT_EXEC))) continue;
+                for (uint64_t pos = kv->kve_start; pos < kv->kve_end && o < 15000; ) {
+                    size_t want = (kv->kve_end - pos) > CH ? CH : (size_t)(kv->kve_end - pos);
+                    if (kernel_proc_copyout(kpid, (intptr_t)pos, buf, want) != 0) {
+                        pos += want; continue;
+                    }
+                    for (size_t i = 0; i + plen <= want && o < 15000; i++) {
+                        if (memcmp(buf + i, pat, plen) == 0) {
+                            o += snprintf(out + o, 16384 - o, "@0x%llx: ",
+                                (unsigned long long)(pos + i));
+                            int st = (i > 24) ? (int)i - 24 : 0;
+                            for (int k = st; k < (int)i + 24 && k < (int)want; k++)
+                                o += snprintf(out + o, 16384 - o, "%02x", buf[k]);
+                            o += snprintf(out + o, 16384 - o, "\n");
+                        }
+                    }
+                    pos += (want > 32) ? want - 32 : want;
+                }
+            }
+            free(buf);
+        }
+        kernel_set_ucred_authid(me, oa);
+        free(vmbuf);
+        if (o == 0) o += snprintf(out, 16384, "no hits");
+        send_response(session->sock, RESP_DATA, out, (uint32_t)o);
+        free(out);
+        return;
+    }
+
+    // "ucred:<pid>" — dump authid + caps + attrs (find the authinfo bit30 field).
+    if (!strncmp(p, "ucred:", 6)) {
+        int kpid = atoi(p + 6);
+        if (kpid <= 0) { send_error(session->sock, "usage ucred:pid"); return; }
+        pid_t me = getpid();
+        uint64_t oa = kernel_get_ucred_authid(me);
+        kernel_set_ucred_authid(me, 0x4800000000010003ULL);
+        uint64_t authid = kernel_get_ucred_authid(kpid);
+        uint8_t caps[16], attrs[32];
+        memset(caps, 0, sizeof(caps)); memset(attrs, 0, sizeof(attrs));
+        int c1 = kernel_get_ucred_caps(kpid, caps);
+        int c2 = kernel_get_ucred_attrs(kpid, attrs);
+        kernel_set_ucred_authid(me, oa);
+        char m[256]; int n = snprintf(m, sizeof(m),
+            "pid=%d authid=%llx caps_rc=%d attrs_rc=%d\ncaps:", kpid,
+            (unsigned long long)authid, c1, c2);
+        for (int i = 0; i < 16; i++) n += snprintf(m + n, sizeof(m) - n, "%02x", caps[i]);
+        n += snprintf(m + n, sizeof(m) - n, "\nattrs:");
+        for (int i = 0; i < 32; i++) n += snprintf(m + n, sizeof(m) - n, "%02x", attrs[i]);
+        send_response(session->sock, RESP_DATA, m, (uint32_t)n);
+        return;
+    }
+
+    // "kwrite:<pid>:<va_hex>:<hexdata>" — kernel_proc_copyin write.
+    if (!strncmp(p, "kwrite:", 7)) {
+        int kpid = 0; uint64_t kva = 0; char hbuf[96];
+        if (sscanf(p + 7, "%d:%llx:%95s", &kpid, (unsigned long long *)&kva, hbuf) != 3
+            || kpid <= 0 || !kva) {
+            send_error(session->sock, "usage kwrite:pid:va:hex"); return;
+        }
+        uint8_t wbuf[48]; int wlen = 0;
+        for (const char *q = hbuf; *q && q[1] && wlen < 48; q += 2) {
+            unsigned v; sscanf(q, "%02x", &v); wbuf[wlen++] = (uint8_t)v;
+        }
+        pid_t me = getpid();
+        uint64_t oa = kernel_get_ucred_authid(me);
+        kernel_set_ucred_authid(me, 0x4800000000010003ULL);
+        int rc = kernel_proc_copyin(kpid, wbuf, (intptr_t)kva, wlen);
+        kernel_set_ucred_authid(me, oa);
+        char m[96];
+        snprintf(m, sizeof(m), "wrote %dB @0x%llx pid=%d rc=%d", wlen,
+                 (unsigned long long)kva, kpid, rc);
+        send_response(session->sock, RESP_DATA, m, (uint32_t)strlen(m));
+        return;
+    }
+
+    // "kdump:<pid>:<va_hex>:<len>:<path>" — dump target process memory to a
+    // file under /data so it can be pulled via FTP for offline disasm.
+    if (!strncmp(p, "kdump:", 6)) {
+        int kpid = 0; uint64_t kva = 0; int klen = 0; char path[200];
+        if (sscanf(p + 6, "%d:%llx:%d:%199s", &kpid,
+                   (unsigned long long *)&kva, &klen, path) != 4
+            || kpid <= 0 || !kva || klen <= 0 || klen > 8 * 1024 * 1024) {
+            send_error(session->sock, "usage kdump:pid:va:len:/data/path");
+            return;
+        }
+        pid_t me = getpid();
+        uint64_t oa = kernel_get_ucred_authid(me);
+        kernel_set_ucred_authid(me, 0x4800000000010003ULL);
+        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        int bad = 0; long done = 0;
+        if (fd >= 0) {
+            uint8_t *buf = malloc(65536);
+            for (long off = 0; off < klen && buf; off += 65536) {
+                size_t want = (klen - off) > 65536 ? 65536 : (size_t)(klen - off);
+                if (kernel_proc_copyout(kpid, (intptr_t)(kva + off), buf, want) != 0) {
+                    memset(buf, 0, want); bad++;
+                }
+                if (write(fd, buf, want) != (ssize_t)want) { bad++; break; }
+                done += want;
+            }
+            free(buf);
+            close(fd);
+        }
+        kernel_set_ucred_authid(me, oa);
+        char m[256];
+        snprintf(m, sizeof(m), "dump %ld/%dB pid=%d va=%llx -> %s badchunks=%d fd=%d",
+                 done, klen, kpid, (unsigned long long)kva, path, bad, fd);
+        send_response(session->sock, RESP_DATA, m, (uint32_t)strlen(m));
+        return;
+    }
+
+    // "udsr" — resolve the Int* (internal record/stat) API symbols inside the
+    // game process and hexdump their prologues so signatures can be derived.
+    if (!strcmp(p, "udsr")) {
+        pid_t me = getpid();
+        uint64_t oa = kernel_get_ucred_authid(me);
+        kernel_set_ucred_authid(me, 0x4800000000010003ULL);
+        uint32_t th = 0;
+        char cand[256];
+        pid_t pid = trp_find_trophy_proc(&th, cand, sizeof(cand));
+        if (pid <= 0) {
+            kernel_set_ucred_authid(me, oa);
+            send_error(session->sock, "no trophy game running");
+            return;
+        }
+        uint32_t uh = 0;
+        krpc_dynlib_handle(pid, "libSceNpUniversalDataSystem.sprx", &uh);
+        if (!uh) { kernel_set_ucred_authid(me, oa); send_error(session->sock, "no uds lib"); return; }
+        static const char *syms[] = {
+            "sceNpUniversalDataSystemIntInitialize",
+            "sceNpUniversalDataSystemIntCreateContext",
+            "sceNpUniversalDataSystemIntCreateHandle",
+            "sceNpUniversalDataSystemIntRegisterContext",
+            "sceNpUniversalDataSystemIntCreateRecordObject",
+            "sceNpUniversalDataSystemIntCreateRecordData",
+            "sceNpUniversalDataSystemIntRecordObjectSetInt32",
+            "sceNpUniversalDataSystemIntRecordObjectSetInt64",
+            "sceNpUniversalDataSystemIntRecordObjectSetString",
+            "sceNpUniversalDataSystemIntPostRecordData",
+            "sceNpUniversalDataSystemIntDebugGetStatData",
+            "sceNpUniversalDataSystemIntDebugDumpStats",
+            "sceNpUniversalDataSystemIntNetSyncTitles",
+            "sceNpUniversalDataSystemPostEvent",
+            "sceNpUniversalDataSystemRegisterContext",
+            NULL
+        };
+        char *out = malloc(8192); int o = 0;
+        o += snprintf(out, 8192, "pid=%d uh=%x\n", (int)pid, uh);
+        for (int i = 0; syms[i] && o < 7000; i++) {
+            intptr_t f = (intptr_t)krpc_dlsym_checked(pid, uh, syms[i]);
+            o += snprintf(out + o, 8192 - o, "%s=%lx\n", syms[i] + 24, (long)f);
+            if (f > 0) {
+                uint8_t code[64];
+                if (rpc_read(pid, f, code, sizeof(code)) == 0) {
+                    for (int k = 0; k < 48; k++)
+                        o += snprintf(out + o, 8192 - o, "%02x", code[k]);
+                    o += snprintf(out + o, 8192 - o, "\n");
+                }
+            }
+        }
+        kernel_set_ucred_authid(me, oa);
+        send_response(session->sock, RESP_DATA, out, (uint32_t)o);
+        free(out);
+        return;
+    }
+
+    // "auth" — scan ShellCore text for the B5 debug-auth function:
+    // it tests bit 30 of authinfo (shr reg,0x1e ; and reg,1) — a very
+    // distinctive pattern. "authp" patches every match to `mov eax,1; ret`.
+    if (!strcmp(p, "auth") || !strcmp(p, "authp") ||
+        !strncmp(p, "auth:", 5) || !strncmp(p, "authp:", 6)) {
+        int do_patch = (p[4] == 'p');
+        pid_t sc = 0;
+        const char *colon = strchr(p, ':');
+        if (colon) sc = (pid_t)strtol(colon + 1, NULL, 0);
+        if (sc <= 0) sc = proc_find_name("SceShellCore");
+        if (sc <= 0) { send_error(session->sock, "ShellCore not found"); return; }
+        int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_VMMAP, sc };
+        size_t size = 0;
+        if (sysctl(mib, 4, NULL, &size, NULL, 0) != 0 || !size) {
+            send_error(session->sock, "vmmap fail"); return;
+        }
+        size += size / 4;
+        char *vmbuf = malloc(size);
+        if (!vmbuf || sysctl(mib, 4, vmbuf, &size, NULL, 0) != 0) {
+            if (vmbuf) free(vmbuf);
+            send_error(session->sock, "vmmap read fail"); return;
+        }
+        uint64_t xr[256][2]; int xn = 0;
+        for (char *pp = vmbuf; pp + sizeof(int) <= vmbuf + size && xn < 256; ) {
+            struct kinfo_vmentry *kv = (struct kinfo_vmentry *)pp;
+            if (kv->kve_structsize <= 0) break;
+            pp += kv->kve_structsize;
+            if (kv->kve_protection & PROT_EXEC) {
+                xr[xn][0] = kv->kve_start; xr[xn][1] = kv->kve_end; xn++;
+            }
+        }
+        free(vmbuf);
+        char *out = malloc(16384); int o = 0;
+        o += snprintf(out, 16384, "pid=%d exec_regions=%d\n", (int)sc, xn);
+        const size_t CH = 0x80000;
+        uint8_t *buf = malloc(CH + 8);
+        for (int r = 0; r < xn && buf; r++) {
+            for (uint64_t pos = xr[r][0]; pos < xr[r][1] && o < 14000; ) {
+                size_t want = (size_t)((xr[r][1]-pos) > CH ? CH : (xr[r][1]-pos));
+                if (kernel_proc_copyout(sc, (intptr_t)pos, buf, want) != 0) {
+                    pos += want; continue;
+                }
+                for (size_t i = 0; i + 4 <= want; i++) {
+                    // 0x805539xx = trophy debug-auth rejection family —
+                    // `b8 XX 39 55 80` = mov eax,<err>. authp zeroes the imm.
+                    if (i + 5 <= want && buf[i] == 0xb8 &&
+                        buf[i+2] == 0x39 && buf[i+3] == 0x55 && buf[i+4] == 0x80) {
+                        uint8_t ec = buf[i+1];   // error low byte
+                        o += snprintf(out + o, 16384 - o, "err805539%02x @0x%llx: ",
+                            ec, (unsigned long long)(pos + i));
+                        int st = (i > 32) ? (int)i - 32 : 0;
+                        for (int k = st; k < (int)i + 16 && k < (int)want; k++)
+                            o += snprintf(out + o, 16384 - o, "%02x", buf[k]);
+                        // trace the auth-check call: nearest `e8 rel32` in the
+                        // ~20 bytes before the mov — report its target so we
+                        // can find the shared gate function.
+                        for (int k = (int)i - 1; k >= st && k >= (int)i - 20; k--) {
+                            if (buf[k] == 0xe8) {
+                                int32_t rel; memcpy(&rel, buf + k + 1, 4);
+                                uint64_t tgt = pos + k + 5 + (int64_t)rel;
+                                o += snprintf(out + o, 16384 - o,
+                                    " call@0x%llx->0x%llx",
+                                    (unsigned long long)(pos + k),
+                                    (unsigned long long)tgt);
+                                break;
+                            }
+                        }
+                        o += snprintf(out + o, 16384 - o, "\n");
+                        if (do_patch) {
+                            // turn `mov eax,0x805539xx` into `mov eax,0`
+                            uint8_t z[4] = {0,0,0,0};
+                            int prc = kernel_proc_copyin(sc, z, (intptr_t)(pos+i+1), 4);
+                            o += snprintf(out + o, 16384 - o,
+                                "PATCH err->0 @0x%llx rc=%d\n",
+                                (unsigned long long)(pos+i), prc);
+                        }
+                        continue;
+                    }
+                    // bit-30 test: `test reg,0x40000000` (f7 cX 00000040) or
+                    // `test eax,0x40000000` (a9 00000040)
+                    int b0 = buf[i];
+                    if ((b0 == 0xf7 && (buf[i+1] & 0xf8) == 0xc0 &&
+                         i + 5 < want && buf[i+2] == 0x00 && buf[i+3] == 0x00 &&
+                         buf[i+4] == 0x00 && buf[i+5] == 0x40) ||
+                        (b0 == 0xa9 && i + 4 < want && buf[i+1] == 0x00 &&
+                         buf[i+2] == 0x00 && buf[i+3] == 0x00 && buf[i+4] == 0x40)) {
+                        o += snprintf(out + o, 16384 - o, "test30 @0x%llx: ",
+                            (unsigned long long)(pos + i));
+                        int st = (i > 24) ? (int)i - 24 : 0;
+                        for (int k = st; k < (int)i + 16 && k < (int)want; k++)
+                            o += snprintf(out + o, 16384 - o, "%02x", buf[k]);
+                        o += snprintf(out + o, 16384 - o, "\n");
+                        continue;
+                    }
+                    // shr reg,0x1e followed by and reg,1 — the debug-auth
+                    // bit-30 test per PHU FUN_019f0660.
+                    {
+                    int is_shr = 0; size_t sl = 0;
+                    if (b0 == 0xc1 && (buf[i+1] & 0xf8) == 0xe8 && buf[i+2] == 0x1e) { is_shr=1; sl=3; }
+                    else if (b0 == 0x41 && buf[i+1] == 0xc1 && (buf[i+2] & 0xf8) == 0xe8 && buf[i+3] == 0x1e) { is_shr=1; sl=4; }
+                    if (!is_shr) continue;
+                    // require `and <same-or-any-reg>,1` within next 6 bytes
+                    int has_and1 = 0;
+                    for (size_t k = i + sl; k < i + sl + 6 && k + 2 < want; k++) {
+                        if (buf[k] == 0x83 && (buf[k+1] & 0xf8) == 0xe0 && buf[k+2] == 0x01) { has_and1 = 1; break; }
+                        if (buf[k] == 0x41 && buf[k+1] == 0x83 && (buf[k+2] & 0xf8) == 0xe0 && buf[k+3] == 0x01) { has_and1 = 1; break; }
+                        if (buf[k] == 0x25 && buf[k+1] == 0x01 && buf[k+2] == 0x00) { has_and1 = 1; break; } // and eax,1
+                    }
+                    if (!has_and1) continue;
+                    o += snprintf(out + o, 16384 - o, "shr30 @0x%llx: ",
+                        (unsigned long long)(pos + i));
+                    int st = (i > 24) ? (int)i - 24 : 0;
+                    for (int k = st; k < (int)i + 16 && k < (int)want; k++)
+                        o += snprintf(out + o, 16384 - o, "%02x", buf[k]);
+                    o += snprintf(out + o, 16384 - o, "\n");
+                    }
+                }
+                pos += (want > 8) ? want - 8 : want;
+            }
+        }
+        free(buf);
+        send_response(session->sock, RESP_DATA, out, (uint32_t)o);
+        free(out);
+        (void)do_patch;
+        return;
+    }
+
+    // "udsn:<id>" — post _UnlockTrophy then call IntNetSyncTitles to force
+    // the daemon to drain the persisted event queue (events.dat → stats).
+    if (!strncmp(p, "udsn:", 5)) {
+        int tid = atoi(p + 5);
+        pid_t me = getpid();
+        uint64_t oa = kernel_get_ucred_authid(me);
+        kernel_set_ucred_authid(me, 0x4800000000010003ULL);
+        uint32_t th = 0;
+        char cand[256];
+        pid_t pid = trp_find_trophy_proc(&th, cand, sizeof(cand));
+        if (pid <= 0) {
+            kernel_set_ucred_authid(me, oa);
+            send_error(session->sock, "no trophy game running"); return;
+        }
+        uint32_t uh = 0;
+        krpc_dynlib_handle(pid, "libSceNpUniversalDataSystem.sprx", &uh);
+        intptr_t f_init = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemInitialize") : 0;
+        intptr_t f_cctx = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemCreateContext") : 0;
+        intptr_t f_chnd = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemCreateHandle") : 0;
+        intptr_t f_reg  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemRegisterContext") : 0;
+        intptr_t f_cev  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemCreateEvent") : 0;
+        intptr_t f_si3  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemEventPropertyObjectSetInt32") : 0;
+        intptr_t f_post = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemPostEvent") : 0;
+        intptr_t f_nst  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemIntNetSyncTitles") : 0;
+        intptr_t f_dev  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemDestroyEvent") : 0;
+        intptr_t f_dh   = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemDestroyHandle") : 0;
+        intptr_t f_dc   = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemDestroyContext") : 0;
+        intptr_t f_fg   = 0;
+        uint32_t ush = 0;
+        if (krpc_dynlib_handle(pid, "libSceUserService.sprx", &ush) == 0 && ush)
+            f_fg = (intptr_t)krpc_dlsym_checked(pid, ush, "sceUserServiceGetForegroundUser");
+        char rr[3000];
+        int o = snprintf(rr, sizeof(rr), "pid=%d nst=%lx", (int)pid, (long)f_nst);
+        if (!f_cctx || !f_chnd || !f_cev || !f_si3 || !f_post || !f_nst) {
+            kernel_set_ucred_authid(me, oa);
+            send_error(session->sock, rr); return;
+        }
+        rpc_sess_t s;
+        if (rpc_attach(&s, pid, f_cctx) != 0 || s.dead) {
+            kernel_set_ucred_authid(me, oa);
+            send_error(session->sock, "attach fail"); return;
+        }
+        uint32_t uid = 0;
+        if (f_fg) { rpc_call(&s, f_fg, s.scratch + 0x40, 0,0,0,0,0); rpc_read(pid, s.scratch+0x40, &uid, 4); }
+        if (!uid) uid = 0x1b68ce95;
+        intptr_t sn = s.scratch + 0x100, st = s.scratch + 0x120;
+        rpc_write(pid, sn, "_UnlockTrophy", 14);
+        rpc_write(pid, st, "_trophy_id", 11);
+        if (f_init) rpc_call(&s, f_init, s.scratch + 0x60, 0,0,0,0,0);
+        int32_t ctx = 0, hnd = 0;
+        rpc_call(&s, f_cctx, s.scratch, uid, 0, 0, 0, 0);
+        rpc_read(pid, s.scratch, &ctx, 4);
+        rpc_call(&s, f_chnd, s.scratch + 8, 0, 0, 0, 0, 0);
+        rpc_read(pid, s.scratch + 8, &hnd, 4);
+        long r_reg = rpc_call(&s, f_reg, ctx, hnd, 0, 0, 0, 0);
+        uint64_t ev = 0;
+        rpc_call(&s, f_cev, sn, 0, s.scratch + 0x10, s.scratch + 0x60, 0, 0);
+        rpc_read(pid, s.scratch + 0x10, &ev, 8);
+        uint64_t pobj = 0;
+        rpc_read(pid, s.scratch + 0x60, &pobj, 8);
+        if (!pobj) pobj = ev;
+        long r_s = ev ? rpc_call(&s, f_si3, (long)pobj, st, tid, 0, 0, 0) : -1;
+        long r_post = ev ? rpc_call(&s, f_post, ctx, hnd, (long)ev, 0, 0, 0) : -1;
+        if (!s.dead) usleep(300000);
+        // probe the IntNetSyncTitles arg space — IPC cmd 0x10012 takes
+        // {ctx(32b), a2(32b), a3(64b)}; a2 is likely an enum, a3 a timeout/flags
+        long nst_try[8];
+        memset(nst_try, 0, sizeof(nst_try));
+        // also try the game's own ctx (borrowed from the UDS singleton table)
+        intptr_t ubase = f_post ? (f_post - 0x9c90) : 0;
+        intptr_t singleton = 0;
+        int32_t gctx = 0;
+        if (ubase) {
+            rpc_read(pid, ubase + 0x24088, &singleton, 8);
+            for (intptr_t sl = singleton + 0x28; sl <= singleton + 0x160; sl += 8) {
+                intptr_t node = 0; rpc_read(pid, sl, &node, 8);
+                if (!node) continue;
+                int32_t cid = 0; uint8_t act = 0;
+                rpc_read(pid, node + 8, &cid, 4); rpc_read(pid, node + 0x14, &act, 1);
+                if (cid > 0 && act && cid != ctx) { gctx = cid; break; }
+            }
+        }
+        struct { int a2; long a3; } nst_args[4] = {
+            {0, 0}, {1, 0}, {0, 60000000}, {1, 60000000},
+        };
+        for (int i = 0; i < 4 && !s.dead; i++)
+            nst_try[i] = rpc_call(&s, f_nst, ctx, nst_args[i].a2, nst_args[i].a3, 0, 0, 0);
+        long nst_g[4] = {0,0,0,0};
+        if (gctx > 0)
+            for (int i = 0; i < 4 && !s.dead; i++)
+                nst_g[i] = rpc_call(&s, f_nst, gctx, nst_args[i].a2, nst_args[i].a3, 0, 0, 0);
+        intptr_t f_term = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemTerminate") : 0;
+        intptr_t f_abort = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemAbortHandle") : 0;
+        // Terminate is risky inside the live game (tears down its UDS client
+        // state) — only run it when explicitly asked via udsn:<id>:t
+        long r_term = (f_term > 0 && !s.dead && strstr(p, ":t"))
+            ? rpc_call(&s, f_term, 0,0,0,0,0,0) : -999;
+        o += snprintf(rr + o, sizeof(rr) - o,
+            " uid=%x ctx=%d hnd=%d reg=%lx ev=%lx s=%lx post=%lx"
+            " nst[00]=%lx nst[10]=%lx nst[0t]=%lx nst[1t]=%lx"
+            " gctx=%d gnst[00]=%lx gnst[10]=%lx gnst[0t]=%lx gnst[1t]=%lx"
+            " term=%lx abort=%lx dead=%d",
+            uid, ctx, hnd, r_reg, (long)ev, r_s, r_post,
+            nst_try[0], nst_try[1], nst_try[2], nst_try[3],
+            gctx, nst_g[0], nst_g[1], nst_g[2], nst_g[3], r_term, (long)f_abort, s.dead);
+        if (!s.dead) {
+            usleep(500000);
+            if (ev && f_dev) rpc_call(&s, f_dev, (long)ev, 0,0,0,0,0);
+            if (hnd && f_dh) rpc_call(&s, f_dh, hnd, 0,0,0,0,0);
+            if (ctx && f_dc) rpc_call(&s, f_dc, ctx, 0,0,0,0,0);
+        }
+        rpc_detach(&s);
+        kernel_set_ucred_authid(me, oa);
+        send_response(session->sock, RESP_DATA, rr, (uint32_t)o);
+        return;
+    }
+
+    // "udsb:<id>" — borrow the GAME's own registered UDS ctx/hnd pair from the
+    // libSceNpUniversalDataSystem singleton tables (ctx array at singleton+0x20
+    // slots 1..40 → +0x28..+0x160; hnd array at +0x180 → +0x188..+0x2c0;
+    // node+0x08=id, +0x14=active) and post _UnlockTrophy through it. Events
+    // posted under the game's own session may reach the extraction pass that
+    // runs on the game's real activity (checkpoint saves).
+    if (!strncmp(p, "udsb:", 5)) {
+        int tid = atoi(p + 5);
+        pid_t me = getpid();
+        uint64_t oa = kernel_get_ucred_authid(me);
+        kernel_set_ucred_authid(me, 0x4800000000010003ULL);
+        uint32_t th = 0;
+        char cand[256];
+        pid_t pid = trp_find_trophy_proc(&th, cand, sizeof(cand));
+        if (pid <= 0) {
+            kernel_set_ucred_authid(me, oa);
+            send_error(session->sock, "no trophy game running"); return;
+        }
+        uint32_t uh = 0;
+        krpc_dynlib_handle(pid, "libSceNpUniversalDataSystem.sprx", &uh);
+        intptr_t f_cev  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemCreateEvent") : 0;
+        intptr_t f_si3  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemEventPropertyObjectSetInt32") : 0;
+        intptr_t f_post = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemPostEvent") : 0;
+        intptr_t f_dev  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemDestroyEvent") : 0;
+        // PostEvent resolved = uds_base + 0x9c90; singleton ptr at base+0x24088
+        intptr_t ubase = f_post ? (f_post - 0x9c90) : 0;
+        char rr[3000]; int o = snprintf(rr, sizeof(rr), "pid=%d uh=%x ubase=%lx", (int)pid, uh, (long)ubase);
+        if (!uh || !f_cev || !f_si3 || !f_post || !ubase) {
+            kernel_set_ucred_authid(me, oa); send_error(session->sock, rr); return;
+        }
+        intptr_t singleton = 0;
+        rpc_read(pid, ubase + 0x24088, &singleton, 8);
+        o += snprintf(rr + o, sizeof(rr) - o, " single=%lx", (long)singleton);
+        rpc_sess_t s;
+        if (rpc_attach(&s, pid, f_cev) != 0 || s.dead) {
+            kernel_set_ucred_authid(me, oa);
+            o += snprintf(rr + o, sizeof(rr) - o, " attachfail %s", g_scp_dbg);
+            send_error(session->sock, rr); return;
+        }
+        // scan ctx slots singleton+0x28..+0x160, hnd slots singleton+0x188..+0x2c0
+        int32_t ctxs[40], hnds[40]; int nc = 0, nh = 0;
+        for (intptr_t sl = singleton + 0x28; sl <= singleton + 0x160 && nc < 40; sl += 8) {
+            intptr_t node = 0; rpc_read(pid, sl, &node, 8);
+            if (!node) continue;
+            int32_t cid = 0; uint8_t act = 0;
+            rpc_read(pid, node + 8, &cid, 4); rpc_read(pid, node + 0x14, &act, 1);
+            if (cid > 0 && act) ctxs[nc++] = cid;
+        }
+        for (intptr_t sl = singleton + 0x188; sl <= singleton + 0x2c0 && nh < 40; sl += 8) {
+            intptr_t node = 0; rpc_read(pid, sl, &node, 8);
+            if (!node) continue;
+            int32_t cid = 0; uint8_t act = 0;
+            rpc_read(pid, node + 8, &cid, 4); rpc_read(pid, node + 0x14, &act, 1);
+            if (cid > 0 && act) hnds[nh++] = cid;
+        }
+        o += snprintf(rr + o, sizeof(rr) - o, " nctx=%d[", nc);
+        for (int i = 0; i < nc && o < 2700; i++) o += snprintf(rr + o, sizeof(rr) - o, "%d,", ctxs[i]);
+        o += snprintf(rr + o, sizeof(rr) - o, "] nhnd=%d[", nh);
+        for (int i = 0; i < nh && o < 2750; i++) o += snprintf(rr + o, sizeof(rr) - o, "%d,", hnds[i]);
+        o += snprintf(rr + o, sizeof(rr) - o, "]");
+        if (nc <= 0 || nh <= 0) {
+            rpc_detach(&s); kernel_set_ucred_authid(me, oa);
+            send_response(session->sock, RESP_DATA, rr, (uint32_t)o); return;
+        }
+        intptr_t sn = s.scratch + 0x100, st = s.scratch + 0x120;
+        rpc_write(pid, sn, "_UnlockTrophy", 14);
+        rpc_write(pid, st, "_trophy_id", 11);
+        uint64_t ev = 0;
+        rpc_call(&s, f_cev, sn, 0, s.scratch + 0x10, s.scratch + 0x60, 0, 0);
+        rpc_read(pid, s.scratch + 0x10, &ev, 8);
+        uint64_t pobj = 0;
+        rpc_read(pid, s.scratch + 0x60, &pobj, 8);
+        if (!pobj) pobj = ev;
+        long r_s = ev ? rpc_call(&s, f_si3, (long)pobj, st, tid, 0, 0, 0) : -1;
+        // post under EVERY active ctx/hnd pair — the game's registered pair is
+        // in there; one of them is bound to NPWR33521_00 daemon-side
+        o += snprintf(rr + o, sizeof(rr) - o, " ev=%lx s=%lx", (long)ev, r_s);
+        for (int i = 0; i < nc && !s.dead; i++) {
+            for (int j = 0; j < nh && !s.dead; j++) {
+                long rp = rpc_call(&s, f_post, ctxs[i], hnds[j], (long)ev, 0, 0, 0);
+                o += snprintf(rr + o, sizeof(rr) - o, " p[%d,%d]=%lx", ctxs[i], hnds[j], rp);
+            }
+        }
+        if (ev && f_dev && !s.dead) rpc_call(&s, f_dev, (long)ev, 0,0,0,0,0);
+        // "udsb:<id>:a" — also post a synthetic activityEnd through the game ctx
+        // to mimic the checkpoint-time event batch that kicks extraction.
+        if (strstr(p, ":a") && !s.dead) {
+            intptr_t f_ss = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemEventPropertyObjectSetString") : 0;
+            intptr_t s_ev   = s.scratch + 0x140;  // "activityEnd"
+            intptr_t s_zone = s.scratch + 0x160;  // "zoneId"
+            intptr_t s_act  = s.scratch + 0x180;  // "activityId"
+            intptr_t s_out  = s.scratch + 0x1a0;  // "outcome"
+            intptr_t s_scr  = s.scratch + 0x1c0;  // "score"
+            intptr_t s_dif  = s.scratch + 0x1e0;  // "difficultySetting"
+            intptr_t v_zone = s.scratch + 0x200;  // "ThePrison"
+            intptr_t v_act  = s.scratch + 0x220;  // "ThePrison"
+            intptr_t v_out  = s.scratch + 0x240;  // "completed"
+            rpc_write(pid, s_ev,   "activityEnd", 12);
+            rpc_write(pid, s_zone, "zoneId", 7);
+            rpc_write(pid, s_act,  "activityId", 11);
+            rpc_write(pid, s_out,  "outcome", 8);
+            rpc_write(pid, s_scr,  "score", 6);
+            rpc_write(pid, s_dif,  "difficultySetting", 18);
+            rpc_write(pid, v_zone, "ThePrison", 10);
+            rpc_write(pid, v_act,  "ThePrison", 10);
+            rpc_write(pid, v_out,  "completed", 10);
+            uint64_t aev = 0;
+            long r_ce = rpc_call(&s, f_cev, s_ev, 0, s.scratch + 0x18, s.scratch + 0x60, 0, 0);
+            rpc_read(pid, s.scratch + 0x18, &aev, 8);
+            uint64_t apobj = 0;
+            rpc_read(pid, s.scratch + 0x60, &apobj, 8);
+            if (!apobj) apobj = aev;
+            o += snprintf(rr + o, sizeof(rr) - o, " aev_ce=%lx aev=%lx", r_ce, (long)aev);
+            if (aev && f_ss > 0) {
+                o += snprintf(rr + o, sizeof(rr) - o, " ssz=%lx ssa=%lx sso=%lx",
+                    rpc_call(&s, f_ss, (long)apobj, s_zone, v_zone, 0, 0, 0),
+                    rpc_call(&s, f_ss, (long)apobj, s_act,  v_act,  0, 0, 0),
+                    rpc_call(&s, f_ss, (long)apobj, s_out,  v_out,  0, 0, 0));
+                o += snprintf(rr + o, sizeof(rr) - o, " sisc=%lx sidif=%lx",
+                    rpc_call(&s, f_si3, (long)apobj, s_scr, 0, 0, 0, 0),
+                    rpc_call(&s, f_si3, (long)apobj, s_dif, 0, 0, 0, 0));
+            }
+            if (aev)
+                o += snprintf(rr + o, sizeof(rr) - o, " apost=%lx",
+                    rpc_call(&s, f_post, ctxs[0], hnds[0], (long)aev, 0, 0, 0));
+            if (aev && f_dev) rpc_call(&s, f_dev, (long)aev, 0,0,0,0,0);
+        }
+        rpc_detach(&s);
+        kernel_set_ucred_authid(me, oa);
+        send_response(session->sock, RESP_DATA, rr, (uint32_t)o);
+        return;
+    }
+
+    // "uds:<id|all>[:gid]" — post a real _UnlockTrophy UDS event from inside
+    // the game process (the path games use: libSceNpUniversalDataSystem
+    // CreateContext/CreateHandle/RegisterContext → CreateEvent("_UnlockTrophy")
+    // → EventPropertyObjectSetInt3(_trophy_id) → PostEvent). Same technique as
+    // the trophy-unlocker-uds daemon but using our own rpc_call bridge.
+    if (!strncmp(p, "uds:", 4)) {
+        const char *a = p + 4;
+        int id_first = 0, id_last = 0, gid = 0;
+        if (!strncmp(a, "all", 3)) { id_last = 49; }
+        else {
+            id_first = id_last = atoi(a);
+            const char *c = strchr(a, ':');
+            if (c) gid = atoi(c + 1);
+            if (id_first < 0 || id_first > 255) {
+                send_error(session->sock, "bad id"); return;
+            }
+        }
+        pid_t me = getpid();
+        uint64_t oa = kernel_get_ucred_authid(me);
+        kernel_set_ucred_authid(me, 0x4800000000010003ULL);
+        uint32_t th = 0;
+        char cand[256];
+        pid_t pid = trp_find_trophy_proc(&th, cand, sizeof(cand));
+        if (pid <= 0) {
+            kernel_set_ucred_authid(me, oa);
+            send_error(session->sock, "no trophy game running");
+            return;
+        }
+        uint32_t uh = 0;
+        krpc_dynlib_handle(pid, "libSceNpUniversalDataSystem.sprx", &uh);
+        intptr_t f_init  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemInitialize") : 0;
+        intptr_t f_cctx  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemCreateContext") : 0;
+        intptr_t f_chnd  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemCreateHandle") : 0;
+        intptr_t f_reg   = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemRegisterContext") : 0;
+        intptr_t f_cev   = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemCreateEvent") : 0;
+        intptr_t f_seti3 = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemEventPropertyObjectSetInt32") : 0;
+        if (f_seti3 <= 0 && uh)
+            f_seti3 = (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemEventPropertyObjectSetInt64");
+        intptr_t f_post  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemPostEvent") : 0;
+        intptr_t f_dev   = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemDestroyEvent") : 0;
+        intptr_t f_tostr = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemEventToString") : 0;
+        intptr_t f_dh    = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemDestroyHandle") : 0;
+        intptr_t f_dc    = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemDestroyContext") : 0;
+        char r2[3000];
+        int o2 = snprintf(r2, sizeof(r2), "pid=%d UH=%u init=%lx cctx=%lx ch=%lx reg=%lx cev=%lx set3=%lx post=%lx%s",
+                          (int)pid, uh, (long)f_init, (long)f_cctx, (long)f_chnd,
+                          (long)f_reg, (long)f_cev, (long)f_seti3, (long)f_post, cand);
+        if (!uh || f_cctx <= 0 || f_chnd <= 0 || f_cev <= 0 || f_seti3 <= 0 || f_post <= 0) {
+            kernel_set_ucred_authid(me, oa);
+            send_error(session->sock, r2);
+            return;
+        }
+        // foreground user inside the game
+        intptr_t f_fg = 0;
+        uint32_t ush = 0;
+        if (krpc_dynlib_handle(pid, "libSceUserService.sprx", &ush) == 0 && ush)
+            f_fg = (intptr_t)krpc_dlsym_checked(pid, ush, "sceUserServiceGetForegroundUser");
+        rpc_sess_t s;
+        int arc = rpc_attach(&s, pid, f_cctx);
+        if (arc != 0 || s.dead) {
+            kernel_set_ucred_authid(me, oa);
+            o2 += snprintf(r2 + o2, sizeof(r2) - o2, " attach=%d %s", arc, g_scp_dbg);
+            send_error(session->sock, r2);
+            return;
+        }
+        uint32_t uid = 0;
+        if (f_fg && !s.dead) {
+            rpc_call(&s, f_fg, s.scratch + 0x40, 0, 0, 0, 0, 0);
+            rpc_read(pid, s.scratch + 0x40, &uid, 4);
+        }
+        if (!uid) {
+            DIR *home = opendir("/user/home");
+            if (home) {
+                struct dirent *he;
+                while ((he = readdir(home))) {
+                    if (he->d_name[0] == '.') continue;
+                    uid = (uint32_t)strtoul(he->d_name, NULL, 16);
+                    if (uid) break;
+                }
+                closedir(home);
+            }
+        }
+        // stage the event/property name strings in the remote scratch area
+        int use_prog = 0, keep = 0, send_gid = 0, dump_ev = 0;
+        long post_flags = 0;
+        {
+            if (strstr(a, ":p")) use_prog = 1;
+            if (strstr(a, ":k")) keep = 1;
+            if (strstr(a, ":t")) dump_ev = 1;
+            const char *ff = strstr(a, ":f");
+            if (ff && ff[2] >= '0' && ff[2] <= '9') post_flags = atol(ff + 2);
+            const char *gc = strchr(a, ':');
+            if (gc && gc[1] >= '0' && gc[1] <= '9')
+                send_gid = 1;   // numeric :gid — send _trophy_group_id too
+        }
+        intptr_t str_unlock = s.scratch + 0x100;
+        intptr_t str_tid    = s.scratch + 0x120;
+        intptr_t str_gid    = s.scratch + 0x140;
+        intptr_t str_prog   = s.scratch + 0x160;
+        intptr_t str_tprog  = s.scratch + 0x180;
+        rpc_write(pid, str_unlock, "_UnlockTrophy", 14);
+        rpc_write(pid, str_tid, "_trophy_id", 11);
+        rpc_write(pid, str_gid, "_trophy_group_id", 17);
+        rpc_write(pid, str_prog, "_UpdateTrophyProgress", 22);
+        rpc_write(pid, str_tprog, "_trophy_progress", 17);
+        o2 += snprintf(r2 + o2, sizeof(r2) - o2, " uid=%08x", uid);
+
+        int32_t ctx = 0, hnd = 0;
+        long r_init = f_init > 0 && !s.dead
+            ? rpc_call(&s, f_init, s.scratch + 0x60, 0, 0, 0, 0, 0) : -999;
+        long r_ctx = s.dead ? -1
+            : rpc_call(&s, f_cctx, s.scratch, uid, 0, 0, 0, 0);
+        if (!s.dead) rpc_read(pid, s.scratch, &ctx, 4);
+        long r_h = s.dead ? -1
+            : rpc_call(&s, f_chnd, s.scratch + 8, 0, 0, 0, 0, 0);
+        if (!s.dead) rpc_read(pid, s.scratch + 8, &hnd, 4);
+        long r_reg = (ctx > 0 && hnd > 0 && !s.dead)
+            ? rpc_call(&s, f_reg, ctx, hnd, 0, 0, 0, 0) : -1;
+        o2 += snprintf(r2 + o2, sizeof(r2) - o2,
+                       " init=%lx cctx=%lx(ctx=%d) ch=%lx(hnd=%d) reg=%lx",
+                       r_init, r_ctx, ctx, r_h, hnd, r_reg);
+
+        int ok = 0, fail = 0;
+        if (ctx > 0 && hnd > 0 && !s.dead) {
+            for (int id = id_first; id <= id_last; id++) {
+                uint64_t ev = 0;
+                long r_ev = rpc_call(&s, f_cev,
+                                     use_prog ? str_prog : str_unlock, 0,
+                                     s.scratch + 0x10, s.scratch + 0x60, 0, 0);
+                rpc_read(pid, s.scratch + 0x10, &ev, 8);
+                // CreateEvent arg4 = out-property-object — the event's
+                // "properties" holder. SetInt32 must target THAT, not the
+                // event, or the field lands at the messagepack root where the
+                // extractor can't see it (it reads properties.$._trophy_id).
+                uint64_t pobj = 0;
+                rpc_read(pid, s.scratch + 0x60, &pobj, 8);
+                if (!s.dead && !pobj) pobj = ev;
+                if ((int32_t)r_ev < 0 || ev == 0 || s.dead) {
+                    o2 += snprintf(r2 + o2, sizeof(r2) - o2,
+                                   " [id%d cev=%lx ev=%lx]", id, r_ev, ev);
+                    fail++; if (s.dead) break; else continue;
+                }
+                long r_s1 = rpc_call(&s, f_seti3, (long)pobj, str_tid, id, 0, 0, 0);
+                // uds.ucp schema: _UnlockTrophy has ONLY $._trophy_id —
+                // _trophy_group_id is not in the schema; sending it may trip
+                // strict validation. _UpdateTrophyProgress takes
+                // _trophy_id + _trophy_progress. Gid only if explicit.
+                long r_s2 = 0;
+                if (use_prog)
+                    r_s2 = rpc_call(&s, f_seti3, (long)pobj, str_tprog, 100, 0, 0, 0);
+                else if (send_gid)
+                    r_s2 = rpc_call(&s, f_seti3, (long)pobj, str_gid, gid, 0, 0, 0);
+                // :t — serialize the event before posting so we can verify the
+                // wire format the daemon will see.
+                if (dump_ev && f_tostr > 0 && !s.dead) {
+                    long tr = rpc_call(&s, f_tostr, (long)ev, s.scratch + 0x240,
+                                       0x200, s.scratch + 0x38, 0, 0);
+                    char ej[320]; memset(ej, 0, sizeof(ej));
+                    rpc_read(pid, s.scratch + 0x240, ej, sizeof(ej) - 1);
+                    int32_t wn = 0;
+                    rpc_read(pid, s.scratch + 0x38, &wn, 4);
+                    o2 += snprintf(r2 + o2, sizeof(r2) - o2,
+                                   " evjson(%lx,n=%d)=%.240s", tr, wn, ej);
+                }
+                long r_post = rpc_call(&s, f_post, ctx, hnd, (long)ev, post_flags, 0, 0);
+                // Give the service time to drain the queue before teardown —
+                // destroying the event/context immediately can drop the post.
+                if (!s.dead) usleep(400000);
+                if (f_dev > 0 && !s.dead && !keep)
+                    rpc_call(&s, f_dev, (long)ev, 0, 0, 0, 0, 0);
+                o2 += snprintf(r2 + o2, sizeof(r2) - o2,
+                               " [id%d ev=%lx s1=%lx s2=%lx post=%lx]",
+                               id, ev, r_s1, r_s2, r_post);
+                if ((int32_t)r_post >= 0) ok++; else fail++;
+                if (s.dead) break;
+            }
+        }
+        if (hnd > 0 && f_dh > 0 && !s.dead && !keep) rpc_call(&s, f_dh, hnd, 0, 0, 0, 0, 0);
+        if (ctx > 0 && f_dc > 0 && !s.dead && !keep) rpc_call(&s, f_dc, ctx, 0, 0, 0, 0, 0);
+        rpc_detach(&s);
+        kernel_set_ucred_authid(me, oa);
+        o2 += snprintf(r2 + o2, sizeof(r2) - o2, " ok=%d fail=%d dead=%d %s",
+                       ok, fail, s.dead, g_scp_dbg);
+        send_response(session->sock, RESP_DATA, r2, (uint32_t)o2);
+        return;
+    }
+
+    int do_all = !strcmp(p, "all");
+    int probe = !strncmp(p, "deep", 4);
+    // "q" — query real unlock state via sceNpTrophy2GetTrophyUnlockState using
+    // the game's own registered ctx/hnd (verification, no mutation).
+    int query_mode = (p[0] == 'q');
+    int first = 0, last = 0;
+    if (query_mode) {
+        if (p[1] == 0 || !strcmp(p, "qall")) { first = 0; last = 127; }
+        else { first = last = atoi(p + 1); }
+        if (first < 0 || first > 255) { send_error(session->sock, "Bad trophy id"); return; }
+    }
+    else if (do_all) { last = 127; }
+    else if (probe) { first = last = atoi(p + 4); }
+    else {
+        first = last = atoi(p);
+        if (first < 0 || first > 255) { send_error(session->sock, "Bad trophy id"); return; }
+    }
+
+    // Elevated ucred for PT_ATTACH on the game process (same as ShellCore path).
+    pid_t me = getpid();
+    uint64_t old_authid = kernel_get_ucred_authid(me);
+    kernel_set_ucred_authid(me, 0x4800000000010003ULL);
+
+    uint32_t tr2h = 0;
+    char cand[256];
+    pid_t pid = trp_find_trophy_proc(&tr2h, cand, sizeof(cand));
+    if (pid <= 0) {
+        kernel_set_ucred_authid(me, old_authid);
+        char e[384];
+        snprintf(e, sizeof(e), "No process with libSceNpTrophy2 loaded — launch the game first.%s", cand);
+        send_error(session->sock, e);
+        return;
+    }
+
+    intptr_t fn_create_ctx = (intptr_t)krpc_dlsym_checked(pid, tr2h, "sceNpTrophy2CreateContext");
+    intptr_t fn_create_h   = (intptr_t)krpc_dlsym_checked(pid, tr2h, "sceNpTrophy2CreateHandle");
+    intptr_t fn_register   = (intptr_t)krpc_dlsym_checked(pid, tr2h, "sceNpTrophy2RegisterContext");
+    intptr_t fn_destroy_h  = (intptr_t)krpc_dlsym_checked(pid, tr2h, "sceNpTrophy2DestroyHandle");
+    intptr_t fn_destroy_c  = (intptr_t)krpc_dlsym_checked(pid, tr2h, "sceNpTrophy2DestroyContext");
+    // Primary: the normal game-side unlock (daemon cmd 0x9004a — no debug
+    // authority needed). SystemDebug* ops are gated by a ShellCore auth check
+    // (authinfo bit 30) that retail processes lack → they return 0x80553908.
+    intptr_t fn_unlock_n   = lock_mode ? 0
+        : (intptr_t)krpc_dlsym_checked(pid, tr2h, "sceNpTrophy2UnlockTrophy");
+    if (fn_unlock_n <= 0 && !lock_mode)
+        fn_unlock_n = (intptr_t)krpc_dlsym_checked(pid, tr2h, "sceNpTrophyUnlockTrophy");
+    intptr_t fn_op         = (intptr_t)krpc_dlsym_checked(pid, tr2h, lock_mode
+        ? "sceNpTrophy2SystemDebugLockTrophy" : "sceNpTrophy2SystemDebugUnlockTrophy");
+    intptr_t fn_qstate     = (intptr_t)krpc_dlsym_checked(pid, tr2h, "sceNpTrophy2GetTrophyInfo");
+    if (fn_qstate <= 0)
+        fn_qstate = (intptr_t)krpc_dlsym_checked(pid, tr2h, "sceNpTrophy2GetTrophyUnlockState");
+    if (fn_qstate <= 0)
+        fn_qstate = (intptr_t)krpc_dlsym_checked(pid, tr2h, "sceNpTrophyGetTrophyUnlockState");
+
+    snprintf(resp, sizeof(resp), "pid=%d cctx=%lx ch=%lx reg=%lx unl=%lx op=%lx qs=%lx%s",
+             (int)pid, (long)fn_create_ctx, (long)fn_create_h,
+             (long)fn_register, (long)fn_unlock_n, (long)fn_op, (long)fn_qstate, cand);
+
+    if (query_mode && fn_qstate <= 0) {
+        kernel_set_ucred_authid(me, old_authid);
+        send_error(session->sock, resp);
+        return;
+    }
+    if (!query_mode &&
+        ((fn_op <= 0 && fn_unlock_n <= 0) || fn_create_ctx <= 0 || fn_create_h <= 0 || fn_register <= 0)) {
+        kernel_set_ucred_authid(me, old_authid);
+        send_error(session->sock, resp);   // syms missing — report which resolved
+        return;
+    }
+
+    // UserService syms inside the game process (for the real user id).
+    intptr_t fn_fg = 0, fn_login = 0, fn_init = 0;
+    uint32_t ush = 0;
+    if (krpc_dynlib_handle(pid, "libSceUserService.sprx", &ush) == 0 && ush) {
+        fn_fg    = (intptr_t)krpc_dlsym_checked(pid, ush, "sceUserServiceGetForegroundUser");
+        fn_login = (intptr_t)krpc_dlsym_checked(pid, ush, "sceUserServiceGetLoginUserIdList");
+        fn_init  = (intptr_t)krpc_dlsym_checked(pid, ush, "sceUserServiceGetInitialUser");
+    }
+
+    rpc_sess_t s;
+    int arc = rpc_attach(&s, pid, fn_create_ctx);
+    if (arc != 0 || s.dead) {
+        kernel_set_ucred_authid(me, old_authid);
+        snprintf(resp + strlen(resp), sizeof(resp) - strlen(resp), " attach=%d", arc);
+        send_error(session->sock, resp);
+        return;
+    }
+
+    // user id: foreground → login list → initial → /user/home hex dir fallback
+    uint32_t uid = 0;
+    if (fn_fg && !s.dead) {
+        rpc_call(&s, fn_fg, s.scratch + 0x40, 0, 0, 0, 0, 0);
+        rpc_read(pid, s.scratch + 0x40, &uid, 4);
+    }
+    if (!uid && fn_login && !s.dead) {
+        uint32_t uids[8] = {0};
+        rpc_call(&s, fn_login, s.scratch + 0x40, 8, 0, 0, 0, 0);
+        rpc_read(pid, s.scratch + 0x40, uids, sizeof(uids));
+        for (int i = 0; i < 8 && !uid; i++) if (uids[i]) uid = uids[i];
+    }
+    if (!uid && fn_init && !s.dead) {
+        rpc_call(&s, fn_init, s.scratch + 0x40, 0, 0, 0, 0, 0);
+        rpc_read(pid, s.scratch + 0x40, &uid, 4);
+    }
+    if (!uid) {
+        DIR *home = opendir("/user/home");
+        if (home) {
+            struct dirent *he;
+            while ((he = readdir(home))) {
+                if (he->d_name[0] == '.') continue;
+                uid = (uint32_t)strtoul(he->d_name, NULL, 16);
+                if (uid) break;
+            }
+            closedir(home);
+        }
+    }
+    if (!uid) {
+        rpc_detach(&s);
+        kernel_set_ucred_authid(me, old_authid);
+        send_error(session->sock, "Could not resolve user id");
+        return;
+    }
+
+    // CreateContext(&ctx, uid, 0, 0) → CreateHandle(&h) → RegisterContext(ctx,h,0)
+    int32_t ctx = 0, hnd = 0;
+    int ctx_ours = 1;
+    intptr_t tbl = 0;
+    rpc_read(pid, (fn_create_ctx - 0x150) + 0x18080, &tbl, 8);
+    if (query_mode) {
+        // Borrow the game's own registered ctx — the only one daemon-bound.
+        for (intptr_t o = 0x158; tbl && o <= 0x250; o += 8) {
+            intptr_t node = 0;
+            rpc_read(pid, tbl + o, &node, 8);
+            if (!node) continue;
+            uint8_t active = 0; int32_t cid = 0;
+            rpc_read(pid, node + 0x14, &active, 1);
+            rpc_read(pid, node + 0x08, &cid, 4);
+            if (active && cid > 0) { ctx = cid; ctx_ours = 0; break; }
+        }
+    }
+    long rc_ctx = (!ctx && !s.dead)
+        ? rpc_call(&s, fn_create_ctx, s.scratch, uid, 0, 0, 0, 0) : -1;
+    if (!ctx && !s.dead) rpc_read(pid, s.scratch, &ctx, 4);
+    if (((uint32_t)rc_ctx == 0x80553910u) || (rc_ctx >= 0 && ctx <= 0)) {
+        // Context for this commId already exists in the process — reuse the
+        // client's cached one. Verified 13.60 libSceNpTrophy2 layout:
+        // singleton ptr at lib_base+0x18080; ctx table at singleton+0x150
+        // (32 node ptrs at +0x158..+0x250), hnd table at singleton+0x30
+        // (32 node ptrs at +0x38..+0x130). node+0x08 = id, +0x14 = active.
+        for (intptr_t o = 0x158; tbl && o <= 0x250; o += 8) {
+            intptr_t node = 0;
+            rpc_read(pid, tbl + o, &node, 8);
+            if (!node) continue;
+            uint8_t active = 0; int32_t cid = 0;
+            rpc_read(pid, node + 0x14, &active, 1);
+            rpc_read(pid, node + 0x08, &cid, 4);
+            if (active && cid > 0) { ctx = cid; ctx_ours = 0; break; }
+        }
+    }
+    // Also borrow the game's own registered handle from the +0x30 hnd table —
+    // it is already bound to ctx daemon-side, no CreateHandle/Register needed.
+    int32_t hnd_borrowed = 0;
+    for (intptr_t o = 0x38; tbl && o <= 0x130; o += 8) {
+        intptr_t node = 0;
+        rpc_read(pid, tbl + o, &node, 8);
+        if (!node) continue;
+        uint8_t active = 0; int32_t cid = 0;
+        rpc_read(pid, node + 0x14, &active, 1);
+        rpc_read(pid, node + 0x08, &cid, 4);
+        if (active && cid > 0) { hnd_borrowed = cid; break; }
+    }
+    long rc_h = -1, rc_reg = -1;
+    int hnd_ours = 0;
+    // PHU B6 flow: ALWAYS create our own fresh handle — re-registering the
+    // game's already-bound hnd is a daemon-side no-op (no objects created),
+    // which is why DebugUnlock's daemon lookup returned 0x80553909. A fresh
+    // hnd forces RegisterContext to run the real bind.
+    if (ctx > 0 && ctx_ours == 0 && hnd_borrowed > 0)
+        hnd = hnd_borrowed;               // fully borrowed pair — no reg needed
+    if (ctx > 0 && hnd <= 0 && !s.dead) {
+        rc_h = rpc_call(&s, fn_create_h, s.scratch + 4, 0, 0, 0, 0, 0);
+        rpc_read(pid, s.scratch + 4, &hnd, 4);
+    }
+    if (hnd > 0 && hnd != hnd_borrowed) hnd_ours = 1;
+    if (hnd > 0 && hnd_ours && !s.dead)
+        rc_reg = rpc_call(&s, fn_register, ctx, hnd, 0, 0, 0, 0);
+
+    // The SystemDebug* calls are gated daemon-side on the CALLER's authinfo
+    // bit 30 (FUN_019f0660 in SceShellCore — reads get_authinfo()[12..15]).
+    // Retail games lack it → 0x80553908. Lend the game full ucred caps +
+    // ShellCore authid for the duration of the op, then restore.
+    static const uint8_t caps_all[16] = {
+        0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+        0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff
+    };
+    uint64_t old_game_authid = 0;
+    uint8_t  old_game_caps[16]; uint8_t old_game_attrs[32];
+    int game_cred_saved = 0;
+    if (!query_mode && ctx > 0 && hnd > 0 && !s.dead) {
+        old_game_authid = kernel_get_ucred_authid(pid);
+        if (kernel_get_ucred_caps(pid, old_game_caps) == 0 &&
+            kernel_get_ucred_attrs(pid, old_game_attrs) == 0) {
+            kernel_set_ucred_caps(pid, caps_all);
+            kernel_set_ucred_authid(pid, 0x4800000000010003ULL);
+            game_cred_saved = 1;
+        }
+    }
+
+    // Diagnostic probe (safe set only — direct internal-lookup calls killed the
+    // game thread; keep to the send-wrapper path used by the export itself).
+    // 13.60 RE findings:
+    //   - export sceNpTrophy2SystemDebugUnlockTrophy sends cmd 0x90018 which
+    //     daemon-side maps to CheckRecoveryRequiredJob (NOT debug unlock!)
+    //   - real DebugUnlockTrophyJob = cmd 0x90046, sent by internal wrapper
+    //     lib+0x3680: phase1 0x90045 [hnd,ctx] then phase2 0x90046 spec(0x9c)
+    //   - the export wrapping it (lib+0x3500) does hnd/ctx client lookups like
+    //     fn_op but additionally validates node state flags.
+    if (probe) {
+        intptr_t lbase = fn_create_ctx - 0x150;
+        uint8_t spec[0x9c];
+        memset(spec, 0, sizeof(spec));
+        spec[0] = 1;                          // type=1 (by trophy id)
+        spec[4] = (uint8_t)first;             // trophy id
+        rpc_write(pid, s.scratch + 0x40, spec, sizeof(spec));
+        // probe6: register the EXISTING game pair (ctx/hnd resolved above).
+        // Daemon "already claimed" check nop'd at 0x4df47356 — RegisterContext
+        // now runs the real bind steps (insert hnd/ctx objects daemon-side).
+        // Also force client node +0x30 flags so export local checks pass.
+        intptr_t cnode = 0, hnode = 0;
+        for (intptr_t o = 0x158; tbl && o <= 0x250; o += 8) {
+            intptr_t n = 0; rpc_read(pid, tbl + o, &n, 8);
+            if (!n) continue;
+            int32_t cid = 0; rpc_read(pid, n + 0x08, &cid, 4);
+            if (cid == ctx) { cnode = n; break; }
+        }
+        for (intptr_t o = 0x38; tbl && o <= 0x130; o += 8) {
+            intptr_t n = 0; rpc_read(pid, tbl + o, &n, 8);
+            if (!n) continue;
+            int32_t cid = 0; rpc_read(pid, n + 0x08, &cid, 4);
+            if (cid == hnd) { hnode = n; break; }
+        }
+        // register requires BOTH nodes +0x30 == 0 (unregistered). Prior probe
+        // runs may have left them at 1 — clear first, register, then report.
+        int32_t zero = 0, one = 1;
+        if (cnode) rpc_write(pid, cnode + 0x30, &zero, 4);
+        if (hnode) rpc_write(pid, hnode + 0x30, &zero, 4);
+        long rr6 = -1, pw = -1;
+        int32_t cf = -1, hf = -1;
+        if (ctx > 0 && hnd > 0 && !s.dead)
+            rr6 = rpc_call(&s, fn_register, ctx, hnd, 0, 0, 0, 0);
+        if (cnode) rpc_read(pid, cnode + 0x30, &cf, 4);
+        if (hnode) rpc_read(pid, hnode + 0x30, &hf, 4);
+        // export needs +0x30 == 1 — if register didn't set it, force it
+        if (cf == 0 && cnode) rpc_write(pid, cnode + 0x30, &one, 4);
+        if (hf == 0 && hnode) rpc_write(pid, hnode + 0x30, &one, 4);
+        // probe7: run the two-phase debug-unlock manually — separate rc per
+        // phase so we can see whether 0x80553909 comes from the 0x90045 bind
+        // or the 0x90046 job.
+        //   sess = 0x800f1fb70()          (global session wrapper)
+        //   buf  = scratch+0x100: 1e9a0(buf) init, 1ea30(buf,hnd) set id
+        //   ph1: 1c7d0(sess,&reqid,buf,hnd,ctx,spec) → poll 1ea90(buf,hnd)
+        //   ph2: 1c850(sess,reqid)                  → final 1e9f0(buf,hnd)
+        intptr_t buf = s.scratch + 0x100;
+        long sess = -1, r1 = -1, r2 = -1, r3 = -1, r4 = -1, r5 = -1;
+        int32_t reqid = -1;
+        // NOTE: lbase = fn_create_ctx-0x150 = lib+0x14000 (not lib base!)
+        if (!s.dead) sess = rpc_call(&s, lbase + 0xbb70, 0, 0, 0, 0, 0, 0);
+        if (!s.dead) r1 = rpc_call(&s, lbase + 0xa9a0, buf, 0, 0, 0, 0, 0);
+        if (!s.dead) r2 = rpc_call(&s, lbase + 0xaa30, buf, hnd, 0, 0, 0, 0);
+        if (!s.dead) r3 = rpc_call(&s, lbase + 0x87d0, sess, s.scratch + 0x1f0,
+                                   buf, hnd, ctx, s.scratch + 0x40);
+        if (!s.dead) rpc_read(pid, s.scratch + 0x1f0, &reqid, 4);
+        if (!s.dead) r4 = rpc_call(&s, lbase + 0xaa90, buf, hnd, 0, 0, 0, 0);
+        if (!s.dead) r5 = rpc_call(&s, lbase + 0x8850, sess, reqid,
+                                   0, 0, 0, 0);
+        if (!s.dead) pw = rpc_call(&s, lbase + 0xa9f0, buf, hnd, 0, 0, 0, 0);
+        snprintf(resp + strlen(resp), sizeof(resp) - strlen(resp),
+                 " probe7 ctx=%d hnd=%d reg=%lx cf=%d hf=%d sess=%lx"
+                 " i=%lx set=%lx ph1=%lx reqid=%d poll=%lx ph2=%lx fin=%lx dead=%d",
+                 ctx, hnd, rr6, cf, hf, sess, r1, r2, r3, reqid, r4, r5, pw, s.dead);
+        rpc_detach(&s);
+        if (game_cred_saved) {
+            kernel_set_ucred_caps(pid, old_game_caps);
+            kernel_set_ucred_attrs(pid, old_game_attrs);
+            kernel_set_ucred_authid(pid, old_game_authid);
+        }
+        kernel_set_ucred_authid(me, old_authid);
+        send_response(session->sock, RESP_DATA, resp, (uint32_t)strlen(resp));
+        return;
+    }
+    // "tcall:<a1_hex>:<a2_hex>" — sentinel arg-delivery test: call the debug
+    // export with literal arg values to map which check returns which rc.
+    if (!strncmp(p, "tcall:", 6)) {
+        long ta1 = strtol(p + 6, NULL, 16);
+        const char *c2 = strchr(p + 6, ':');
+        long ta2 = c2 ? strtol(c2 + 1, NULL, 16) : 0;
+        uint32_t spec[4] = { 1, (uint32_t)first, 0, 0 };
+        rpc_write(pid, s.scratch + 0x40, spec, sizeof(spec));
+        long r = rpc_call(&s, fn_op, ta1, ta2, s.scratch + 0x40, 0, 0, 0);
+        snprintf(resp + strlen(resp), sizeof(resp) - strlen(resp),
+                 " tcall a1=%lx a2=%lx rc=%lx dead=%d", ta1, ta2, r, s.dead);
+        rpc_detach(&s);
+        kernel_set_ucred_authid(me, old_authid);
+        send_response(session->sock, RESP_DATA, resp, (uint32_t)strlen(resp));
+        return;
+    }
+    int ok = 0, fail = 0; long last_rc = 0;
+    if (query_mode) {
+        // sceNpTrophy2GetTrophyUnlockState(ctx, hnd, id, &state) — report rc and
+        // first 16 bytes of the returned state per id. Daemon-authoritative:
+        // tells us whether the posted UDS events actually flipped anything.
+        int got = 0;
+        snprintf(resp + strlen(resp), sizeof(resp) - strlen(resp),
+                 " query ctx=%d hnd=%d:", ctx, hnd);
+        for (int id = first; id <= last && !s.dead && got < 24; id++) {
+            // GetTrophyInfo(ctx,hnd,id,&details,&data) — two 0x80 out-bufs.
+            uint8_t z[0x80]; memset(z, 0, sizeof(z));
+            rpc_write(pid, s.scratch + 0x50, z, sizeof(z));
+            rpc_write(pid, s.scratch + 0xD0, z, sizeof(z));
+            long qr = rpc_call(&s, fn_qstate, ctx, hnd, (long)id,
+                               s.scratch + 0x50, s.scratch + 0xD0, 0);
+            if ((int32_t)qr < 0) continue;   // id doesn't exist — skip silently
+            uint8_t st[0x80], dt[0x80];
+            rpc_read(pid, s.scratch + 0x50, st, sizeof(st));
+            rpc_read(pid, s.scratch + 0xD0, dt, sizeof(dt));
+            // unlocked flag typically lives in data.ts or details; dump the
+            // non-zero-looking fields compactly.
+            snprintf(resp + strlen(resp), sizeof(resp) - strlen(resp),
+                     " [id%d rc=%lx det=%02x%02x%02x%02x:%02x%02x%02x%02x dat=%02x%02x%02x%02x:%02x%02x%02x%02x:%llx]",
+                     id, qr, st[0], st[1], st[2], st[3],
+                     st[8], st[9], st[10], st[11],
+                     dt[0], dt[1], dt[2], dt[3],
+                     dt[4], dt[5], dt[6], dt[7],
+                     (unsigned long long)*(uint64_t*)(dt + 8));
+            got++;
+        }
+        snprintf(resp + strlen(resp), sizeof(resp) - strlen(resp),
+                 " dead=%d", s.dead);
+        rpc_detach(&s);
+        kernel_set_ucred_authid(me, old_authid);
+        send_response(session->sock, RESP_DATA, resp, (uint32_t)strlen(resp));
+        return;
+    }
+    if (ctx > 0 && hnd > 0 && !s.dead) {
+        for (int id = first; id <= last; id++) {
+            long r = -1;
+            // Preferred path: sceNpTrophy2UnlockTrophy(ctx, hnd, id, &plat_out)
+            if (fn_unlock_n > 0) {
+                int32_t plat = -1;
+                rpc_write(pid, s.scratch + 0x48, &plat, 4);
+                r = rpc_call(&s, fn_unlock_n, ctx, hnd, (long)id,
+                             s.scratch + 0x48, 0, 0);
+                if ((int32_t)r >= 0) { ok++; last_rc = r; if (s.dead) break; else continue; }
+                last_rc = r;
+            }
+            // Fallback: SystemDebugUnlockTrophy — try both arg orders and log
+            // both rcs. 13.60 disasm: arg1 → +0x30 table, arg2 → +0x150 table.
+            if (fn_op > 0 && !s.dead) {
+                uint32_t spec[2] = { 1, (uint32_t)id };
+                rpc_write(pid, s.scratch + 0x40, spec, sizeof(spec));
+                long r1 = rpc_call(&s, fn_op, hnd, ctx, s.scratch + 0x40, 0, 0, 0);
+                long r2 = s.dead ? -1 : rpc_call(&s, fn_op, ctx, hnd, s.scratch + 0x40, 0, 0, 0);
+                snprintf(resp + strlen(resp), sizeof(resp) - strlen(resp),
+                         " [id%d hcx=%lx cxh=%lx]", id, r1, r2);
+                r = ((int32_t)r1 >= 0) ? r1 : r2;
+                last_rc = r;
+                if ((int32_t)r >= 0) ok++; else fail++;
+            } else if ((int32_t)r < 0) {
+                fail++;
+            }
+            if (s.dead) break;
+        }
+    }
+
+    if (hnd > 0 && hnd_ours && fn_destroy_h > 0) rpc_call(&s, fn_destroy_h, hnd, 0, 0, 0, 0, 0);
+    if (ctx > 0 && ctx_ours && fn_destroy_c > 0) rpc_call(&s, fn_destroy_c, ctx, 0, 0, 0, 0, 0);
+    rpc_detach(&s);
+    if (game_cred_saved) {
+        kernel_set_ucred_caps(pid, old_game_caps);
+        kernel_set_ucred_attrs(pid, old_game_attrs);
+        kernel_set_ucred_authid(pid, old_game_authid);
+    }
+    kernel_set_ucred_authid(me, old_authid);
+
+    snprintf(resp + strlen(resp), sizeof(resp) - strlen(resp),
+             " uid=%08x ctx=%d(rc=%lx) hnd=%d%s(rc=%lx) reg=%lx auth=%lx ok=%d fail=%d last=%lx dead=%d",
+             uid, ctx, (long)rc_ctx, hnd, hnd_borrowed ? "*" : "", (long)rc_h, (long)rc_reg,
+             (long)old_game_authid, ok, fail, (long)last_rc, s.dead);
+    send_response(session->sock, RESP_DATA, resp, (uint32_t)strlen(resp));
+}
+
 // Handle client
 void *client_thread(void *arg) {
     client_session_t *session = (client_session_t *)arg;
@@ -11023,6 +13683,7 @@ void *client_thread(void *arg) {
         uint8_t cmd = header[0];
         uint32_t data_len;
         memcpy(&data_len, header + 1, 4);
+        dbg_kv("cmd=", cmd);
         
         // Read data if present
         uint8_t *data = NULL;
@@ -11162,6 +13823,17 @@ void *client_thread(void *arg) {
                     send_error(session->sock, "No request data provided");
                 }
                 break;
+            case CMD_TROPHY_LIST:
+                handle_trophy_list(session);
+                break;
+            case CMD_TROPHY_ICON:
+                if (data) handle_trophy_icon(session, (const char *)data);
+                else send_error(session->sock, "Usage: NPWR|file.png");
+                break;
+            case CMD_TROPHY_UNLOCK:
+                if (data) handle_trophy_unlock(session, (const char *)data);
+                else send_error(session->sock, "Usage: unlock:<id|all> | lock:<id>");
+                break;
             case CMD_LIST_SAVES:
                 handle_list_saves(session);
                 break;
@@ -11254,10 +13926,6 @@ void *client_thread(void *arg) {
                 break;
             case CMD_PAD_INFO:
                 handle_pad_info(session);
-                break;
-            case CMD_DISC_DUMP:
-                if (data) handle_disc_dump(session, (const char *)data);
-                else send_error(session->sock, "Usage: start|status|cancel");
                 break;
             case CMD_SCREENSHOT:
                 handle_screenshot(session);
@@ -11589,6 +14257,7 @@ int main() {
     // Boot log — survives crashes, readable via FTP afterwards
     FILE *blog = fopen("/data/ps5_suite_boot.log", "w");
     if (blog) { fputs("main: elevated ok\n", blog); fflush(blog); }
+    dbg_init();
 
     // Self-update handoff: the outgoing instance leaves UPDATE_MARKER when it
     // pushes a new ELF to the loader. Finding a fresh marker means WE are the
@@ -11733,7 +14402,7 @@ int main() {
             // the port forever. Instead of dying (and forcing a PS5 reboot),
             // fall back to a secondary port. The client scans 9113+ range.
             int bound_port = 0;
-            for (int p = SERVER_PORT + 1; p <= SERVER_PORT + 5 && bound_port == 0; p++) {
+            for (int p = SERVER_PORT + 1; p <= SERVER_PORT + 30 && bound_port == 0; p++) {
                 close(server_sock);
                 server_sock = socket(AF_INET, SOCK_STREAM, 0);
                 if (server_sock < 0) break;
@@ -11819,6 +14488,7 @@ bound_ok:
         if (client_sock < 0) {
             continue;
         }
+        dbg_kv("accept fd=", (unsigned long)client_sock);
         
         // Aggressive TCP socket options for sustained high speed
         setsockopt(client_sock, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe));

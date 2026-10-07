@@ -85,11 +85,13 @@ namespace PS5Upload
         PowerAction = 0x77,
         UsbList = 0x78,
         PadInfo = 0x79,
-        DiscDump = 0x7A,
         Screenshot = 0x7B,
         Notify = 0x7C,
         PadAction = 0x7D,
         IccControl = 0x7E,
+        TrophyList = 0x80,
+        TrophyIcon = 0x81,
+        TrophyUnlock = 0x82,
         Shutdown = 0xFF
     }
 
@@ -664,6 +666,133 @@ namespace PS5Upload
             catch (Exception ex)
             {
                 return (false, ex.Message);
+            }
+            finally
+            {
+                _commandLock.Release();
+            }
+        }
+
+        /// <summary>Mount a single game by title id (worker pipeline, filtered).</summary>
+        public async Task<string?> MountGameAsync(string titleId, Action<string>? onProgress = null)
+        {
+            await _commandLock.WaitAsync();
+            try
+            {
+                await SendCommandAsync(Command.MountGame, Encoding.UTF8.GetBytes(titleId));
+                while (true)
+                {
+                    var (response, data) = await ReceiveResponseAsync();
+                    if (response == Response.Progress)
+                    {
+                        string msg = Encoding.UTF8.GetString(data).TrimEnd('\0');
+                        if (!string.IsNullOrEmpty(msg)) onProgress?.Invoke(msg);
+                    }
+                    else if (response == Response.Ok) return Encoding.UTF8.GetString(data);
+                    else if (response == Response.Error) return "ERROR: " + Encoding.UTF8.GetString(data);
+                    else return null;
+                }
+            }
+            catch (Exception ex) { LastError = $"MountGameAsync: {ex.Message}"; return null; }
+            finally { _commandLock.Release(); }
+        }
+
+        // ============ Trophy viewer (NpTrophy V2) ============
+
+        // Returns every registered trophy set with raw tropconf/tropmeta JSON
+        // payloads and the per-user TRPTITLE.DAT blob (empty when the user
+        // never earned anything in that set).
+        public async Task<List<PS5TrophySet>> GetTrophyListAsync()
+        {
+            var sets = new List<PS5TrophySet>();
+            await _commandLock.WaitAsync();
+            try
+            {
+                await SendCommandAsync(Command.TrophyList);
+                var (response, data) = await ReceiveResponseAsync(180000);
+                if (response != Response.Data || data == null || data.Length < 2)
+                    return sets;
+
+                int off = 0;
+                ushort count = BitConverter.ToUInt16(data, off); off += 2;
+
+                string rdStr()
+                {
+                    int l = data[off]; off++;
+                    string s = Encoding.UTF8.GetString(data, off, l); off += l;
+                    return s;
+                }
+                byte[] rdBlob()
+                {
+                    uint l = BitConverter.ToUInt32(data, off); off += 4;
+                    var b = new byte[l];
+                    Array.Copy(data, off, b, 0, l); off += (int)l;
+                    return b;
+                }
+
+                for (int i = 0; i < count; i++)
+                {
+                    sets.Add(new PS5TrophySet
+                    {
+                        NpCommunicationId = rdStr(),
+                        TitleId = rdStr(),
+                        UserId = rdStr(),
+                        TropConfJson = rdBlob(),
+                        TropMetaJson = rdBlob(),
+                        TrpTitleData = rdBlob()
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                LastError = $"GetTrophyListAsync: {ex.GetType().Name}: {ex.Message}";
+            }
+            finally
+            {
+                _commandLock.Release();
+            }
+            return sets;
+        }
+
+        // Fetch a trophy PNG ("trop0000.png", "icon0_en-US.png", …) from a set's UCP.
+        public async Task<byte[]?> GetTrophyIconAsync(string npwr, string entry)
+        {
+            await _commandLock.WaitAsync();
+            try
+            {
+                byte[] req = Encoding.UTF8.GetBytes($"{npwr}|{entry}");
+                await SendCommandAsync(Command.TrophyIcon, req);
+                var (response, data) = await ReceiveResponseAsync();
+                if (response != Response.Data || data == null || data.Length == 0)
+                    return null;
+                return data;
+            }
+            catch
+            {
+                return null;
+            }
+            finally
+            {
+                _commandLock.Release();
+            }
+        }
+
+        // Trophy unlock/lock — "unlock:<id|all>" or "lock:<npwr>:<id>".
+        // Unlock goes through the running game's trophy pipeline; lock is a
+        // direct TRPTITLE.DAT rewrite done by the payload itself.
+        public async Task<(bool ok, string msg)> TrophyUnlockAsync(string spec)
+        {
+            await _commandLock.WaitAsync();
+            try
+            {
+                await SendCommandAsync(Command.TrophyUnlock, Encoding.UTF8.GetBytes(spec + "\0"));
+                var (response, data) = await ReceiveResponseAsync(120000);
+                var msg = Encoding.UTF8.GetString(data ?? Array.Empty<byte>());
+                return (response == Response.Data || response == Response.Ok, msg);
+            }
+            catch (Exception ex)
+            {
+                return (false, $"TrophyUnlockAsync: {ex.GetType().Name}: {ex.Message}");
             }
             finally
             {
@@ -2494,9 +2623,6 @@ namespace PS5Upload
             }
         }
 
-        public Task<(bool success, string message)> DiscDumpAsync(string action)
-            => SendTextCommandAsync(Command.DiscDump, action);
-
         public async Task<(bool success, string message)> CaptureScreenshotAsync()
         {
             await _commandLock.WaitAsync();
@@ -3263,5 +3389,99 @@ namespace PS5Upload
         }
 
         public string ShortUserId => UserId.Length > 8 ? UserId.Substring(0, 8) + "…" : UserId;
+    }
+
+    // ============ Trophy viewer (NpTrophy V2) ============
+
+    // One registered trophy set: raw UCP payloads + per-user TRPTITLE.DAT.
+    public class PS5TrophySet : System.ComponentModel.INotifyPropertyChanged
+    {
+        public string NpCommunicationId { get; set; } = "";
+        public string TitleId { get; set; } = "";
+        public string UserId { get; set; } = "";
+        public byte[] TropConfJson { get; set; } = Array.Empty<byte>();
+        public byte[] TropMetaJson { get; set; } = Array.Empty<byte>();
+        public byte[] TrpTitleData { get; set; } = Array.Empty<byte>();
+
+        public List<PS5Trophy> Trophies { get; } = new();
+
+        public byte[] UnlockMask { get; set; } = Array.Empty<byte>();
+        public bool StateKnown { get; set; }
+        public int EarnedFallback { get; set; } = -1;
+
+        private string _gameName = "";
+        public string GameName
+        {
+            get => _gameName;
+            set { _gameName = value; PropertyChanged?.Invoke(this, new System.ComponentModel.PropertyChangedEventArgs(nameof(GameName))); }
+        }
+
+        private Avalonia.Media.IImage? _icon;
+        public Avalonia.Media.IImage? Icon
+        {
+            get => _icon;
+            set { _icon = value; PropertyChanged?.Invoke(this, new System.ComponentModel.PropertyChangedEventArgs(nameof(Icon))); }
+        }
+
+        public int EarnedCount => StateKnown
+            ? Trophies.Count(t => t.IsUnlocked)
+            : EarnedFallback >= 0 ? EarnedFallback : Trophies.Count(t => t.IsUnlocked);
+        public int TotalCount => Trophies.Count;
+        public string ProgressDisplay => TotalCount == 0
+            ? "—"
+            : (StateKnown || EarnedFallback >= 0)
+                ? $"{EarnedCount}/{TotalCount}"
+                : $"—/{TotalCount}";
+
+        public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
+    }
+
+    // One trophy definition merged with (optional) per-user unlock state.
+    public class PS5Trophy : System.ComponentModel.INotifyPropertyChanged
+    {
+        public int Id { get; set; }
+        public string Name { get; set; } = "";
+        public string Detail { get; set; } = "";
+        public string Grade { get; set; } = "";
+        public bool Hidden { get; set; }
+        public string GroupId { get; set; } = "";
+        public bool IsUnlocked { get; set; }
+        public bool StateKnown { get; set; }
+        public DateTime? UnlockedTime { get; set; }
+
+        public string GradeDisplay => Grade switch
+        {
+            "P" => "Platinum",
+            "G" => "Gold",
+            "S" => "Silver",
+            "B" => "Bronze",
+            _ => "?"
+        };
+        public Avalonia.Media.IBrush GradeBrush => Grade switch
+        {
+            "P" => new Avalonia.Media.SolidColorBrush(Avalonia.Media.Color.Parse("#7FD4FF")),
+            "G" => new Avalonia.Media.SolidColorBrush(Avalonia.Media.Color.Parse("#FFD24A")),
+            "S" => new Avalonia.Media.SolidColorBrush(Avalonia.Media.Color.Parse("#C0C0C0")),
+            "B" => new Avalonia.Media.SolidColorBrush(Avalonia.Media.Color.Parse("#CD7F32")),
+            _ => new Avalonia.Media.SolidColorBrush(Avalonia.Media.Color.Parse("#6C757D"))
+        };
+        public string StateDisplay => !StateKnown
+            ? "—"
+            : IsUnlocked
+                ? (UnlockedTime?.ToString("yyyy-MM-dd HH:mm") ?? "Unlocked")
+                : "Locked";
+        public string HiddenDisplay => Hidden ? "🙈" : "";
+        public string GroupDisplay => string.IsNullOrEmpty(GroupId) || GroupId == "default" ? "Base" : GroupId;
+        public bool CanUnlock => StateKnown && !IsUnlocked;
+        public bool CanLock => StateKnown && IsUnlocked;
+
+        private Avalonia.Media.IImage? _icon;
+        public Avalonia.Media.IImage? Icon
+        {
+            get => _icon;
+            set { _icon = value; PropertyChanged?.Invoke(this, new System.ComponentModel.PropertyChangedEventArgs(nameof(Icon))); }
+        }
+
+        public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
     }
 }

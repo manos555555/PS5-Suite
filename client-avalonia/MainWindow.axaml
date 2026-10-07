@@ -375,10 +375,11 @@
 
                 <!-- PAGE 2: Games -->
                 <Grid x:Name="PageGames" IsVisible="False">
-                    <TabControl Background="#1E1E1E">
+                    <TabControl x:Name="GamesTabControl" Background="#1E1E1E" SelectionChanged="GamesTabControl_SelectionChanged">
                         <TabItem Header="🎮 Games">
                             <Grid>
                                 <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto"/>
                                     <RowDefinition Height="Auto"/>
                                     <RowDefinition Height="*"/>
                                 </Grid.RowDefinitions>
@@ -392,7 +393,25 @@
                         </WrapPanel>
                     </Border>
 
-                    <ListBox Grid.Row="1" x:Name="MountedGamesListBox" Background="#1E1E1E" BorderThickness="0" DoubleTapped="MountedGamesListBox_DoubleTapped">
+                    <Border Grid.Row="1" Background="#252526" CornerRadius="4" Padding="8" Margin="0,0,0,10">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBox x:Name="GameSearchBox" PlaceholderText="🔍 Search games..." TextChanged="GameSearchBox_TextChanged" Background="#1E1E1E" BorderBrush="#3E3E42" VerticalContentAlignment="Center"/>
+                            <ComboBox Grid.Column="1" x:Name="GameSortComboBox" Width="150" Margin="8,0,0,0" SelectedIndex="0" SelectionChanged="GameSortComboBox_SelectionChanged" VerticalContentAlignment="Center">
+                                <ComboBoxItem>Name A→Z</ComboBoxItem>
+                                <ComboBoxItem>Name Z→A</ComboBoxItem>
+                                <ComboBoxItem>Size ↑</ComboBoxItem>
+                                <ComboBoxItem>Size ↓</ComboBoxItem>
+                                <ComboBoxItem>Title ID</ComboBoxItem>
+                                <ComboBoxItem>Mounted first</ComboBoxItem>
+                            </ComboBox>
+                        </Grid>
+                    </Border>
+
+                    <ListBox Grid.Row="2" x:Name="MountedGamesListBox" Background="#1E1E1E" BorderThickness="0" DoubleTapped="MountedGamesListBox_DoubleTapped">
                         <ListBox.ContextMenu>
                             <ContextMenu>
                                 <MenuItem Header="▶ Launch Game" Click="LaunchGameMenuItem_Click"/>
@@ -466,9 +485,14 @@
                                                         <ColumnDefinition Width="*"/>
                                                         <ColumnDefinition Width="Auto"/>
                                                     </Grid.ColumnDefinitions>
-                                                    <Border Grid.Column="0" Width="64" Height="64" Margin="0,0,15,0" Background="#3E3E42" CornerRadius="8" ClipToBounds="True">
-                                                        <Image Source="{Binding Cover}" Stretch="UniformToFill"/>
-                                                    </Border>
+                                                    <Grid Grid.Column="0" Width="64" Height="64" Margin="0,0,15,0">
+                                                        <Border Background="#3E3E42" CornerRadius="8">
+                                                            <TextBlock Text="📦" FontSize="28" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                                        </Border>
+                                                        <Border CornerRadius="8" ClipToBounds="True">
+                                                            <Image Source="{Binding Cover}" Stretch="UniformToFill"/>
+                                                        </Border>
+                                                    </Grid>
                                                     <StackPanel Grid.Column="1" VerticalAlignment="Center">
                                                         <TextBlock Text="{Binding Name}" FontSize="15" FontWeight="Bold"/>
                                                         <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
@@ -485,6 +509,192 @@
                                         </DataTemplate>
                                     </ListBox.ItemTemplate>
                                 </ListBox>
+                            </Grid>
+                        </TabItem>
+
+                        <!-- Prospero Store Site (homebrew.page native PS5 catalog) -->
+                        <TabItem Header="🌐 Prospero Store Site">
+                            <Grid>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="*"/>
+                                </Grid.RowDefinitions>
+                                <Border Grid.Row="0" Background="#252526" CornerRadius="4" Padding="12" Margin="0,0,0,15">
+                                    <WrapPanel>
+                                        <TextBlock Text="🌐 Prospero Store Site" FontSize="16" FontWeight="Bold" Foreground="#007ACC" VerticalAlignment="Center" Margin="0,0,15,0"/>
+                                        <Button Content="🔄 Refresh Catalog" Click="ProsperoRefresh_Click" Padding="10,5" Margin="0,0,8,0"/>
+                                        <TextBlock x:Name="ProsperoStatusText" Text="" Foreground="#999999" VerticalAlignment="Center"/>
+                                    </WrapPanel>
+                                </Border>
+                                <Border Grid.Row="1" Background="#252526" CornerRadius="4" Padding="8" Margin="0,0,0,10">
+                                    <Grid>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+                                        <TextBox x:Name="ProsperoSearchBox" PlaceholderText="🔍 Search apps..." TextChanged="ProsperoSearch_TextChanged" Background="#1E1E1E" BorderBrush="#3E3E42" VerticalContentAlignment="Center"/>
+                                        <ComboBox Grid.Column="1" x:Name="ProsperoCategoryComboBox" Width="140" Margin="8,0,0,0" SelectedIndex="0" SelectionChanged="ProsperoCategory_SelectionChanged" VerticalContentAlignment="Center">
+                                            <ComboBoxItem>All</ComboBoxItem>
+                                            <ComboBoxItem>Apps</ComboBoxItem>
+                                            <ComboBoxItem>Games</ComboBoxItem>
+                                            <ComboBoxItem>Tools</ComboBoxItem>
+                                            <ComboBoxItem>Coming soon</ComboBoxItem>
+                                        </ComboBox>
+                                        <ComboBox Grid.Column="2" x:Name="ProsperoSortComboBox" Width="150" Margin="8,0,0,0" SelectedIndex="0" SelectionChanged="ProsperoSort_SelectionChanged" VerticalContentAlignment="Center">
+                                            <ComboBoxItem>Name A→Z</ComboBoxItem>
+                                            <ComboBoxItem>Name Z→A</ComboBoxItem>
+                                            <ComboBoxItem>Size ↑</ComboBoxItem>
+                                            <ComboBoxItem>Size ↓</ComboBoxItem>
+                                            <ComboBoxItem>Newest first</ComboBoxItem>
+                                            <ComboBoxItem>Author</ComboBoxItem>
+                                        </ComboBox>
+                                    </Grid>
+                                </Border>
+                                <ListBox Grid.Row="2" x:Name="ProsperoListBox" Background="#1E1E1E" BorderThickness="0">
+                                    <ListBox.ItemTemplate>
+                                        <DataTemplate>
+                                            <Border Background="#2D2D30" CornerRadius="6" Padding="12" Margin="3">
+                                                <Grid>
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="Auto"/>
+                                                        <ColumnDefinition Width="*"/>
+                                                        <ColumnDefinition Width="Auto"/>
+                                                    </Grid.ColumnDefinitions>
+                                                    <Grid Grid.Column="0" Width="64" Height="64" Margin="0,0,15,0">
+                                                        <Border Background="#3E3E42" CornerRadius="8">
+                                                            <TextBlock Text="🧩" FontSize="28" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                                        </Border>
+                                                        <Border CornerRadius="8" ClipToBounds="True">
+                                                            <Image Source="{Binding Icon}" Stretch="UniformToFill"/>
+                                                        </Border>
+                                                    </Grid>
+                                                    <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                                        <TextBlock Text="{Binding Name}" FontSize="15" FontWeight="Bold"/>
+                                                        <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
+                                                            <TextBlock Text="{Binding TitleId}" FontSize="12" Foreground="#007ACC" FontWeight="SemiBold"/>
+                                                            <TextBlock Text=" • " Foreground="#666666"/>
+                                                            <TextBlock Text="{Binding Version}" FontSize="12" Foreground="#FFC107"/>
+                                                            <TextBlock Text=" • " Foreground="#666666"/>
+                                                            <TextBlock Text="{Binding Author}" FontSize="12" Foreground="#9CDCFE"/>
+                                                            <TextBlock Text=" • " Foreground="#666666"/>
+                                                            <TextBlock Text="{Binding KindDisplay}" FontSize="12" Foreground="#CE9178"/>
+                                                            <TextBlock Text=" • " Foreground="#666666"/>
+                                                            <TextBlock Text="{Binding SizeDisplay}" FontSize="12" Foreground="#888888"/>
+                                                        </StackPanel>
+                                                        <TextBlock Text="{Binding StatusDisplay}" FontSize="11" Foreground="{Binding StatusColor}" Margin="0,3,0,0"/>
+                                                    </StackPanel>
+                                                    <Button Grid.Column="2" Content="{Binding InstallLabel}" Click="ProsperoInstall_Click" Tag="{Binding TitleId}" Padding="12,6" Background="#28A745" VerticalAlignment="Center" IsEnabled="{Binding CanInstall}"/>
+                                                </Grid>
+                                            </Border>
+                                        </DataTemplate>
+                                    </ListBox.ItemTemplate>
+                                </ListBox>
+                            </Grid>
+                        </TabItem>
+
+                        <!-- Trophies (NpTrophy V2 viewer) -->
+                        <TabItem Header="🏆 Trophies">
+                            <Grid>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="*"/>
+                                </Grid.RowDefinitions>
+                                <Border Grid.Row="0" Background="#252526" CornerRadius="4" Padding="12" Margin="0,0,0,15">
+                                    <WrapPanel>
+                                        <TextBlock Text="🏆 Trophies" FontSize="16" FontWeight="Bold" Foreground="#007ACC" VerticalAlignment="Center" Margin="0,0,15,0"/>
+                                        <TextBlock x:Name="TrophyStatusText" Text="" Foreground="#999999" VerticalAlignment="Center"/>
+                                    </WrapPanel>
+                                </Border>
+                                <Border Grid.Row="1" Background="#252526" CornerRadius="4" Padding="8" Margin="0,0,0,10">
+                                    <Grid>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+                                        <TextBox x:Name="TrophySetSearchBox" PlaceholderText="🔍 Search games..." TextChanged="TrophySetSearchBox_TextChanged" Background="#1E1E1E" BorderBrush="#3E3E42" VerticalContentAlignment="Center"/>
+                                        <ComboBox Grid.Column="1" x:Name="TrophySetSortComboBox" Width="150" Margin="8,0,0,0" SelectedIndex="0" SelectionChanged="TrophySetSortComboBox_SelectionChanged" VerticalContentAlignment="Center">
+                                            <ComboBoxItem>Name A→Z</ComboBoxItem>
+                                            <ComboBoxItem>Name Z→A</ComboBoxItem>
+                                            <ComboBoxItem>Progress ↑</ComboBoxItem>
+                                            <ComboBoxItem>Progress ↓</ComboBoxItem>
+                                            <ComboBoxItem>Trophy count</ComboBoxItem>
+                                        </ComboBox>
+                                    </Grid>
+                                </Border>
+                                <Grid Grid.Row="2">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="320"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <ListBox Grid.Column="0" x:Name="TrophySetsListBox" Background="#1E1E1E" BorderThickness="0" SelectionChanged="TrophySetsListBox_SelectionChanged" Margin="0,0,8,0">
+                                        <ListBox.ItemTemplate>
+                                            <DataTemplate>
+                                                <Border Background="#2D2D30" CornerRadius="6" Padding="10" Margin="3">
+                                                    <Grid>
+                                                        <Grid.ColumnDefinitions>
+                                                            <ColumnDefinition Width="Auto"/>
+                                                            <ColumnDefinition Width="*"/>
+                                                        </Grid.ColumnDefinitions>
+                                                        <Border Grid.Column="0" Width="48" Height="48" Margin="0,0,10,0" Background="#3E3E42" CornerRadius="6" ClipToBounds="True">
+                                                            <Image Source="{Binding Icon}" Stretch="UniformToFill"/>
+                                                        </Border>
+                                                        <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                                            <TextBlock Text="{Binding GameName}" FontSize="13" FontWeight="Bold" TextTrimming="CharacterEllipsis"/>
+                                                            <StackPanel Orientation="Horizontal" Margin="0,3,0,0">
+                                                                <TextBlock Text="{Binding NpCommunicationId}" FontSize="11" Foreground="#007ACC"/>
+                                                                <TextBlock Text=" • " Foreground="#666666"/>
+                                                                <TextBlock Text="{Binding ProgressDisplay}" FontSize="11" Foreground="#9CDCFE"/>
+                                                            </StackPanel>
+                                                        </StackPanel>
+                                                    </Grid>
+                                                </Border>
+                                            </DataTemplate>
+                                        </ListBox.ItemTemplate>
+                                    </ListBox>
+                                    <ListBox Grid.Column="1" x:Name="TrophyItemsListBox" Background="#1E1E1E" BorderThickness="0">
+                                        <ListBox.ItemTemplate>
+                                            <DataTemplate>
+                                                <Border Background="#2D2D30" CornerRadius="6" Padding="10" Margin="3">
+                                                    <Grid>
+                                                        <Grid.ColumnDefinitions>
+                                                            <ColumnDefinition Width="Auto"/>
+                                                            <ColumnDefinition Width="*"/>
+                                                            <ColumnDefinition Width="Auto"/>
+                                                        </Grid.ColumnDefinitions>
+                                                        <Border Grid.Column="0" Width="48" Height="48" Margin="0,0,10,0" Background="#3E3E42" CornerRadius="6" ClipToBounds="True">
+                                                            <Image Source="{Binding Icon}" Stretch="UniformToFill"/>
+                                                        </Border>
+                                                        <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                                            <StackPanel Orientation="Horizontal">
+                                                                <TextBlock Text="{Binding Name}" FontSize="13" FontWeight="Bold"/>
+                                                                <TextBlock Text="{Binding HiddenDisplay}" Margin="6,0,0,0"/>
+                                                            </StackPanel>
+                                                            <TextBlock Text="{Binding Detail}" FontSize="11" Foreground="#AAAAAA" TextWrapping="Wrap" Margin="0,3,0,0"/>
+                                                            <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
+                                                                <TextBlock Text="{Binding GroupDisplay}" FontSize="10" Foreground="#888888"/>
+                                                            </StackPanel>
+                                                        </StackPanel>
+                                                        <StackPanel Grid.Column="2" VerticalAlignment="Center" HorizontalAlignment="Right">
+                                                            <Border Background="{Binding GradeBrush}" CornerRadius="10" Padding="10,4" HorizontalAlignment="Right">
+                                                                <TextBlock Text="{Binding GradeDisplay}" FontSize="11" Foreground="#202020" FontWeight="Bold"/>
+                                                            </Border>
+                                                            <TextBlock Text="{Binding StateDisplay}" FontSize="10" Foreground="#999999" Margin="0,5,0,0" HorizontalAlignment="Right"/>
+                                                            <Button Content="🔓 Unlock" FontSize="10" Padding="10,2" Margin="0,5,0,0" HorizontalAlignment="Right"
+                                                                    IsVisible="{Binding CanUnlock}" Click="TrophyUnlock_Click"
+                                                                    ToolTip.Tip="Debug-unlock this trophy — requires the game to be RUNNING on the PS5"/>
+                                                            <Button Content="🔒 Lock" FontSize="10" Padding="10,2" Margin="0,5,0,0" HorizontalAlignment="Right"
+                                                                    IsVisible="{Binding CanLock}" Click="TrophyLock_Click"
+                                                                    ToolTip.Tip="Re-lock this trophy — rewrites TRPTITLE.DAT on the console (close the game first)"/>
+                                                        </StackPanel>
+                                                    </Grid>
+                                                </Border>
+                                            </DataTemplate>
+                                        </ListBox.ItemTemplate>
+                                    </ListBox>
+                                </Grid>
                             </Grid>
                         </TabItem>
                     </TabControl>
@@ -1177,18 +1387,6 @@
                                         </StackPanel>
                                     </Border>
 
-                                    <TextBlock Text="💿 Disc Dump" FontWeight="Bold" FontSize="16" Foreground="#0E9CFF" Margin="0,0,0,15"/>
-                                    <Border Background="#252526" BorderBrush="#3E3E42" BorderThickness="1" CornerRadius="6" Padding="15" Margin="0,0,0,15">
-                                        <StackPanel>
-                                            <WrapPanel Margin="0,0,0,10">
-                                                <Button Content="▶ Start Dump" Click="DiscDumpStart_Click" Padding="12,6" Background="#28A745" Margin="0,0,8,0"/>
-                                                <Button Content="🔄 Status" Click="DiscDumpStatus_Click" Padding="12,6" Background="#3E3E42" Margin="0,0,8,0"/>
-                                                <Button Content="⏹ Cancel" Click="DiscDumpCancel_Click" Padding="12,6" Background="#DC3545"/>
-                                            </WrapPanel>
-                                            <ProgressBar x:Name="DiscDumpProgress" Height="8" Minimum="0" Maximum="100" Value="0" Margin="0,0,0,8"/>
-                                            <TextBlock x:Name="DiscDumpStatusText" Text="Insert a disc, then Start — copies /mnt/disc → /user/data/disc_dumps" Foreground="#999999" FontSize="11" TextWrapping="Wrap"/>
-                                        </StackPanel>
-                                    </Border>
                                 </StackPanel>
                             </ScrollViewer>
                         </TabItem>

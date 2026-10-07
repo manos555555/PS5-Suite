@@ -51,6 +51,8 @@
                         <ListBoxItem>📁 File Transfer</ListBoxItem>
                         <ListBoxItem>🎮 Games</ListBoxItem>
                         <ListBoxItem>🛒 Homebrew Store</ListBoxItem>
+                        <ListBoxItem>🌐 Prospero Store</ListBoxItem>
+                        <ListBoxItem>🏆 Trophies</ListBoxItem>
                         <ListBoxItem>💾 Saves &amp; Media</ListBoxItem>
                         <ListBoxItem>🖥️ System Info</ListBoxItem>
                         <ListBoxItem>🛠️ Tools</ListBoxItem>
@@ -93,7 +95,7 @@
 
             <!-- Files Tab -->
             <Panel x:Name="PageFiles" IsVisible="False">
-                <Grid RowDefinitions="Auto,*">
+                <Grid RowDefinitions="Auto,Auto,*">
                     <Border Grid.Row="0" Background="#252526" Padding="10">
                         <Grid ColumnDefinitions="*,Auto">
                             <TextBlock x:Name="CurrentPathText" Text="/data" Foreground="#A0A0A0" 
@@ -101,7 +103,15 @@
                             <Button Grid.Column="1" Content="⬆️" Background="#3E3E42" Padding="10" Click="GoUpButton_Click"/>
                         </Grid>
                     </Border>
-                    <ListBox Grid.Row="1" x:Name="FilesListBox" Background="#1E1E1E" 
+                    <WrapPanel Grid.Row="1" Margin="10,6" Orientation="Horizontal">
+                        <Button Content="🔄 Refresh" Background="#3E3E42" Foreground="White" Padding="10" Margin="0,4,6,4" Click="FilesRefresh_Click"/>
+                        <Button Content="📤 Upload" Background="#007ACC" Foreground="White" Padding="10" Margin="0,4,6,4" Click="FileUpload_Click"/>
+                        <Button Content="📁 New Folder" Background="#3E3E42" Foreground="White" Padding="10" Margin="0,4,6,4" Click="FileNewFolder_Click"/>
+                        <Button Content="⬇️ Download" Background="#3E3E42" Foreground="White" Padding="10" Margin="0,4,6,4" Click="FileDownload_Click"/>
+                        <Button Content="📝 Rename" Background="#3E3E42" Foreground="White" Padding="10" Margin="0,4,6,4" Click="FileRename_Click"/>
+                        <Button Content="🗑️ Delete" Background="#DC3545" Foreground="White" Padding="10" Margin="0,4,6,4" Click="FileDelete_Click"/>
+                    </WrapPanel>
+                    <ListBox Grid.Row="2" x:Name="FilesListBox" Background="#1E1E1E" 
                              SelectionMode="Single" DoubleTapped="FilesListBox_DoubleTapped">
                         <ListBox.ItemTemplate>
                             <DataTemplate>
@@ -124,30 +134,52 @@
 
             <!-- Games Tab -->
             <Panel x:Name="PageGames" IsVisible="False">
-                <Grid RowDefinitions="Auto,Auto,*">
+                <Grid RowDefinitions="Auto,Auto,Auto,*">
                     <Border Grid.Row="0" Background="#252526" Padding="10">
-                        <Grid ColumnDefinitions="*,Auto">
-                            <TextBlock Text="Mounted Games" Foreground="#0E9CFF" FontWeight="Bold" FontSize="14" VerticalAlignment="Center"/>
-                            <Button Grid.Column="1" Content="🔄" Background="#3E3E42" Padding="10" Click="RefreshGamesButton_Click"/>
-                        </Grid>
+                        <StackPanel Spacing="8">
+                            <Grid ColumnDefinitions="*,Auto">
+                                <TextBox x:Name="GameSearchBox" Watermark="Search games..."
+                                         Background="#2D2D30" BorderBrush="#3E3E42" Padding="10"
+                                         TextChanged="GameSearch_TextChanged"/>
+                                <Button Grid.Column="1" Content="🔄" Background="#3E3E42" Padding="10" Click="RefreshGamesButton_Click"/>
+                            </Grid>
+                            <Grid ColumnDefinitions="*,Auto">
+                                <TextBlock x:Name="GameCountText" Text="Games" Foreground="#0E9CFF" FontWeight="Bold" FontSize="13" VerticalAlignment="Center"/>
+                                <ComboBox x:Name="GameSortCombo" Grid.Column="1" Background="#2D2D30" SelectedIndex="0"
+                                          SelectionChanged="GameSort_SelectionChanged">
+                                    <ComboBoxItem>Name A→Z</ComboBoxItem>
+                                    <ComboBoxItem>Name Z→A</ComboBoxItem>
+                                    <ComboBoxItem>Size ↑</ComboBoxItem>
+                                    <ComboBoxItem>Size ↓</ComboBoxItem>
+                                </ComboBox>
+                            </Grid>
+                        </StackPanel>
                     </Border>
-                    <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="8" Margin="10,6">
-                        <Button Content="🎮 Mount All" Background="#007ACC" Foreground="White" Padding="12" Click="MountGamesButton_Click"/>
-                        <Button Content="▶️ Launch" Background="#3E3E42" Foreground="White" Padding="12" Click="LaunchGameButton_Click"/>
-                        <Button Content="🗑️ Unmount" Background="#3E3E42" Foreground="White" Padding="12" Click="UnmountGameButton_Click"/>
-                    </StackPanel>
-                    <ListBox Grid.Row="2" x:Name="GamesListBox" Background="#1E1E1E">
+                    <WrapPanel Grid.Row="1" Margin="10,6" Orientation="Horizontal">
+                        <Button Content="🎮 Mount All" Background="#007ACC" Foreground="White" Padding="10" Margin="0,4,6,4" Click="MountGamesButton_Click"/>
+                        <Button Content="📥 Mount" Background="#3E3E42" Foreground="White" Padding="10" Margin="0,4,6,4" Click="MountGameButton_Click"/>
+                        <Button Content="▶️ Launch" Background="#3E3E42" Foreground="White" Padding="10" Margin="0,4,6,4" Click="LaunchGameButton_Click"/>
+                        <Button Content="⏹ Stop" Background="#DC3545" Foreground="White" Padding="10" Margin="0,4,6,4" Click="StopGameButton_Click"/>
+                        <Button Content="🗑️ Unmount" Background="#3E3E42" Foreground="White" Padding="10" Margin="0,4,6,4" Click="UnmountGameButton_Click"/>
+                    </WrapPanel>
+                    <TextBlock Grid.Row="2" x:Name="RunningAppsText" Text="" Foreground="#28A745" FontSize="11" Margin="12,0" TextWrapping="Wrap" IsVisible="False"/>
+                    <ListBox Grid.Row="3" x:Name="GamesListBox" Background="#1E1E1E">
                         <ListBox.ItemTemplate>
                             <DataTemplate>
                                 <Border Background="#2D2D30" CornerRadius="8" Padding="12" Margin="4">
                                     <Grid ColumnDefinitions="Auto,*">
                                         <Border Grid.Column="0" Width="60" Height="60" Background="#3E3E42" 
-                                                CornerRadius="8" Margin="0,0,12,0">
-                                            <TextBlock Text="🎮" FontSize="28" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                                CornerRadius="8" Margin="0,0,12,0" ClipToBounds="True">
+                                            <Panel>
+                                                <TextBlock Text="🎮" FontSize="28" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                                <Image Source="{Binding Icon}" Stretch="UniformToFill"/>
+                                            </Panel>
                                         </Border>
                                         <StackPanel Grid.Column="1" VerticalAlignment="Center">
                                             <TextBlock Text="{Binding Name}" FontSize="14" FontWeight="Bold" TextTrimming="CharacterEllipsis"/>
-                                            <TextBlock Text="{Binding TitleId}" FontSize="12" Foreground="#0E9CFF"/>
+                                            <TextBlock FontSize="12" Foreground="#0E9CFF">
+                                                <Run Text="{Binding TitleId}"/><Run Text="{Binding RunningBadge}" Foreground="#28A745"/>
+                                            </TextBlock>
                                             <TextBlock Text="{Binding SizeText}" FontSize="11" Foreground="#808080"/>
                                         </StackPanel>
                                     </Grid>
@@ -201,6 +233,140 @@
                 </Grid>
             </Panel>
 
+            <!-- Prospero Store Tab (homebrew.page native PS5 apps) -->
+            <Panel x:Name="PageProspero" IsVisible="False">
+                <Grid RowDefinitions="Auto,Auto,*">
+                    <Border Grid.Row="0" Background="#252526" Padding="10">
+                        <StackPanel Spacing="8">
+                            <Grid ColumnDefinitions="*,Auto">
+                                <TextBox x:Name="ProsperoSearchBox" Watermark="Search Prospero store..."
+                                         Background="#2D2D30" BorderBrush="#3E3E42" Padding="10"
+                                         TextChanged="ProsperoSearch_TextChanged"/>
+                                <Button Grid.Column="1" Content="🔄" Background="#3E3E42" Padding="10" Click="ProsperoRefresh_Click"/>
+                            </Grid>
+                            <ComboBox x:Name="ProsperoCategoryCombo" Background="#2D2D30" SelectedIndex="0"
+                                      HorizontalAlignment="Stretch" SelectionChanged="ProsperoCategory_SelectionChanged">
+                                <ComboBoxItem>📦 All</ComboBoxItem>
+                                <ComboBoxItem>🧩 Apps</ComboBoxItem>
+                                <ComboBoxItem>🎮 Games</ComboBoxItem>
+                                <ComboBoxItem>🔧 Tools</ComboBoxItem>
+                                <ComboBoxItem>⏳ Coming soon</ComboBoxItem>
+                            </ComboBox>
+                            <TextBlock x:Name="ProsperoStatusText" Text="Tap 🔄 to fetch homebrew.page catalog" Foreground="#808080" FontSize="11"/>
+                        </StackPanel>
+                    </Border>
+                    <ProgressBar Grid.Row="1" x:Name="ProsperoProgress" Height="6" Minimum="0" Maximum="100" Value="0"
+                                 Background="#1E1E1E" Foreground="#0E9CFF" IsVisible="False"/>
+                    <ListBox Grid.Row="2" x:Name="ProsperoListBox" Background="#1E1E1E">
+                        <ListBox.ItemTemplate>
+                            <DataTemplate>
+                                <Border Background="#2D2D30" CornerRadius="8" Padding="12" Margin="4">
+                                    <Grid ColumnDefinitions="Auto,*,Auto">
+                                        <Border Grid.Column="0" Width="52" Height="52" Background="#3E3E42"
+                                                CornerRadius="8" Margin="0,0,12,0" ClipToBounds="True">
+                                            <Panel>
+                                                <TextBlock Text="📦" FontSize="24" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                                <Image Source="{Binding IconImage}" Stretch="UniformToFill"/>
+                                            </Panel>
+                                        </Border>
+                                        <StackPanel Grid.Column="1" VerticalAlignment="Center" Margin="0,0,8,0">
+                                            <TextBlock Text="{Binding Name}" FontSize="13" FontWeight="Bold" TextTrimming="CharacterEllipsis"/>
+                                            <TextBlock Text="{Binding TitleId}" FontSize="11" Foreground="#0E9CFF"/>
+                                            <TextBlock FontSize="10" Foreground="#808080">
+                                                <Run Text="{Binding MetaLine}"/>
+                                            </TextBlock>
+                                        </StackPanel>
+                                        <Button Grid.Column="2" Content="{Binding ButtonLabel}" Background="#007ACC" Foreground="White"
+                                                Padding="8" VerticalAlignment="Center" Tag="{Binding TitleId}"
+                                                IsEnabled="{Binding CanInstall}" Click="ProsperoInstall_Click"/>
+                                    </Grid>
+                                </Border>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+                </Grid>
+            </Panel>
+
+            <!-- Trophies Tab -->
+            <Panel x:Name="PageTrophies" IsVisible="False">
+                <Grid RowDefinitions="Auto,Auto,*">
+                    <Border Grid.Row="0" Background="#252526" Padding="10">
+                        <StackPanel Spacing="8">
+                            <Grid ColumnDefinitions="*,Auto">
+                                <TextBox x:Name="TrophySearchBox" Watermark="Search trophy sets..."
+                                         Background="#2D2D30" BorderBrush="#3E3E42" Padding="10"
+                                         TextChanged="TrophySearch_TextChanged"/>
+                                <Button Grid.Column="1" Content="🔄" Background="#3E3E42" Padding="10" Click="TrophyRefresh_Click"/>
+                            </Grid>
+                            <TextBlock x:Name="TrophyStatusText" Text="Tap 🔄 to load trophy sets" Foreground="#808080" FontSize="11"/>
+                        </StackPanel>
+                    </Border>
+                    <Border Grid.Row="1" Background="#252526" Padding="6,0" x:Name="TrophyBackBar" IsVisible="False">
+                        <Button Content="← Back to sets" Background="Transparent" Foreground="#0E9CFF"
+                                Padding="10" Click="TrophyBack_Click"/>
+                    </Border>
+                    <ListBox Grid.Row="2" x:Name="TrophySetsListBox" Background="#1E1E1E"
+                             SelectionChanged="TrophySet_SelectionChanged">
+                        <ListBox.ItemTemplate>
+                            <DataTemplate>
+                                <Border Background="#2D2D30" CornerRadius="8" Padding="12" Margin="4">
+                                    <Grid ColumnDefinitions="Auto,*">
+                                        <Border Grid.Column="0" Width="52" Height="52" Background="#3E3E42"
+                                                CornerRadius="8" Margin="0,0,12,0" ClipToBounds="True">
+                                            <Panel>
+                                                <TextBlock Text="🏆" FontSize="24" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                                <Image Source="{Binding Icon}" Stretch="UniformToFill"/>
+                                            </Panel>
+                                        </Border>
+                                        <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                            <TextBlock Text="{Binding GameName}" FontSize="14" FontWeight="Bold" TextTrimming="CharacterEllipsis"/>
+                                            <TextBlock Text="{Binding NpCommunicationId}" FontSize="11" Foreground="#0E9CFF"/>
+                                            <TextBlock FontSize="11" Foreground="#808080">
+                                                <Run Text="{Binding ProgressDisplay}"/><Run Text=" earned"/>
+                                            </TextBlock>
+                                        </StackPanel>
+                                    </Grid>
+                                </Border>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+                    <ListBox Grid.Row="2" x:Name="TrophyItemsListBox" Background="#1E1E1E" IsVisible="False">
+                        <ListBox.ItemTemplate>
+                            <DataTemplate>
+                                <Border Background="#2D2D30" CornerRadius="8" Padding="10" Margin="4">
+                                    <Grid ColumnDefinitions="Auto,*,Auto">
+                                        <Border Grid.Column="0" Width="44" Height="44" Background="#3E3E42"
+                                                CornerRadius="6" Margin="0,0,10,0" ClipToBounds="True">
+                                            <Panel>
+                                                <TextBlock Text="🏆" FontSize="20" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                                <Image Source="{Binding Icon}" Stretch="UniformToFill"/>
+                                            </Panel>
+                                        </Border>
+                                        <StackPanel Grid.Column="1" VerticalAlignment="Center" Margin="0,0,8,0">
+                                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                                <TextBlock Text="{Binding Name}" FontSize="13" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
+                                                <TextBlock Text="{Binding HiddenDisplay}" FontSize="11"/>
+                                            </StackPanel>
+                                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                                <TextBlock Text="{Binding GradeDisplay}" FontSize="10" FontWeight="Bold" Foreground="{Binding GradeBrush}"/>
+                                                <TextBlock Text="{Binding StateDisplay}" FontSize="10" Foreground="#808080"/>
+                                            </StackPanel>
+                                            <TextBlock Text="{Binding Detail}" FontSize="10" Foreground="#606060" TextTrimming="CharacterEllipsis"/>
+                                        </StackPanel>
+                                        <StackPanel Grid.Column="2" VerticalAlignment="Center" Spacing="4">
+                                            <Button Content="🔓" Background="#28A745" Foreground="White" Padding="8"
+                                                    IsVisible="{Binding CanUnlock}" Click="TrophyUnlock_Click"/>
+                                            <Button Content="🔒" Background="#DC3545" Foreground="White" Padding="8"
+                                                    IsVisible="{Binding CanLock}" Click="TrophyLock_Click"/>
+                                        </StackPanel>
+                                    </Grid>
+                                </Border>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+                </Grid>
+            </Panel>
+
             <!-- Saves & Media Tab -->
             <Panel x:Name="PageSaves" IsVisible="False">
                 <ScrollViewer>
@@ -229,11 +395,15 @@
                                         </DataTemplate>
                                     </ListBox.ItemTemplate>
                                 </ListBox>
-                                <StackPanel Orientation="Horizontal" Spacing="8">
-                                    <Button Content="🔓 Mount" Background="#007ACC" Foreground="White" Padding="10" Click="SaveMountButton_Click"/>
-                                    <Button Content="🔒 Unmount" Background="#3E3E42" Foreground="White" Padding="10" Click="SaveUnmountButton_Click"/>
-                                    <Button Content="🗑️ Delete" Background="#DC3545" Foreground="White" Padding="10" Click="SaveDeleteButton_Click"/>
-                                </StackPanel>
+                                <WrapPanel Orientation="Horizontal">
+                                    <Button Content="🔓 Mount" Background="#007ACC" Foreground="White" Padding="10" Margin="0,4,6,4" Click="SaveMountButton_Click"/>
+                                    <Button Content="🔒 Unmount" Background="#3E3E42" Foreground="White" Padding="10" Margin="0,4,6,4" Click="SaveUnmountButton_Click"/>
+                                    <Button Content="📂 Browse" Background="#3E3E42" Foreground="White" Padding="10" Margin="0,4,6,4" Click="SaveBrowseButton_Click"/>
+                                    <Button Content="� Backup" Background="#28A745" Foreground="White" Padding="10" Margin="0,4,6,4" Click="SaveBackupButton_Click"/>
+                                    <Button Content="📥 Raw" Background="#3E3E42" Foreground="White" Padding="10" Margin="0,4,6,4" Click="SaveBackupRaw_Click"/>
+                                    <Button Content="📤 Restore" Background="#FFC107" Foreground="#1E1E1E" Padding="10" Margin="0,4,6,4" Click="SaveRestoreButton_Click"/>
+                                    <Button Content="�🗑️ Delete" Background="#DC3545" Foreground="White" Padding="10" Margin="0,4,6,4" Click="SaveDeleteButton_Click"/>
+                                </WrapPanel>
                                 <TextBlock Text="Mounted saves are browsable at /data/save_mnt" Foreground="#606060" FontSize="10"/>
                             </StackPanel>
                         </Border>
@@ -251,18 +421,23 @@
                                     <ListBox.ItemTemplate>
                                         <DataTemplate>
                                             <Border Background="#2D2D30" CornerRadius="4" Padding="10" Margin="3">
-                                                <StackPanel>
-                                                    <TextBlock Text="{Binding FileName}" FontSize="12" FontWeight="SemiBold"/>
-                                                    <TextBlock FontSize="10" Foreground="#808080">
-                                                        <Run Text="{Binding DateDisplay}"/><Run Text="  ·  "/><Run Text="{Binding SizeDisplay}"/>
-                                                    </TextBlock>
-                                                </StackPanel>
+                                                <Grid ColumnDefinitions="*,Auto">
+                                                    <StackPanel Grid.Column="0">
+                                                        <TextBlock Text="{Binding FileName}" FontSize="12" FontWeight="SemiBold"/>
+                                                        <TextBlock FontSize="10" Foreground="#808080">
+                                                            <Run Text="{Binding DateDisplay}"/><Run Text="  ·  "/><Run Text="{Binding SizeDisplay}"/>
+                                                        </TextBlock>
+                                                    </StackPanel>
+                                                    <Image Grid.Column="1" Source="{Binding Thumbnail}" Width="72" Height="40" Stretch="Uniform"/>
+                                                </Grid>
                                             </Border>
                                         </DataTemplate>
                                     </ListBox.ItemTemplate>
                                 </ListBox>
-                                <Button Content="🗑️ Delete Selected" Background="#DC3545" Foreground="White"
-                                        Padding="10" HorizontalAlignment="Stretch" Click="ScreenshotDeleteButton_Click"/>
+                                <WrapPanel Orientation="Horizontal">
+                                    <Button Content="⬇️ Download" Background="#3E3E42" Foreground="White" Padding="10" Margin="0,4,6,4" Click="ScreenshotDownload_Click"/>
+                                    <Button Content="🗑️ Delete Selected" Background="#DC3545" Foreground="White" Padding="10" Margin="0,4,6,4" Click="ScreenshotDeleteButton_Click"/>
+                                </WrapPanel>
                             </StackPanel>
                         </Border>
                     </StackPanel>
@@ -490,12 +665,12 @@
                                 <Slider x:Name="FanSlider" Minimum="30" Maximum="90" Value="60"
                                         TickFrequency="1" IsSnapToTickEnabled="True"
                                         ValueChanged="FanSlider_ValueChanged"/>
-                                <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Spacing="8">
-                                    <Button Content="Cool 50°" Background="#3E3E42" Padding="10" Click="FanPreset_Click"/>
+                                <WrapPanel Orientation="Horizontal" HorizontalAlignment="Center">
+                                    <Button Content="Cool 50°" Background="#3E3E42" Foreground="White" Padding="10" Margin="0,4,6,4" Click="FanPreset_Click"/>
                                     <TextBlock x:Name="FanSliderText" Text="60°C" FontSize="18" FontWeight="Bold"
-                                               Foreground="#0E9CFF" VerticalAlignment="Center" MinWidth="60"/>
-                                    <Button Content="Quiet 70°" Background="#3E3E42" Padding="10" Click="FanPreset_Click"/>
-                                </StackPanel>
+                                               Foreground="#0E9CFF" VerticalAlignment="Center" MinWidth="60" Margin="0,4"/>
+                                    <Button Content="Quiet 70°" Background="#3E3E42" Foreground="White" Padding="10" Margin="0,4,6,4" Click="FanPreset_Click"/>
+                                </WrapPanel>
                                 <Button Content="🌀 Set Threshold" Background="#007ACC" Foreground="White"
                                         Padding="12" HorizontalAlignment="Stretch" Click="FanSetButton_Click"/>
                             </StackPanel>
@@ -543,18 +718,18 @@
                         <Border Background="#252526" CornerRadius="8" Padding="15">
                             <StackPanel Spacing="10">
                                 <TextBlock Text="🧠 Memory" Foreground="#0E9CFF" FontWeight="Bold" FontSize="14"/>
-                                <StackPanel Orientation="Horizontal" Spacing="8">
-                                    <TextBox x:Name="MemPidBox" Watermark="pid" Width="100"
+                                <WrapPanel Orientation="Horizontal">
+                                    <TextBox x:Name="MemPidBox" Watermark="pid" Width="100" Margin="0,4,6,4"
                                              Background="#2D2D30" BorderBrush="#3E3E42" Padding="10" FontSize="12"/>
-                                    <Button Content="📋 Regions" Background="#3E3E42" Padding="8" Click="MemRegions_Click"/>
-                                </StackPanel>
-                                <StackPanel Orientation="Horizontal" Spacing="8">
-                                    <TextBox x:Name="MemAddrBox" Watermark="0xaddr" Width="150"
+                                    <Button Content="📋 Regions" Background="#3E3E42" Foreground="White" Padding="8" Margin="0,4,6,4" Click="MemRegions_Click"/>
+                                </WrapPanel>
+                                <WrapPanel Orientation="Horizontal">
+                                    <TextBox x:Name="MemAddrBox" Watermark="0xaddr" Width="150" Margin="0,4,6,4"
                                              Background="#2D2D30" BorderBrush="#3E3E42" Padding="10" FontSize="12"/>
-                                    <TextBox x:Name="MemLenBox" Watermark="len" Width="80"
+                                    <TextBox x:Name="MemLenBox" Watermark="len" Width="80" Margin="0,4,6,4"
                                              Background="#2D2D30" BorderBrush="#3E3E42" Padding="10" FontSize="12"/>
-                                    <Button Content="📖 Read" Background="#007ACC" Padding="8" Click="MemRead_Click"/>
-                                </StackPanel>
+                                    <Button Content="📖 Read" Background="#007ACC" Foreground="White" Padding="8" Margin="0,4,6,4" Click="MemRead_Click"/>
+                                </WrapPanel>
                                 <TextBox x:Name="MemOutputBox" IsReadOnly="True" Height="160" FontFamily="Consolas" FontSize="10"
                                          Background="#0D0D0D" BorderBrush="#3E3E42" Padding="8" TextWrapping="Wrap"/>
                             </StackPanel>
@@ -584,11 +759,11 @@
                                         </DataTemplate>
                                     </ListBox.ItemTemplate>
                                 </ListBox>
-                                <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Center">
-                                    <Button Content="⏸ Suspend" Background="#3E3E42" Padding="8" Click="AppSuspend_Click"/>
-                                    <Button Content="▶ Resume" Background="#3E3E42" Padding="8" Click="AppResume_Click"/>
-                                    <Button Content="🗑 Kill" Background="#DC3545" Foreground="White" Padding="8" Click="AppKill_Click"/>
-                                </StackPanel>
+                                <WrapPanel Orientation="Horizontal" HorizontalAlignment="Center">
+                                    <Button Content="⏸ Suspend" Background="#3E3E42" Foreground="White" Padding="10" Margin="0,4,6,4" Click="AppSuspend_Click"/>
+                                    <Button Content="▶ Resume" Background="#3E3E42" Foreground="White" Padding="10" Margin="0,4,6,4" Click="AppResume_Click"/>
+                                    <Button Content="⏹ Kill" Background="#DC3545" Foreground="White" Padding="10" Margin="0,4,6,4" Click="AppKill_Click"/>
+                                </WrapPanel>
                             </StackPanel>
                         </Border>
 
@@ -615,10 +790,11 @@
                         <Border Background="#252526" CornerRadius="8" Padding="15">
                             <StackPanel Spacing="10">
                                 <TextBlock Text="⚡ Power" Foreground="#0E9CFF" FontWeight="Bold" FontSize="14"/>
-                                <StackPanel Orientation="Horizontal" Spacing="8">
-                                    <Button Content="🔄 Reboot" Background="#3E3E42" Foreground="White" Padding="10" Click="PowerReboot_Click"/>
-                                    <Button Content="⏻ Shutdown" Background="#DC3545" Foreground="White" Padding="10" Click="PowerShutdown_Click"/>
-                                </StackPanel>
+                                <WrapPanel Orientation="Horizontal">
+                                    <Button Content="🔄 Reboot" Background="#3E3E42" Foreground="White" Padding="10" Margin="0,4,6,4" Click="PowerReboot_Click"/>
+                                    <Button Content="⏻ Shutdown" Background="#DC3545" Foreground="White" Padding="10" Margin="0,4,6,4" Click="PowerShutdown_Click"/>
+                                    <Button Content="📺 Restart Shell UI" Background="#3E3E42" Foreground="White" Padding="10" Margin="0,4,6,4" Click="RestartUi_Click"/>
+                                </WrapPanel>
                             </StackPanel>
                         </Border>
 
@@ -657,11 +833,11 @@
                         <Border Background="#252526" CornerRadius="8" Padding="15">
                             <StackPanel Spacing="10">
                                 <TextBlock Text="💡 Console LED" Foreground="#0E9CFF" FontWeight="Bold" FontSize="14"/>
-                                <StackPanel Orientation="Horizontal" Spacing="8">
-                                    <Button Content="Bright" Background="#3E3E42" Padding="8" Click="LedDim_Click" Tag="0"/>
-                                    <Button Content="Medium" Background="#3E3E42" Padding="8" Click="LedDim_Click" Tag="1"/>
-                                    <Button Content="Dim" Background="#3E3E42" Padding="8" Click="LedDim_Click" Tag="2"/>
-                                </StackPanel>
+                                <WrapPanel Orientation="Horizontal">
+                                    <Button Content="Bright" Background="#3E3E42" Foreground="White" Padding="8" Margin="0,4,6,4" Click="LedDim_Click" Tag="0"/>
+                                    <Button Content="Medium" Background="#3E3E42" Foreground="White" Padding="8" Margin="0,4,6,4" Click="LedDim_Click" Tag="1"/>
+                                    <Button Content="Dim" Background="#3E3E42" Foreground="White" Padding="8" Margin="0,4,6,4" Click="LedDim_Click" Tag="2"/>
+                                </WrapPanel>
                                 <Grid ColumnDefinitions="*,Auto">
                                     <ComboBox x:Name="LedEffectCombo" Grid.Column="0" Background="#2D2D30" SelectedIndex="1">
                                         <ComboBoxItem>off</ComboBoxItem>
@@ -709,21 +885,6 @@
                                         Padding="10" HorizontalAlignment="Stretch" Click="NotifySend_Click"/>
                             </StackPanel>
                         </Border>
-
-                        <!-- Disc Dump Card -->
-                        <Border Background="#252526" CornerRadius="8" Padding="15">
-                            <StackPanel Spacing="10">
-                                <TextBlock Text="💿 Disc Dump" Foreground="#0E9CFF" FontWeight="Bold" FontSize="14"/>
-                                <StackPanel Orientation="Horizontal" Spacing="8">
-                                    <Button Content="▶ Start" Background="#007ACC" Foreground="White" Padding="10" Click="DiscDumpStart_Click"/>
-                                    <Button Content="⏹ Cancel" Background="#DC3545" Foreground="White" Padding="10" Click="DiscDumpCancel_Click"/>
-                                </StackPanel>
-                                <ProgressBar x:Name="DiscDumpBar" Height="8" Minimum="0" Maximum="100" Value="0"
-                                             Background="#1E1E1E" Foreground="#0E9CFF"/>
-                                <TextBlock x:Name="DiscDumpStatus" Text="Idle — dumps /mnt/disc to /user/data/disc_dumps"
-                                           Foreground="#808080" FontSize="11" TextWrapping="Wrap"/>
-                            </StackPanel>
-                        </Border>
                     </StackPanel>
                 </ScrollViewer>
             </Panel>
@@ -750,5 +911,28 @@
         <Border Grid.Row="2" Background="#252526" Padding="10">
             <TextBlock x:Name="StatusText" Text="Ready" Foreground="#808080" FontSize="11" HorizontalAlignment="Center"/>
         </Border>
+
+        <!-- Modal dialog overlay (message / confirm / input) -->
+        <Grid Grid.Row="0" Grid.RowSpan="3" x:Name="DialogOverlay" IsVisible="False"
+              Background="#AA000000">
+            <Border Background="#252526" CornerRadius="12" Padding="20" Margin="24"
+                    MaxWidth="420" VerticalAlignment="Center" HorizontalAlignment="Center"
+                    BorderBrush="#3E3E42" BorderThickness="1">
+                <StackPanel Spacing="14">
+                    <TextBlock x:Name="DialogTitle" Text="Title" FontSize="16" FontWeight="Bold" Foreground="#0E9CFF"/>
+                    <ScrollViewer MaxHeight="300">
+                        <TextBlock x:Name="DialogMessage" Text="" FontSize="13" Foreground="#E0E0E0" TextWrapping="Wrap"/>
+                    </ScrollViewer>
+                    <TextBox x:Name="DialogInput" Watermark="" Background="#2D2D30" BorderBrush="#3E3E42"
+                             Padding="10" FontSize="14" IsVisible="False"/>
+                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="10">
+                        <Button x:Name="DialogCancelButton" Content="Cancel" Background="#3E3E42" Foreground="White"
+                                Padding="16,10" Click="DialogCancel_Click"/>
+                        <Button x:Name="DialogOkButton" Content="OK" Background="#007ACC" Foreground="White"
+                                Padding="16,10" Click="DialogOk_Click"/>
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+        </Grid>
     </Grid>
 </UserControl>

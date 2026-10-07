@@ -13,6 +13,17 @@ namespace PS5SuiteAndroid.Android;
     ConfigurationChanges = ConfigChanges.Orientation | ConfigChanges.ScreenSize | ConfigChanges.UiMode)]
 public class MainActivity : AvaloniaMainActivity<App>
 {
+    protected override void OnCreate(global::Android.OS.Bundle? savedInstanceState)
+    {
+        // Expose user-browsable writable dirs to the shared library before
+        // Avalonia starts (Android/data/<pkg>/files — no permission needed).
+        PS5SuiteAndroid.AppPaths.DownloadsDirProvider =
+            () => GetExternalFilesDir(null)?.AbsolutePath ?? FilesDir!.AbsolutePath;
+        PS5SuiteAndroid.AppPaths.CacheDirProvider =
+            () => CacheDir!.AbsolutePath;
+        base.OnCreate(savedInstanceState);
+    }
+
     protected override AppBuilder CustomizeAppBuilder(AppBuilder builder)
     {
         return base.CustomizeAppBuilder(builder)

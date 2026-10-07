@@ -18,6 +18,7 @@ namespace PS5SuiteAndroid.Views;
 public partial class MainView : UserControl
 {
     private PS5Protocol? _protocol;
+    private string? _ps5IpAddress;
     private string _currentPath = "/data";
     private ObservableCollection<FileItem> _files = new();
     private ObservableCollection<GameItem> _games = new();
@@ -44,13 +45,67 @@ public partial class MainView : UserControl
     {
         if (NavList.SelectedIndex < 0 || PageConnect == null) return;
         var pages = new Control[] {
-            PageConnect, PageFiles, PageGames, PageStore, PageSaves,
-            PageSystem, PageTools, PageDevices, PageLog
+            PageConnect, PageFiles, PageGames, PageStore, PageProspero,
+            PageTrophies, PageSaves, PageSystem, PageTools, PageDevices, PageLog
         };
         for (int i = 0; i < pages.Length; i++)
             if (pages[i] != null) pages[i].IsVisible = i == NavList.SelectedIndex;
         NavDrawer.IsPaneOpen = false;
+
+        // Auto-load pages that need the PS5 the first time they open
+        if (_protocol?.IsConnected == true)
+        {
+            switch (NavList.SelectedIndex)
+            {
+                case 2: if (!_gamesLoadedOnce) { _gamesLoadedOnce = true; _ = RefreshGamesAsync(); } break;
+                case 4: if (!_prosperoLoadedOnce) { _prosperoLoadedOnce = true; _ = RefreshProsperoAsync(); } break;
+                case 5: if (!_trophyLoadedOnce) { _trophyLoadedOnce = true; _ = RefreshTrophiesAsync(); } break;
+            }
+        }
     }
+
+    private bool _gamesLoadedOnce;
+    private bool _prosperoLoadedOnce;
+    private bool _trophyLoadedOnce;
+
+    // ============================================================
+    // MODAL DIALOG OVERLAY (message / confirm / input / pick)
+    // ============================================================
+    private TaskCompletionSource<object?>? _dialogTcs;
+
+    private void DialogShow(string title, string message, bool showInput, bool showCancel, string inputText = "")
+    {
+        DialogTitle.Text = title;
+        DialogMessage.Text = message;
+        DialogInput.IsVisible = showInput;
+        DialogInput.Text = inputText;
+        DialogCancelButton.IsVisible = showCancel;
+        DialogOverlay.IsVisible = true;
+        if (showInput) DialogInput.Focus();
+    }
+
+    private void DialogOk_Click(object? sender, RoutedEventArgs e)
+        => _dialogTcs?.TrySetResult(DialogInput.IsVisible ? DialogInput.Text : (object?)true);
+
+    private void DialogCancel_Click(object? sender, RoutedEventArgs e)
+        => _dialogTcs?.TrySetResult(null);
+
+    private Task<object?> RunDialogAsync(string title, string message, bool showInput, bool showCancel, string inputText = "")
+    {
+        _dialogTcs = new TaskCompletionSource<object?>();
+        DialogShow(title, message, showInput, showCancel, inputText);
+        return _dialogTcs.Task.ContinueWith(t => { DialogOverlay.IsVisible = false; return t.Result; },
+            TaskScheduler.FromCurrentSynchronizationContext());
+    }
+
+    private Task ShowMessageAsync(string message, string title = "PS5 Suite")
+        => RunDialogAsync(title, message, false, false);
+
+    private async Task<bool> ShowConfirmAsync(string message, string title = "Confirm")
+        => await RunDialogAsync(title, message, false, true) is true;
+
+    private async Task<string?> ShowInputAsync(string title, string message, string initial = "")
+        => await RunDialogAsync(title, message, true, true, initial) as string;
 
     private void UpdateStatus(string message)
     {
@@ -105,6 +160,7 @@ public partial class MainView : UserControl
 
             if (success)
             {
+                _ps5IpAddress = ip;
                 UpdateConnectionStatus(true);
                 UpdateStatus("Connected successfully!");
             }
@@ -127,21 +183,23 @@ public partial class MainView : UserControl
         }
     }
 
+    private void NavigateTo(int index) => NavList.SelectedIndex = index;
+
     private void BrowseFilesButton_Click(object? sender, RoutedEventArgs e)
     {
-        // Switch to Files tab - find parent TabControl
-        var tabControl = this.FindControl<TabControl>("TabControl");
-        // For now just refresh files
+        NavigateTo(1);
         _ = RefreshFilesAsync();
     }
 
     private void ViewGamesButton_Click(object? sender, RoutedEventArgs e)
     {
+        NavigateTo(2);
         _ = RefreshGamesAsync();
     }
 
     private void SystemInfoButton_Click(object? sender, RoutedEventArgs e)
     {
+        NavigateTo(7);
         _ = RefreshSystemInfoAsync();
     }
 
@@ -220,20 +278,23 @@ public partial class MainView : UserControl
         try
         {
             var games = await _protocol.GetGameListAsync();
-            _games.Clear();
+            _allGames.Clear();
 
             foreach (var game in games)
             {
-                _games.Add(new GameItem
+                _allGames.Add(new GameItem
                 {
                     Name = game.Name,
                     TitleId = game.TitleId,
                     Path = game.Path,
-                    SizeText = "—"
+                    Size = game.Size,
+                    SizeText = game.Size > 0 ? FormatSize((long)game.Size) : "—"
                 });
             }
 
+            ApplyGameFilter();
             UpdateStatus($"Found {games.Count} games");
+            _ = Task.Run(LoadGameExtrasAsync);
         }
         catch (Exception ex)
         {
@@ -702,54 +763,6 @@ public partial class MainView : UserControl
         catch (Exception ex) { UpdateStatus($"Notify error: {ex.Message}"); }
     }
 
-    private async void DiscDumpStart_Click(object? sender, RoutedEventArgs e)
-    {
-        if (!RequireConnection()) return;
-        UpdateStatus("Starting disc dump...");
-        try
-        {
-            var (ok, msg) = await _protocol!.DiscDumpAsync("start");
-            UpdateStatus(ok ? "Disc dump started" : $"Dump failed: {msg}");
-            if (ok) _ = PollDiscDumpAsync();
-        }
-        catch (Exception ex) { UpdateStatus($"Dump error: {ex.Message}"); }
-    }
-
-    private async Task PollDiscDumpAsync()
-    {
-        for (int i = 0; i < 600; i++)
-        {
-            await Task.Delay(2000);
-            if (_protocol == null || !_protocol.IsConnected) return;
-            try
-            {
-                var (ok, msg) = await _protocol.DiscDumpAsync("status");
-                Dispatcher.UIThread.Post(() =>
-                {
-                    DiscDumpStatus.Text = msg;
-                    var m = System.Text.RegularExpressions.Regex.Match(msg, @"(\d+)%");
-                    if (m.Success) DiscDumpBar.Value = int.Parse(m.Groups[1].Value);
-                });
-                if (!ok || msg.Contains("done", StringComparison.OrdinalIgnoreCase)
-                    || msg.Contains("idle", StringComparison.OrdinalIgnoreCase)
-                    || msg.Contains("error", StringComparison.OrdinalIgnoreCase))
-                    return;
-            }
-            catch { return; }
-        }
-    }
-
-    private async void DiscDumpCancel_Click(object? sender, RoutedEventArgs e)
-    {
-        if (!RequireConnection()) return;
-        try
-        {
-            var (ok, msg) = await _protocol!.DiscDumpAsync("cancel");
-            UpdateStatus(ok ? "Dump cancelled" : $"Cancel failed: {msg}");
-        }
-        catch (Exception ex) { UpdateStatus($"Cancel error: {ex.Message}"); }
-    }
-
     // ============================================================
     // HOMEBREW STORE (pkg-zone.com catalog)
     // ============================================================
@@ -1186,10 +1199,22 @@ public class FileItem
     public string SizeText { get; set; } = "";
 }
 
-public class GameItem
+public class GameItem : System.ComponentModel.INotifyPropertyChanged
 {
     public string Name { get; set; } = "";
     public string TitleId { get; set; } = "";
     public string Path { get; set; } = "";
     public string SizeText { get; set; } = "";
+    public ulong Size { get; set; }
+    public bool IsRunning { get; set; }
+    public string RunningBadge => IsRunning ? "   ▶ RUNNING" : "";
+
+    private Avalonia.Media.IImage? _icon;
+    public Avalonia.Media.IImage? Icon
+    {
+        get => _icon;
+        set { _icon = value; PropertyChanged?.Invoke(this, new System.ComponentModel.PropertyChangedEventArgs(nameof(Icon))); }
+    }
+
+    public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
 }

@@ -607,7 +607,7 @@ namespace PS5Upload
         {
             try
             {
-                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo { FileName = "https://buymeacoffee.com/manos555554", UseShellExecute = true });
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo { FileName = "https://buymeacoffee.com/manos555555", UseShellExecute = true });
                 Log("☕ Thank you for your support!");
             }
             catch (Exception ex) { Log($"❌ Failed to open link: {ex.Message}"); }
@@ -1638,96 +1638,6 @@ namespace PS5Upload
         }
 
         // ============================================================
-        // DISC DUMP
-        // ============================================================
-        private DispatcherTimer? _discDumpTimer;
-
-        private async void DiscDumpStart_Click(object? sender, RoutedEventArgs e)
-        {
-            if (!_protocol.IsConnected) { await ShowMessageAsync("Not connected to PS5", "Error"); return; }
-            try
-            {
-                var (success, message) = await _protocol.DiscDumpAsync("start");
-                if (success)
-                {
-                    Log($"💿 Disc dump started → {message}");
-                    DiscDumpStatusText.Text = $"Dumping to {message}...";
-                    _discDumpTimer ??= new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
-                    _discDumpTimer.Tick -= DiscDumpTimer_Tick;
-                    _discDumpTimer.Tick += DiscDumpTimer_Tick;
-                    _discDumpTimer.Start();
-                }
-                else
-                {
-                    DiscDumpStatusText.Text = $"❌ {message}";
-                    Log($"❌ Disc dump: {message}");
-                }
-            }
-            catch (Exception ex) { Log($"❌ Disc dump error: {ex.Message}"); }
-        }
-
-        private async void DiscDumpTimer_Tick(object? sender, EventArgs e)
-        {
-            try
-            {
-                var (success, message) = await _protocol.DiscDumpAsync("status");
-                if (!success && string.IsNullOrEmpty(message)) return;
-                var kv = message.Split('|')
-                    .Select(l => l.Split('=', 2))
-                    .Where(p => p.Length == 2)
-                    .ToDictionary(p => p[0], p => p[1]);
-                bool active = kv.GetValueOrDefault("active", "0") == "1";
-                ulong done = ulong.TryParse(kv.GetValueOrDefault("done", "0"), out var d) ? d : 0;
-                ulong total = ulong.TryParse(kv.GetValueOrDefault("total", "0"), out var t) ? t : 0;
-                string file = kv.GetValueOrDefault("file", "");
-                string err = kv.GetValueOrDefault("err", "");
-
-                if (total > 0)
-                {
-                    DiscDumpProgress.Value = Math.Min(100, (double)done * 100.0 / total);
-                    DiscDumpStatusText.Text = $"{done / 1048576:N0} / {total / 1048576:N0} MB — {file}";
-                }
-                else
-                {
-                    DiscDumpStatusText.Text = $"{done / 1048576:N0} MB — {file}";
-                }
-
-                if (!active)
-                {
-                    _discDumpTimer?.Stop();
-                    DiscDumpStatusText.Text = string.IsNullOrEmpty(err)
-                        ? $"✅ Done — {done / 1048576:N0} MB copied to {kv.GetValueOrDefault("dest", "?")}"
-                        : $"⚠️ Stopped: {err}";
-                    Log($"💿 {DiscDumpStatusText.Text}");
-                }
-            }
-            catch { /* transient read errors — keep polling */ }
-        }
-
-        private async void DiscDumpStatus_Click(object? sender, RoutedEventArgs e)
-        {
-            if (!_protocol.IsConnected) { await ShowMessageAsync("Not connected to PS5", "Error"); return; }
-            try
-            {
-                var (success, message) = await _protocol.DiscDumpAsync("status");
-                DiscDumpStatusText.Text = message;
-                Log($"💿 Status: {message}");
-            }
-            catch (Exception ex) { Log($"❌ Disc dump error: {ex.Message}"); }
-        }
-
-        private async void DiscDumpCancel_Click(object? sender, RoutedEventArgs e)
-        {
-            if (!_protocol.IsConnected) { await ShowMessageAsync("Not connected to PS5", "Error"); return; }
-            try
-            {
-                var (success, message) = await _protocol.DiscDumpAsync("cancel");
-                Log(success ? "💿 Dump cancelled" : $"❌ Cancel: {message}");
-            }
-            catch (Exception ex) { Log($"❌ Disc dump error: {ex.Message}"); }
-        }
-
-        // ============================================================
         // HOMEBREW STORE (pkg-zone.com catalog)
         // ============================================================
         private sealed class StoreItem : System.ComponentModel.INotifyPropertyChanged
@@ -1738,6 +1648,7 @@ namespace PS5Upload
             public string Author { get; set; } = "";
 
             private Bitmap? _cover;
+            [System.Text.Json.Serialization.JsonIgnore]
             public Bitmap? Cover
             {
                 get => _cover;
@@ -1748,16 +1659,131 @@ namespace PS5Upload
         }
 
         private readonly List<StoreItem> _storeItems = new();
-        private static readonly HttpClient _storeHttp = new() { Timeout = TimeSpan.FromSeconds(20) };
+        // pkg-zone.com is extremely flaky — roughly half of all requests either
+        // time out at the edge or hit a Laravel 500. Short timeout + per-request
+        // retry is the only way a fetch reliably lands; a single long timeout
+        // just makes the app look frozen.
+        private static readonly HttpClient _storeHttp = CreateStoreHttp();
+        private static HttpClient CreateStoreHttp()
+        {
+            var h = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
+            h.DefaultRequestHeaders.UserAgent.ParseAdd(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36");
+            h.DefaultRequestHeaders.Accept.ParseAdd(
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+            h.DefaultRequestHeaders.AcceptLanguage.ParseAdd("en-US,en;q=0.9");
+            return h;
+        }
+
+        // Retry wrapper for the flaky backend. Returns null after `attempts`
+        // failures so the caller can decide whether to abort or degrade.
+        private static async Task<string?> FetchStorePageAsync(string url, int attempts)
+        {
+            Exception? lastEx = null;
+            for (int a = 0; a < attempts; a++)
+            {
+                try { return await _storeHttp.GetStringAsync(url); }
+                catch (Exception ex)
+                {
+                    lastEx = ex;
+                    if (a + 1 < attempts) await Task.Delay(800 * (a + 1));
+                }
+            }
+            _ = lastEx;
+            return null;
+        }
 
         private static string StoreClean(string s)
             => System.Net.WebUtility.HtmlDecode(s).Trim();
 
-        private async void StoreRefresh_Click(object? sender, RoutedEventArgs e)
+        // The catalog is tiny and rarely changes — cache it next to the exe so
+        // the store paints instantly even when pkg-zone.com is having a bad day
+        // (it 500s roughly half of all requests).
+        private const string StoreCacheFile = "pkgzone_cache.json";
+        private const string StoreCoverDir = "pkgzone_covers";
+
+        private int LoadStoreCache()
         {
             try
             {
-                StoreStatusText.Text = "Fetching pkg-zone.com catalog...";
+                if (!File.Exists(StoreCacheFile)) return 0;
+                var items = JsonSerializer.Deserialize<List<StoreItem>>(File.ReadAllText(StoreCacheFile));
+                if (items == null || items.Count == 0) return 0;
+                _storeItems.Clear();
+                _storeItems.AddRange(items);
+                ApplyStoreFilter();
+                StoreStatusText.Text = $"{items.Count} PS5 packages (cached)";
+                foreach (var it in items) TryLoadCachedCover(it);
+                return items.Count;
+            }
+            catch { return 0; }
+        }
+
+        private static void TryLoadCachedCover(StoreItem it)
+        {
+            try
+            {
+                string p = Path.Combine(StoreCoverDir, it.Id + ".png");
+                if (File.Exists(p))
+                    it.Cover = new Bitmap(p);
+            }
+            catch { }
+        }
+
+        private static void SaveCoverToCache(StoreItem it, byte[] png)
+        {
+            try
+            {
+                Directory.CreateDirectory(StoreCoverDir);
+                File.WriteAllBytes(Path.Combine(StoreCoverDir, it.Id + ".png"), png);
+            }
+            catch { }
+        }
+
+        // Fetches every missing cover in parallel, writes successful ones to the
+        // disk cache. Runs after every refresh attempt — success OR failure —
+        // so cached catalogs still get their icons whenever the site responds.
+        private void FetchStoreCoversAsync()
+        {
+            var items = _storeItems.ToList();
+            _ = Task.Run(async () =>
+            {
+                await Task.WhenAll(items.Select(async it =>
+                {
+                    if (it.Cover != null) return;
+                    TryLoadCachedCover(it);
+                    if (it.Cover != null) return;
+                    for (int a = 0; a < 5 && it.Cover == null; a++)
+                    {
+                        try
+                        {
+                            var bytes = await _storeHttp.GetByteArrayAsync($"https://pkg-zone.com/images/{it.Id}/cover.png");
+                            // Site outages return HTML error pages — reject
+                            // anything that isn't actually a PNG.
+                            if (bytes.Length < 100 || bytes[0] != 0x89 || bytes[1] != 0x50)
+                                throw new Exception("not a PNG");
+                            using var ms = new MemoryStream(bytes);
+                            var bmp = new Bitmap(ms);
+                            await Dispatcher.UIThread.InvokeAsync(() => { it.Cover = bmp; });
+                            SaveCoverToCache(it, bytes);
+                        }
+                        catch { await Task.Delay(800 * (a + 1)); }
+                    }
+                }));
+            });
+        }
+
+        private bool _storeFetching;
+        private async void StoreRefresh_Click(object? sender, RoutedEventArgs e)
+        {
+            if (_storeFetching) return;   // rapid clicks pile up overlapping fetches
+            _storeFetching = true;
+            try
+            {
+                int cached = LoadStoreCache();
+                StoreStatusText.Text = cached > 0
+                    ? $"{cached} PS5 packages (cached) — refreshing…"
+                    : "Fetching pkg-zone.com catalog...";
                 Log("🛒 Fetching homebrew catalog...");
 
                 var items = new List<StoreItem>();
@@ -1774,17 +1800,22 @@ namespace PS5Upload
                     @"<div class=""dark:text-gray-300"">([^<]*)</div>", System.Text.RegularExpressions.RegexOptions.Compiled);
 
                 var seen = new HashSet<string>();
+                int consecutiveFailures = 0;
                 for (int page = 1; page <= 15; page++)
                 {
                     string url = $"https://pkg-zone.com/?console=ps5&page={page}";
-                    string html;
-                    try { html = await _storeHttp.GetStringAsync(url); }
-                    catch (Exception ex)
+                    // Retry every page — the backend 500s or edge-times-out on
+                    // roughly half of all requests, so a single-attempt walk
+                    // dies halfway through the catalog almost every time.
+                    string? html = await FetchStorePageAsync(url, 4);
+                    if (html == null)
                     {
-                        if (page == 1) throw;
-                        Log($"🛒 Page {page} unreachable ({ex.Message}) — stopping");
-                        break;
+                        consecutiveFailures++;
+                        if (page == 1) throw new Exception("catalog unreachable after 4 attempts");
+                        if (consecutiveFailures >= 3) { Log($"🛒 Page {page} unreachable — stopping"); break; }
+                        continue;
                     }
+                    consecutiveFailures = 0;
                     var arts = articleRx.Matches(html);
                     if (arts.Count == 0) break;
                     int newOnes = 0;
@@ -1806,32 +1837,36 @@ namespace PS5Upload
                     if (newOnes == 0) break;
                     StoreStatusText.Text = $"Fetched {items.Count} packages...";
                 }
+                if (items.Count == 0) throw new Exception("catalog returned no PS5 packages");
 
                 _storeItems.Clear();
                 _storeItems.AddRange(items);
                 ApplyStoreFilter();
+                foreach (var it in items) TryLoadCachedCover(it);
                 StoreStatusText.Text = $"{items.Count} PS5 packages";
                 Log($"🛒 Catalog: {items.Count} PS5 packages");
-
-                _ = Task.Run(async () =>
-                {
-                    foreach (var it in _storeItems)
-                    {
-                        try
-                        {
-                            var bytes = await _storeHttp.GetByteArrayAsync($"https://pkg-zone.com/images/{it.Id}/cover.png");
-                            using var ms = new MemoryStream(bytes);
-                            var bmp = new Bitmap(ms);
-                            await Dispatcher.UIThread.InvokeAsync(() => { it.Cover = bmp; });
-                        }
-                        catch { }
-                    }
-                });
+                try { File.WriteAllText(StoreCacheFile, JsonSerializer.Serialize(items)); } catch { }
             }
             catch (Exception ex)
             {
-                StoreStatusText.Text = "Fetch failed";
-                Log($"❌ Store error: {ex.Message}");
+                if (_storeItems.Count > 0)
+                {
+                    StoreStatusText.Text = $"{_storeItems.Count} PS5 packages (cached — pkg-zone.com down)";
+                    Log($"⚠️ pkg-zone.com unreachable, showing cached catalog ({ex.Message})");
+                }
+                else
+                {
+                    StoreStatusText.Text = "Fetch failed";
+                    Log($"❌ Store error: {ex.Message}");
+                }
+            }
+            finally
+            {
+                _storeFetching = false;
+                // Covers are fetched regardless of whether the catalog refresh
+                // succeeded — cached items deserve icons too, and the image
+                // endpoint often stays up while the listing 500s.
+                if (_storeItems.Count > 0) FetchStoreCoversAsync();
             }
         }
 
@@ -1848,24 +1883,112 @@ namespace PS5Upload
 
         private void StoreSearch_TextChanged(object? sender, TextChangedEventArgs e) => ApplyStoreFilter();
 
+        // Downloads carry no client timeout — 60MB+ streams would trip the
+        // 20s catalog limit; we bound them with our own cancellation instead.
+        private static readonly HttpClient _storeDl = CreateStoreDl();
+        private static HttpClient CreateStoreDl()
+        {
+            var h = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
+            h.DefaultRequestHeaders.UserAgent.ParseAdd(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36");
+            return h;
+        }
+
+        private bool _storeInstalling;
+
+        // pkg-zone only speaks HTTPS and the console can't fetch that itself —
+        // the PC downloads the PKG once (disk cache for re-installs), then
+        // serves it over plain LAN HTTP through TryServePkgAsync.
+        private async Task<bool> DownloadStorePkgAsync(string id, string name, string destPath)
+        {
+            for (int attempt = 0; attempt < 4; attempt++)
+            {
+                try
+                {
+                    using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(15));
+                    using var resp = await _storeDl.GetAsync(
+                        $"https://pkg-zone.com/download/ps5/{id}/latest",
+                        HttpCompletionOption.ResponseHeadersRead, cts.Token);
+                    resp.EnsureSuccessStatusCode();
+                    long total = resp.Content.Headers.ContentLength ?? 0;
+                    await using var src = await resp.Content.ReadAsStreamAsync(cts.Token);
+                    await using var dst = new FileStream(destPath, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20);
+                    var buf = new byte[512 * 1024];
+                    long done = 0; int rd; int lastBucket = -1;
+                    while ((rd = await src.ReadAsync(buf, cts.Token)) > 0)
+                    {
+                        await dst.WriteAsync(buf.AsMemory(0, rd), cts.Token);
+                        done += rd;
+                        if (total > 0)
+                        {
+                            int bucket = (int)(done * 10 / total);   // log every ~10%
+                            if (bucket != lastBucket)
+                            {
+                                lastBucket = bucket;
+                                Log($"📥 {name}: {done / 1048576}/{total / 1048576} MB");
+                                StoreStatusText.Text = $"Downloading {name} — {done / 1048576}/{total / 1048576} MB";
+                            }
+                        }
+                    }
+                    if (total > 0 && done < total) throw new IOException($"short read {done}/{total}");
+
+                    // PKG sanity: Sony packages start with 0x7F 'CNT'.
+                    await using (var chk = new FileStream(destPath, FileMode.Open, FileAccess.Read))
+                    {
+                        var magic = new byte[4];
+                        if (await chk.ReadAsync(magic) < 4 || magic[0] != 0x7F || magic[1] != 'C')
+                            throw new IOException("downloaded file is not a PKG");
+                    }
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    try { File.Delete(destPath); } catch { }
+                    Log($"⚠️ Download failed ({ex.Message}){(attempt < 3 ? $" — retry {attempt + 2}/4" : "")}");
+                    if (attempt < 3) await Task.Delay(1500);
+                }
+            }
+            return false;
+        }
+
         private async void StoreInstall_Click(object? sender, RoutedEventArgs e)
         {
+            if (_storeInstalling) return;   // one install at a time
             if (!_protocol.IsConnected) { await ShowMessageAsync("Not connected to PS5", "Error"); return; }
             string? id = (sender as Control)?.Tag as string;
             if (string.IsNullOrEmpty(id)) return;
             var item = _storeItems.FirstOrDefault(i => i.Id == id);
             string name = item?.Name ?? id;
             if (!await ShowConfirmAsync($"Install \"{name}\" ({id}) on the PS5?")) return;
+            _storeInstalling = true;
             try
             {
-                string url = $"https://pkg-zone.com/download/ps5/{id}/latest";
-                Log($"📥 Installing {name} from pkg-zone...");
+                string dir = Path.Combine(AppContext.BaseDirectory, "pkgzone_pkgs");
+                Directory.CreateDirectory(dir);
+                string local = Path.Combine(dir, id + ".pkg");
+                if (!File.Exists(local) || new FileInfo(local).Length < 1024)
+                {
+                    if (!await DownloadStorePkgAsync(id, name, local))
+                    {
+                        StoreStatusText.Text = "download failed";
+                        return;
+                    }
+                    Log($"✅ Downloaded {name} ({new FileInfo(local).Length / 1048576} MB)");
+                }
+                else Log($"� Using cached {name} ({new FileInfo(local).Length / 1048576} MB)");
+
+                StoreStatusText.Text = $"Installing {name}...";
+                string? url = await TryServePkgAsync(local);
+                if (url == null) { Log("❌ Could not start the PKG stream server"); return; }
                 var (success, result) = await _protocol.InstallPkgAsync(url);
                 Log(success
                     ? $"✅ Install accepted: {name} — check the PS5 home screen"
                     : $"❌ Install failed: {result}");
+                if (success) _ = PollPkgInstallStatus();
+                StoreStatusText.Text = "";
             }
             catch (Exception ex) { Log($"❌ Install error: {ex.Message}"); }
+            finally { _storeInstalling = false; }
         }
     }
 }

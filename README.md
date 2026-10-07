@@ -2,7 +2,18 @@
 
 **By Manos**
 
-All-in-one management suite for jailbroken PS5 consoles. One app — on **Windows, Linux, macOS and Android** — that does everything: high-speed file transfers, game mount/launch, decrypted save backup/restore, screenshots, live hardware monitoring, PKG streaming installs, full FPKG building on the PC, an integrated Homebrew Store, memory tools, fan control, kernel log, a remote shell — plus console LED control and DualSense lightbar support.
+All-in-one management suite for jailbroken PS5 consoles. One app — on **Windows, Linux, macOS and Android** — that does everything: high-speed file transfers, game mount/launch, **trophy unlock & re-lock**, decrypted save backup/restore, screenshots, live hardware monitoring, PKG streaming installs, full FPKG building on the PC, an integrated Homebrew Store + Prospero Store, memory tools, fan control, kernel log, a remote shell — plus console LED control and DualSense lightbar support.
+
+<div align="center">
+
+### ☕ Enjoying PS5 Suite?
+
+**This project is built for the PS5 scene, for free — if it saved you time or you just like what we do, consider buying us a coffee. Every cup goes straight back into new features, fixes and payload wizardry.** 🍻
+
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/manos555555)
+[![Follow on X](https://img.shields.io/badge/Follow%20on%20X-000000?style=for-the-badge&logo=x&logoColor=white)](https://x.com/manos_moyrtzis)
+
+</div>
 
 ![PS5 Suite — File Transfer](screenshots/file_transfer.png)
 
@@ -26,8 +37,8 @@ All-in-one management suite for jailbroken PS5 consoles. One app — on **Window
 | `PS5Suite-Windows-x64.exe` | Windows 10/11 64-bit — self-contained, no .NET install needed |
 | `PS5Suite-Linux-x64` | Linux 64-bit — `chmod +x` and run |
 | `PS5Suite-Linux-ARM64` | ARM64 Linux (Raspberry Pi, etc.) |
-| `PS5Suite-macOS-x64` | Intel Macs — `chmod +x`, Gatekeeper: right-click → Open |
-| `PS5Suite-macOS-ARM64` | Apple Silicon (M1/M2/M3/M4) |
+| `PS5Suite-macOS-x64.zip` | Intel Macs — unzip → double-click `PS5Suite.app` (Gatekeeper: right-click → Open) |
+| `PS5Suite-macOS-ARM64.zip` | Apple Silicon (M1/M2/M3/M4) — same, exec permissions preserved |
 | `PS5Suite.apk` | **Android** — signed APK, full feature parity with desktop |
 | `ps5_suite_server.elf` | **Required** on-console server component |
 
@@ -100,6 +111,24 @@ Two side-by-side panes: your PC on the left, the PS5 on the right.
 
 ---
 
+### 🌐 GAMES → Prospero Store
+
+- Built-in **homebrew.page** catalog: homebrew apps, games and tools with covers, categories and search.
+- **📥 Install** — downloads the app ZIP, verifies SHA-256, extracts, uploads to /data/homebrew/ with parallel connections and auto-mounts it on the PS5 home screen.
+
+---
+
+### 🏆 TROPHIES
+
+- Lists every trophy set on the console (per game) with real data parsed from TRPTITLE.DAT — names, descriptions, grades (bronze/silver/gold/platinum), icons, hidden status and earned timestamps.
+- **🔓 Unlock** — awards a trophy live through the running game (the matching title must be running — the app tells you if it isn't).
+- **🔒 Lock** — re-locks a trophy by rewriting the set's unlock bitmasks in place (group masks, row flags and timestamps cleared) — as if it was never earned.
+- **📥 Unlock All** — batch-unlock every trophy in the set in one click.
+- Search/filter across sets, live refresh after every change.
+
+---
+
+
 ### �💾 SAVES & MEDIA → Saves
 
 - Enumerates all save data on the console (per user, per title) with size/type badges.
@@ -152,8 +181,7 @@ Everything is read **live from the console** — nothing hardcoded; values the c
 - **🎮 Controller (DualSense)** — live pad state + controller info read through a remote bridge into `SceShellUI` (the payload gets no pad session of its own, so it resolves the real logged-in user remotely — nothing hardcoded). **Lightbar**: set any RGB color.
 - **💡 Console LED** — real `/dev/icc_indicator` interface with three hardware channels (blue `0x01` / white `0x11` / amber `0x21` — verified on hardware): pick a color, run effects (breathe, sunrise, blink, chase…), `auto` hands control back to the system.
 - **🔔 Notify** — push a custom notification to the PS5 screen.
-- **📀 Disc Dump** — dump the inserted BD disc to `/user/disc` with live progress + cancel.
-- **🔊 Beeper** — console beep / mute.
+- ** Beeper** — console beep / mute.
 
 ---
 
@@ -242,7 +270,7 @@ Everything is read **live from the console** — nothing hardcoded; values the c
 
 ## 📱 Android app
 
-- Same Avalonia UI/protocol as desktop — every feature above works on Android: transfers, games, store, saves, system info, tools, devices, debug log.
+- Same Avalonia UI/protocol as desktop — every feature above works on Android: transfers, games (mount/launch/stop), both stores, trophies, saves, system info, tools, devices, debug log.
 - Side **☰ hamburger menu** navigation, signed APK, version synced with desktop releases.
 - Install → enter PS5 IP → Connect. Same payload, same ports.
 

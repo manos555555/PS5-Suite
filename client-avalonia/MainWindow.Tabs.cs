@@ -380,7 +380,42 @@ namespace PS5Upload
         // ============================================================
         // GAMES TAB
         // ============================================================
+        private List<PS5MountedGame> _allGames = new();
+
         private async void RefreshGameListButton_Click(object? sender, RoutedEventArgs e) => await RefreshGameListAsync();
+
+        private void GameSearchBox_TextChanged(object? sender, Avalonia.Controls.TextChangedEventArgs e) => ApplyGameFilter();
+
+        private void GameSortComboBox_SelectionChanged(object? sender, SelectionChangedEventArgs e) => ApplyGameFilter();
+
+        private void ApplyGameFilter()
+        {
+            if (MountedGamesListBox == null || GameSearchBox == null || GameSortComboBox == null) return;
+            var q = GameSearchBox.Text?.Trim() ?? "";
+            IEnumerable<PS5MountedGame> view = string.IsNullOrEmpty(q)
+                ? _allGames
+                : _allGames.Where(g =>
+                    g.Name.Contains(q, StringComparison.OrdinalIgnoreCase) ||
+                    g.TitleId.Contains(q, StringComparison.OrdinalIgnoreCase) ||
+                    g.Region.Contains(q, StringComparison.OrdinalIgnoreCase) ||
+                    g.Path.Contains(q, StringComparison.OrdinalIgnoreCase));
+
+            view = GameSortComboBox.SelectedIndex switch
+            {
+                1 => view.OrderByDescending(g => g.Name, StringComparer.OrdinalIgnoreCase),
+                2 => view.OrderBy(g => g.Size),
+                3 => view.OrderByDescending(g => g.Size),
+                4 => view.OrderBy(g => g.TitleId, StringComparer.OrdinalIgnoreCase),
+                5 => view.OrderByDescending(g => g.IsActive),
+                _ => view.OrderBy(g => g.Name, StringComparer.OrdinalIgnoreCase),
+            };
+
+            var list = view.ToList();
+            MountedGamesListBox.ItemsSource = list;
+            GameCountText.Text = string.IsNullOrEmpty(q) || list.Count == _allGames.Count
+                ? $" ({_allGames.Count} games)"
+                : $" ({list.Count}/{_allGames.Count} games)";
+        }
 
         private async Task RefreshGameListAsync()
         {
@@ -389,11 +424,8 @@ namespace PS5Upload
             try
             {
                 var games = await _protocol.GetGameListAsync();
-                await Dispatcher.UIThread.InvokeAsync(() =>
-                {
-                    MountedGamesListBox.ItemsSource = games;
-                    GameCountText.Text = $" ({games.Count} games)";
-                });
+                _allGames = games;
+                await Dispatcher.UIThread.InvokeAsync(() => ApplyGameFilter());
 
                 if (games.Count > 0)
                 {
