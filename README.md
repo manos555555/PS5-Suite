@@ -126,6 +126,8 @@ Two side-by-side panes: your PC on the left, the PS5 on the right.
 - **📥 Unlock All** — batch-unlock every trophy in the set in one click.
 - Search/filter across sets, live refresh after every change.
 
+> ⚠️ **Warning:** unlocking many trophies with unrealistically short/identical timestamps can look suspicious if the console ever syncs to PSN. **I take no responsibility for any ban on your account or console** — use this feature offline and at your own risk.
+
 ---
 
 
@@ -285,5 +287,7 @@ Please report it in the **[Issues](https://github.com/manos555555/PS5-Suite/issu
 ## ⚠️ Disclaimer
 
 Requires a jailbroken PS5 with a payload loader. Save backup/restore and memory write features modify console state — **use at your own risk**. For personal/educational use; no copyrighted content included.
+
+**🏆 Trophy features:** unlocking trophies — especially many at once or with unrealistic timestamps — may look suspicious to Sony if your console or account ever syncs with PSN. **The author takes no responsibility for any ban of your account or console.** Use offline, at your own risk.
 
 **Enjoy. — Manos**
