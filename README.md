@@ -50,7 +50,7 @@ All-in-one management suite for jailbroken PS5 consoles. One app — on **Window
 ## 🚀 Setup (2 minutes)
 
 1. Load a jailbreak / payload loader on the PS5 — tested with **etaHEN** and **Kstuff** (any payload loader that accepts ELFs works).
-2. Open the app → expand **⚙️ Payload Settings** → **📂 Browse** → pick `payload/ps5_suite_server.elf` → **📤 Send Payload** (default port 9020).
+2. Open the app → expand **⚙️ Payload Settings** → **📂 Browse** → pick `payload/ps5_suite_server.elf` → **📤 Send Payload** (default port 9021).
 3. The payload installs itself and starts the suite server (ports 9113–9116).
 4. Press **🔍** to auto-discover the console on your LAN, or type its IP → **🔌 Connect**.
 5. Done. Future payload updates go through **🔄 Self-Update Payload** (pushes the new ELF through the running server) or **⬆️ Update from GitHub**.
@@ -66,7 +66,7 @@ All-in-one management suite for jailbroken PS5 consoles. One app — on **Window
 - **Auto-discover (🔍)** — broadcasts on the LAN and finds the PS5 automatically.
 - **Profiles** — save multiple consoles by name, delete them, reconnect instantly.
 - **Storage Info panel** — free/total space on the console's drive, **🔄 Refresh Storage** button.
-- **Payload Settings** — pick the ELF, set the injection port (default 9020), **Send Payload**, **Self-Update Payload** (updates the running server in place), **Update from GitHub** (checks for new suite releases).
+- **Payload Settings** — pick the ELF, set the injection port (default 9021), **Send Payload**, **Self-Update Payload** (updates the running server in place), **Update from GitHub** (checks for new suite releases).
 - **Ko-fi support link** in the header. ❤️
 
 ---
@@ -263,7 +263,7 @@ Everything is read **live from the console** — nothing hardcoded; values the c
 | On-console payload | C, built with the **PS5 Payload SDK** (`prospero-clang`) |
 | FPKG engine | **LibProsperoPkg** (bundled) — CNT/PFS/PFSC/PFSv3/FIH build, read & verify |
 | Transfer protocol | Raw TCP, chunked + parallel streams |
-| Suite server ports | 9113–9116 |
+| Suite server ports | 9113–9118 (scans until it finds the live server) |
 | Local PKG streamer ports | 18990–19009 |
 | Payload proxy port | 13801+ |
 

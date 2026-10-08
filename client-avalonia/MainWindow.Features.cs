@@ -318,7 +318,7 @@ namespace PS5Upload
                 else
                 {
                     Log("❌ Failed to send payload");
-                    await ShowMessageAsync($"Failed to send payload to {ipAddress}:{_payloadPort}\n\nMake sure GoldHEN is running.", "Connection Failed");
+                    await ShowMessageAsync($"Failed to send payload to {ipAddress}:{_payloadPort}\n\nMake sure a payload loader (etaHEN/GoldHEN) is listening on that port.", "Connection Failed");
                 }
                 SendPayloadButton.IsEnabled = true;
             }
