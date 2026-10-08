@@ -10,8 +10,11 @@ All-in-one management suite for jailbroken PS5 consoles. One app — on **Window
 
 **This project is built for the PS5 scene, for free — if it saved you time or you just like what we do, consider buying us a coffee. Every cup goes straight back into new features, fixes and payload wizardry.** 🍻
 
+**Got questions, ideas or found a bug? Join the community on Discord — we hang out there!**
+
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/manos555555)
 [![Follow on X](https://img.shields.io/badge/Follow%20on%20X-000000?style=for-the-badge&logo=x&logoColor=white)](https://x.com/manos_moyrtzis)
+[![Join our Discord](https://img.shields.io/badge/Join%20our%20Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/eRXG2Csmpy)
 
 </div>
 
