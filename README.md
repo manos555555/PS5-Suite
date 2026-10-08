@@ -107,7 +107,7 @@ Two side-by-side panes: your PC on the left, the PS5 on the right.
 
 ---
 
-### � GAMES → Homebrew Store
+### 🛍️ GAMES → Homebrew Store
 
 - Built-in **pkg-zone.com** catalog: browse/search every public PS5 homebrew package.
 - Covers, version + author info, one-tap **📥 Install** — the package streams straight to the console installer.
@@ -126,7 +126,6 @@ Two side-by-side panes: your PC on the left, the PS5 on the right.
 - Lists every trophy set on the console (per game) with real data parsed from TRPTITLE.DAT — names, descriptions, grades (bronze/silver/gold/platinum), icons, hidden status and earned timestamps.
 - **🔓 Unlock** — awards a trophy live through the running game (the matching title must be running — the app tells you if it isn't).
 - **🔒 Lock** — re-locks a trophy by rewriting the set's unlock bitmasks in place (group masks, row flags and timestamps cleared) — as if it was never earned.
-- **📥 Unlock All** — batch-unlock every trophy in the set in one click.
 - Search/filter across sets, live refresh after every change.
 
 > ⚠️ **Warning:** unlocking many trophies with unrealistically short/identical timestamps can look suspicious if the console ever syncs to PSN. **I take no responsibility for any ban on your account or console** — use this feature offline and at your own risk.
@@ -134,7 +133,7 @@ Two side-by-side panes: your PC on the left, the PS5 on the right.
 ---
 
 
-### �💾 SAVES & MEDIA → Saves
+### 💾 SAVES & MEDIA → Saves
 
 - Enumerates all save data on the console (per user, per title) with size/type badges.
 - **🔓 Mount (decrypt)** — mounts the save decrypted on the PS5 so its files are readable.
@@ -186,7 +185,7 @@ Everything is read **live from the console** — nothing hardcoded; values the c
 - **🎮 Controller (DualSense)** — live pad state + controller info read through a remote bridge into `SceShellUI` (the payload gets no pad session of its own, so it resolves the real logged-in user remotely — nothing hardcoded). **Lightbar**: set any RGB color.
 - **💡 Console LED** — real `/dev/icc_indicator` interface with three hardware channels (blue `0x01` / white `0x11` / amber `0x21` — verified on hardware): pick a color, run effects (breathe, sunrise, blink, chase…), `auto` hands control back to the system.
 - **🔔 Notify** — push a custom notification to the PS5 screen.
-- ** Beeper** — console beep / mute.
+- **🔊 Beeper** — console beep / mute.
 
 ---
 
