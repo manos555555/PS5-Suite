@@ -1,4 +1,4 @@
-# 🎮 PS5 Suite v7.2.3 — Complete PS5 Management Platform
+# 🎮 PS5 Suite v7.2.4 — Complete PS5 Management Platform
 
 **By Manos**
 
