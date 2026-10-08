@@ -13,7 +13,6 @@ All-in-one management suite for jailbroken PS5 consoles. One app — on **Window
 **Got questions, ideas or found a bug? Join the community on Discord — we hang out there!**
 
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/manosmourtzakis)
-[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/manos555555)
 [![Follow on X](https://img.shields.io/badge/Follow%20on%20X-000000?style=for-the-badge&logo=x&logoColor=white)](https://x.com/manos_moyrtzis)
 [![Join our Discord](https://img.shields.io/badge/Join%20our%20Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/eRXG2Csmpy)
 
@@ -68,7 +67,7 @@ All-in-one management suite for jailbroken PS5 consoles. One app — on **Window
 - **Profiles** — save multiple consoles by name, delete them, reconnect instantly.
 - **Storage Info panel** — free/total space on the console's drive, **🔄 Refresh Storage** button.
 - **Payload Settings** — pick the ELF, set the injection port (default 9020), **Send Payload**, **Self-Update Payload** (updates the running server in place), **Update from GitHub** (checks for new suite releases).
-- **Buy Me a Coffee** link in the header. ❤️
+- **Ko-fi support link** in the header. ❤️
 
 ---
 

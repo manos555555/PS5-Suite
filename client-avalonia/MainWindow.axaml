@@ -161,11 +161,11 @@
 
                 <!-- Bottom Actions -->
                 <StackPanel Grid.Row="3" Margin="10,10,10,15">
-                    <Button x:Name="BuyMeCoffeeButton" Background="#FFDD00" Foreground="#000000" 
+                    <Button x:Name="BuyMeCoffeeButton" Background="#FF5E5B" Foreground="#FFFFFF" 
                             Click="BuyMeCoffeeButton_Click" HorizontalAlignment="Stretch" Padding="8,6" FontSize="12">
                         <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
                             <TextBlock Text="☕" FontSize="14" Margin="0,0,6,0"/>
-                            <TextBlock Text="Buy me a coffee" FontSize="12" Foreground="#000000"/>
+                            <TextBlock Text="Support me on Ko-fi" FontSize="12" Foreground="#FFFFFF"/>
                         </StackPanel>
                     </Button>
                     

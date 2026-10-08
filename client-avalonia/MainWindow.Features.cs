@@ -639,13 +639,13 @@ namespace PS5Upload
         }
 
         // ============================================================
-        // BUY ME A COFFEE
+        // KO-FI SUPPORT LINK
         // ============================================================
         private void BuyMeCoffeeButton_Click(object? sender, RoutedEventArgs e)
         {
             try
             {
-                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo { FileName = "https://buymeacoffee.com/manos555555", UseShellExecute = true });
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo { FileName = "https://ko-fi.com/manosmourtzakis", UseShellExecute = true });
                 Log("☕ Thank you for your support!");
             }
             catch (Exception ex) { Log($"❌ Failed to open link: {ex.Message}"); }
