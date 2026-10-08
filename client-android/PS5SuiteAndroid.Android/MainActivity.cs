@@ -21,6 +21,16 @@ public class MainActivity : AvaloniaMainActivity<App>
             () => GetExternalFilesDir(null)?.AbsolutePath ?? FilesDir!.AbsolutePath;
         PS5SuiteAndroid.AppPaths.CacheDirProvider =
             () => CacheDir!.AbsolutePath;
+        PS5SuiteAndroid.AppPaths.UrlOpener = url =>
+        {
+            try
+            {
+                StartActivity(new global::Android.Content.Intent(
+                    global::Android.Content.Intent.ActionView,
+                    global::Android.Net.Uri.Parse(url)));
+            }
+            catch { }
+        };
         base.OnCreate(savedInstanceState);
     }
 

@@ -184,6 +184,8 @@ namespace PS5Upload
 
             if (_autoSendPayload && !string.IsNullOrEmpty(_payloadPath) && !string.IsNullOrEmpty(_ps5IpAddress))
                 _ = AutoSendPayloadOnStartup();
+
+            Opened += (_, _) => _ = CheckForAppUpdateAsync();
         }
 
         // ============================================================

@@ -10,6 +10,9 @@ public static class AppPaths
     public static Func<string>? DownloadsDirProvider;
     public static Func<string>? CacheDirProvider;
 
+    // Opens a URL in the platform browser (Android head wires an Intent).
+    public static Action<string>? UrlOpener;
+
     public static string DownloadsDir =>
         DownloadsDirProvider?.Invoke() ?? Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
 

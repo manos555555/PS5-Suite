@@ -466,6 +466,44 @@ namespace PS5Upload
         }
 
         // ============================================================
+        // APP UPDATE CHECK — runs once at startup. Queries the latest
+        // GitHub release tag; if newer than the running build, shows a
+        // prompt whose Yes opens the release page. Silent on any failure
+        // (offline, rate limit, malformed tag) — never nags.
+        // ============================================================
+        private async Task CheckForAppUpdateAsync()
+        {
+            try
+            {
+                var av = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version;
+                var current = new Version(av?.Major ?? 0, av?.Minor ?? 0, av?.Build ?? 0);
+
+                using var resp = await GitHubClient.GetAsync(
+                    $"https://api.github.com/repos/{GitHubRepo}/releases/latest");
+                if (!resp.IsSuccessStatusCode) return;
+
+                using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+                var root = doc.RootElement;
+                string tag = root.TryGetProperty("tag_name", out var t) ? t.GetString() ?? "" : "";
+                string url = root.TryGetProperty("html_url", out var u) ? u.GetString() ?? "" : "";
+                if (string.IsNullOrEmpty(url)) url = $"https://github.com/{GitHubRepo}/releases/latest";
+                if (!Version.TryParse(tag.TrimStart('v', 'V'), out var latest)) return;
+                if (latest <= current) return;
+
+                Log($"⬆️ New version available: v{latest} (installed: v{current})");
+                bool open = await ShowConfirmAsync(
+                    $"A new version of PS5 Suite is available!\n\n" +
+                    $"Latest release: v{latest}\nInstalled: v{current}\n\n" +
+                    $"Open the download page?",
+                    "Update Available");
+                if (open)
+                    System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                        { FileName = url, UseShellExecute = true });
+            }
+            catch { /* offline / rate-limited / whatever — never disturb startup */ }
+        }
+
+        // ============================================================
         // MOUNT GAMES
         // ============================================================
         private async void MountGamesButton_Click(object? sender, RoutedEventArgs e)

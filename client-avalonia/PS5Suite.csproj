@@ -10,10 +10,11 @@
     <AssemblyName>PS5Suite</AssemblyName>
     <RootNamespace>PS5Upload</RootNamespace>
     <ApplicationIcon>ps5_logo.ico</ApplicationIcon>
-    <Version>7.2.3</Version>
+    <Version>7.2.4</Version>
     <Authors>Manos</Authors>
     <Description>PS5 Suite - Complete PS5 Management Platform</Description>
     <Copyright>Copyright © 2026 Manos</Copyright>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
   </PropertyGroup>
 
   <ItemGroup>

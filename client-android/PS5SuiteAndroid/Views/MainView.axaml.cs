@@ -36,6 +36,49 @@ public partial class MainView : UserControl
         SavesListBox.ItemsSource = _saves;
         ScreenshotsListBox.ItemsSource = _screenshots;
         LogItems.ItemsSource = _logLines;
+        Loaded += (_, _) =>
+        {
+            if (_updateChecked) return;
+            _updateChecked = true;
+            _ = CheckForAppUpdateAsync();
+        };
+    }
+
+    // ============================================================
+    // APP UPDATE CHECK — once per app launch. Silent on failure.
+    // If a newer GitHub release exists: prompt → Yes opens the page.
+    // ============================================================
+    private bool _updateChecked;
+
+    private async Task CheckForAppUpdateAsync()
+    {
+        try
+        {
+            var av = typeof(MainView).Assembly.GetName().Version;
+            var current = new Version(av?.Major ?? 0, av?.Minor ?? 0, av?.Build ?? 0);
+
+            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
+            http.DefaultRequestHeaders.UserAgent.ParseAdd("PS5-Suite-Client");
+            using var resp = await http.GetAsync(
+                "https://api.github.com/repos/manos555555/PS5-Suite/releases/latest");
+            if (!resp.IsSuccessStatusCode) return;
+
+            using var doc = System.Text.Json.JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+            var root = doc.RootElement;
+            string tag = root.TryGetProperty("tag_name", out var t) ? t.GetString() ?? "" : "";
+            string url = root.TryGetProperty("html_url", out var u) ? u.GetString() ?? "" : "";
+            if (string.IsNullOrEmpty(url)) url = "https://github.com/manos555555/PS5-Suite/releases/latest";
+            if (!Version.TryParse(tag.TrimStart('v', 'V'), out var latest)) return;
+            if (latest <= current) return;
+
+            bool open = await ShowConfirmAsync(
+                $"A new version of PS5 Suite is available!\n\n" +
+                $"Latest release: v{latest}\nInstalled: v{current}\n\n" +
+                $"Open the download page?",
+                "Update Available");
+            if (open) AppPaths.UrlOpener?.Invoke(url);
+        }
+        catch { /* offline / rate-limited — never disturb startup */ }
     }
 
     private void MenuButton_Click(object? sender, RoutedEventArgs e)

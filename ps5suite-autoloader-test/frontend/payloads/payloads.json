@@ -1,0 +1,37 @@
+[
+    [
+        "bolt",
+        "PS5 Suite",
+        "v7.2.4 - Full Management Suite",
+        "ps5_suite_server.elf",
+        3000
+    ],
+    [
+        "bolt",
+        "etaHEN",
+        "Homebrew Enabler",
+        "OnionHEN.elf",
+        3000
+    ],
+    [
+        "bolt",
+        "kstuff",
+        "v0.1.11 - Kernel Patches",
+        "kstuff.elf",
+        3000
+    ],
+    [
+        "bolt",
+        "ShadowMount+",
+        "v0.1.7b2 - Game Mounter",
+        "shadowmountplus.elf",
+        3000
+    ],
+    [
+        "bolt",
+        "nanoDNS",
+        "v0.4 - DNS Server",
+        "nanodns.elf",
+        3000
+    ]
+]
