@@ -309,21 +309,18 @@ namespace PS5Upload
                 }
                 if (found == null)
                 {
-                    // Counts known, per-trophy flags unknown — keep "—" per row.
-                    set.EarnedFallback = unionPop;
-                    // Still apply verified per-row flags from the 0x800 table
-                    // where present (Witcher file: flags matched the mask 100%).
-                    if (rowState.Count == 0) return;
-                    foreach (var t in set.Trophies)
-                        if (rowState.TryGetValue(t.Id, out var rs))
-                        {
-                            t.StateKnown = true;
-                            t.IsUnlocked = rs.unlocked;
-                            t.UnlockedTime = rs.when == default ? null : rs.when;
-                        }
-                    return;
+                    // Multi-group sets: no single window carries the union, so
+                    // the popcount scan misses. The union of the 0x700 group
+                    // masks IS the authoritative per-trophy state (it is what
+                    // the console reads) — apply it directly instead of
+                    // falling back to rows-only, which made the list disagree
+                    // with the sidebar count (sidebar=unionPop, list=rows).
+                    mask = unionMask;
                 }
-                mask = found;
+                else
+                {
+                    mask = found;
+                }
             }
 
             set.UnlockMask = mask;

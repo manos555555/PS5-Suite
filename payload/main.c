@@ -12138,6 +12138,24 @@ static int trp_lock_file(const char *path, int tid, char *diag, size_t dsz) {
         memset(d + row_ts_off, 0, 8);
     }
 
+    // Safety net: keep a one-shot backup of the pre-edit file so a daemon-side
+    // regeneration (or a bad rewrite) doesn't permanently zero the user's set.
+    {
+        char bak[PATH_MAX];
+        snprintf(bak, sizeof(bak), "%s.bak", path);
+        FILE *in = fopen(path, "rb");
+        if (in) {
+            FILE *out = fopen(bak, "wb");
+            if (out) {
+                uint8_t cpb[8192]; size_t r;
+                while ((r = fread(cpb, 1, sizeof(cpb), in)) > 0)
+                    if (fwrite(cpb, 1, r, out) != r) break;
+                fclose(out);
+            }
+            fclose(in);
+        }
+    }
+
     // 6) atomic-ish rewrite: tmp + rename so a crash mid-write can't leave a
     //    truncated trophy file.
     char tmp[PATH_MAX];

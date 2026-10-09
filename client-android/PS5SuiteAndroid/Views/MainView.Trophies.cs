@@ -278,18 +278,16 @@ public partial class MainView
             }
             if (found == null)
             {
-                set.EarnedFallback = unionPop;
-                if (rowState.Count == 0) return;
-                foreach (var t in set.Trophies)
-                    if (rowState.TryGetValue(t.Id, out var rs))
-                    {
-                        t.StateKnown = true;
-                        t.IsUnlocked = rs.unlocked;
-                        t.UnlockedTime = rs.when == default ? null : rs.when;
-                    }
-                return;
+                // Multi-group sets: no single window carries the union, so the
+                // popcount scan misses. The union of the 0x700 group masks IS
+                // the authoritative per-trophy state — apply it directly
+                // instead of rows-only (which made list disagree with sidebar).
+                mask = unionMask;
             }
-            mask = found;
+            else
+            {
+                mask = found;
+            }
         }
 
         set.UnlockMask = mask;
