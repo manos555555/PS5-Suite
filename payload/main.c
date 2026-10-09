@@ -2150,6 +2150,10 @@ static void payload_restore_privileges(void);   // defined in main() section
 #define MOUNTED_IDS_MAX 64
 static char g_mounted_ids_flat[MOUNTED_IDS_MAX][10];
 static volatile int g_mounted_count = 0;
+// Remount-pass healing: how many already-mounted titles were missing their
+// app.db row and got re-registered this run. Drives the UI refresh gate so
+// a pure "already mounted" Mount click never bounces the home screen.
+static int g_healed_registrations = 0;
 
 // ============================================================================
 // GLOBAL STATE GUARDS (shared progress socket + counters)
@@ -2975,6 +2979,21 @@ static int appdb_register_work(int mode, const char *title_id,
         json);
     if (appdb_exec(db, sql) != SQLITE_OK) { sqlite3_close(db); return -11; }
 
+    // The home row orders tiles by lastAccessIndex — a freshly installed
+    // title takes MAX+1 so it lands at the front. Index 0 sorts past the
+    // visible edge of the row (the tile exists but never shows on screen).
+    long long next_idx = 1;
+    if (icon_tbl[0]) {
+        sqlite3_stmt *st = NULL;
+        snprintf(sql, sizeof(sql),
+            "SELECT MAX(lastAccessIndex) FROM %s", icon_tbl);
+        if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+            if (sqlite3_step(st) == SQLITE_ROW)
+                next_idx = sqlite3_column_int64(st, 0) + 1;
+            sqlite3_finalize(st);
+        }
+    }
+
     if (icon_tbl[0]) {
         snprintf(sql, sizeof(sql),
             "INSERT INTO %s (titleId,titleName,localConceptId,conceptId,"
@@ -2982,9 +3001,9 @@ static int appdb_register_work(int mode, const char *title_id,
             "installedDate,installStatus,dispLocation,visible,deeplinkUri,"
             "hubAppUri,platform,appDrmType,primaryTitleSort,discStatus,"
             "contentBadgeType,contentId) VALUES ("
-            "'%s','%s','%s',%llu,%s,0,%s,%s,2,138,1,"
+            "'%s','%s','%s',%llu,%s,%lld,%s,%s,2,138,1,"
             "'%s','pshome:gamehub?titleId=%s',0,%d,4295163909,0,%llu,%s);",
-            icon_tbl, title_id, esc, lcid, concept_id, now, now, now,
+            icon_tbl, title_id, esc, lcid, concept_id, now, next_idx, now, now,
             deeplink, title_id, is_game ? 5 : 0, badge, cid_frag);
         appdb_exec(db, sql);
     }
@@ -2992,12 +3011,13 @@ static int appdb_register_work(int mode, const char *title_id,
     if (concept_tbl[0]) {
         snprintf(sql, sizeof(sql),
             "INSERT INTO %s (localConceptId,validFlag,conceptId,conceptName,"
-            "primaryTitleId,primaryTitleName,lastInteractedTime,dispLocation,"
-            "promoteTime,deeplinkUri,hubAppUri,metaDataPath,icon0Info) VALUES ("
-            "'%s',1,%llu,'%s','%s','%s',%s,1162,%s,'%s',"
+            "primaryTitleId,primaryTitleName,lastAccessIndex,lastInteractedTime,"
+            "dispLocation,promoteTime,deeplinkUri,hubAppUri,metaDataPath,"
+            "icon0Info) VALUES ("
+            "'%s',1,%llu,'%s','%s','%s',%lld,%s,1162,%s,'%s',"
             "'pshome:gamehub?titleId=%s','%s',%s);",
-            concept_tbl, lcid, concept_id, esc, title_id, esc, now, now,
-            deeplink, title_id, metadir, icon_frag);
+            concept_tbl, lcid, concept_id, esc, title_id, esc, next_idx, now,
+            now, deeplink, title_id, metadir, icon_frag);
         appdb_exec(db, sql);
     }
 
@@ -3022,6 +3042,107 @@ static int appdb_direct_register(const char *title_id, const char *game_path) {
     int wrc = wdg_fn_call((void*)appdb_job_work, j, NULL, NULL, NULL, 15000);
     int rc = (wrc == 0) ? j->rc : -2;
     if (wrc != -2) free(j);   // timeout → parked worker owns it
+    return rc;
+}
+
+// Is this title already in tbl_contentinfo? Lets the remount path skip the
+// idempotent DELETE+INSERT when the row exists — otherwise every "Mount
+// Games" click rewrites identical rows and forces a pointless UI refresh.
+static int appdb_title_exists(const char *title_id) {
+    sqlite3 *db = NULL;
+    if (sqlite3_open("/system_data/priv/mms/app.db", &db) != SQLITE_OK) {
+        if (db) sqlite3_close(db);
+        return 0;   // treat unreadable as missing → heal path runs
+    }
+    sqlite3_busy_timeout(db, 3000);
+    sqlite3_stmt *st = NULL;
+    int found = 0;
+    if (sqlite3_prepare_v2(db,
+            "SELECT 1 FROM tbl_contentinfo WHERE titleId=? LIMIT 1",
+            -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, title_id, -1, SQLITE_STATIC);
+        found = (sqlite3_step(st) == SQLITE_ROW);
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return found;
+}
+
+// Look up the per-user tbl_iconinfo_* name — shared by the helpers below.
+static int appdb_icon_table(sqlite3 *db, char *out, size_t out_sz) {
+    sqlite3_stmt *st = NULL;
+    int ok = 0;
+    if (sqlite3_prepare_v2(db,
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name LIKE 'tbl_iconinfo_%' LIMIT 1",
+            -1, &st, NULL) == SQLITE_OK) {
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            snprintf(out, out_sz, "%s", (const char *)sqlite3_column_text(st, 0));
+            ok = 1;
+        }
+    }
+    sqlite3_finalize(st);
+    return ok;
+}
+
+// 1 when the icon row exists AND carries a real lastAccessIndex. Rows written
+// before the index was assigned sit at 0 → invisible past the home row's end.
+static int appdb_icon_index_ok(const char *title_id) {
+    sqlite3 *db = NULL;
+    if (sqlite3_open("/system_data/priv/mms/app.db", &db) != SQLITE_OK) {
+        if (db) sqlite3_close(db);
+        return 1;   // unreadable → don't churn heals on a guess
+    }
+    sqlite3_busy_timeout(db, 3000);
+    char icon_tbl[64] = "";
+    int ok = 0;
+    if (appdb_icon_table(db, icon_tbl, sizeof(icon_tbl))) {
+        char q[256];
+        sqlite3_stmt *st = NULL;
+        snprintf(q, sizeof(q),
+            "SELECT (lastAccessIndex > 0) FROM %s WHERE titleId=? LIMIT 1",
+            icon_tbl);
+        if (sqlite3_prepare_v2(db, q, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, title_id, -1, SQLITE_STATIC);
+            ok = (sqlite3_step(st) == SQLITE_ROW) && sqlite3_column_int(st, 0);
+        }
+        sqlite3_finalize(st);
+    }
+    sqlite3_close(db);
+    return ok;
+}
+
+// Move an already-registered title to the front of the home ordering —
+// heals rows that were registered with lastAccessIndex=0.
+static int appdb_bump_icon_index(const char *title_id) {
+    sqlite3 *db = NULL;
+    if (sqlite3_open("/system_data/priv/mms/app.db", &db) != SQLITE_OK) {
+        if (db) sqlite3_close(db);
+        return -1;
+    }
+    sqlite3_busy_timeout(db, 3000);
+    char icon_tbl[64] = "", q[256];
+    int rc = -2;
+    if (appdb_icon_table(db, icon_tbl, sizeof(icon_tbl))) {
+        long long next_idx = 1;
+        sqlite3_stmt *st = NULL;
+        snprintf(q, sizeof(q), "SELECT MAX(lastAccessIndex) FROM %s", icon_tbl);
+        if (sqlite3_prepare_v2(db, q, -1, &st, NULL) == SQLITE_OK) {
+            if (sqlite3_step(st) == SQLITE_ROW)
+                next_idx = sqlite3_column_int64(st, 0) + 1;
+            sqlite3_finalize(st);
+        }
+        snprintf(q, sizeof(q),
+            "UPDATE %s SET lastAccessIndex=%lld WHERE titleId=?", icon_tbl,
+            next_idx);
+        st = NULL;
+        if (sqlite3_prepare_v2(db, q, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, title_id, -1, SQLITE_STATIC);
+            rc = (sqlite3_step(st) == SQLITE_DONE) ? 0 : -3;
+        }
+        sqlite3_finalize(st);
+    }
+    sqlite3_close(db);
     return rc;
 }
 static int appdb_direct_unregister(const char *title_id) {
@@ -3467,10 +3588,19 @@ static int process_game(const char* game_path, char* game_name_out, size_t name_
     
     if (is_game_already_mounted(title_id, game_path)) {
         // Under kstuff a previous attempt may have mounted fine but never
-        // written the registry row (daemon IPC unavailable) — the insert is
-        // idempotent, so re-register on every remount check.
+        // written the registry row — heal ONLY if the row is actually
+        // missing, so repeat mounts touch nothing and need no UI refresh.
+        // Rows registered before lastAccessIndex was assigned exist but
+        // render past the home row's edge — bump them to the front instead
+        // of rewriting the whole registration.
         if (!etahen_present()) {
-            appdb_direct_register(title_id, game_path);
+            if (!appdb_title_exists(title_id)) {
+                if (appdb_direct_register(title_id, game_path) == 0)
+                    g_healed_registrations++;
+            } else if (!appdb_icon_index_ok(title_id)) {
+                if (appdb_bump_icon_index(title_id) == 0)
+                    g_healed_registrations++;
+            }
         }
         track_mounted_title(title_id);
         return 2;
@@ -5631,6 +5761,7 @@ static void mount_games_body(mount_job_t* job, int sock) {
     // Reset dedup table: the mount worker is the only writer (serialized by
     // g_mount_running); readers only sample the count atomically.
     __atomic_store_n(&g_mounted_count, 0, __ATOMIC_SEQ_CST);
+    g_healed_registrations = 0;
     dbg_log("mb list cleared\n");
 
     // (AppInstUtil Initialize happens lazily inside register_title() — one
@@ -5803,9 +5934,12 @@ static void mount_games_body(mount_job_t* job, int sock) {
 
     // Direct-DB registration bypasses the daemon, so nothing tells the UI
     // that the registry changed — bounce SceShellUI so new icons appear (and
-    // removed ones disappear) without a console reboot.
+    // removed ones disappear) without a console reboot. Only when something
+    // actually changed: already-mounted games touch nothing (the heal path
+    // only re-registers rows that are missing), so a pure-skip run must not
+    // flash the home screen for no reason.
     if (!etahen_present() &&
-        (mounted_count + skipped_count + cleaned) > 0) {
+        (mounted_count > 0 || cleaned > 0 || g_healed_registrations > 0)) {
         send_notification("Refreshing home screen...");
         usleep(500 * 1000);
         restart_shellui();
@@ -9313,6 +9447,10 @@ static void unmount_body(unmount_job_t* job) {
     int sock = job->client_sock;
 
     dbg_log("unmount_body enter\n");
+    // Snapshot whether the title is registered BEFORE cleanup — the UI
+    // refresh below is only justified when a registry row actually goes away
+    // (icons come from app.db; an unregistered unmount changes nothing).
+    int had_row = etahen_present() ? 1 : appdb_title_exists(title_id);
     // game_mounter model — unmount the nullfs FIRST, then delete the
     // /user/app + /user/appmeta dirs. No registry IPC at all.
     int busy = full_title_cleanup(title_id, send_progress_message);
@@ -9332,8 +9470,9 @@ static void unmount_body(unmount_job_t* job) {
 
     // Same auto-refresh as mount — under kstuff the direct-DB unregister runs
     // on a detached worker, so give it a moment to delete the row before the
-    // UI re-reads it (otherwise the dead icon survives this refresh).
-    if (!etahen_present()) {
+    // UI re-reads it (otherwise the dead icon survives this refresh). Skipped
+    // entirely when the title was never registered — nothing to redraw.
+    if (!etahen_present() && had_row) {
         send_notification("Refreshing home screen...");
         usleep(2500 * 1000);
         restart_shellui();
