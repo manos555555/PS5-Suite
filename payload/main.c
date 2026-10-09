@@ -1311,6 +1311,7 @@ static int handle_pkg_install_status(int sock) {
 
 // Forward declaration (defined later in file)
 void send_notification(const char *msg);
+void send_notification_pretty(const char *body, const char *sub);
 
 #define ICC_FAN_DEVICE "/dev/icc_fan"
 #define ICC_FAN_THRESHOLD_IOCTL 0xC01C8F07ul
@@ -11638,7 +11639,7 @@ static const char *memfind(const char *h, const char *hend, const char *nd) {
 // property, while Little Nightmares uses _UnlockTrophy/_UpdateTrophyProgress.
 // evkind: 0=_UnlockTrophy, 1=_UpdateTrophyProgress, 2=custom event, -1 unknown
 typedef struct {
-    int id, prog, target, statid;
+    int id, prog, target, statid, gid;
     int evkind, evwide;
     char evname[64], evprop[64];
 } trop_ent_t;
@@ -11663,6 +11664,9 @@ static int tropconf_parse(const uint8_t *j, size_t n, trop_ent_t *out, int cap) 
         if (tv) { int t = atoi(tv + 15); if (t > 0) out[cnt].target = t; }
         const char *si = memfind(q, lim, "\"udsStatId\":\"");
         if (si) out[cnt].statid = atoi(si + 13);
+        out[cnt].gid = 0;
+        const char *gi = memfind(q, lim, "\"groupId\":\"");
+        if (gi) out[cnt].gid = atoi(gi + 11);
         out[cnt].evkind = -1; out[cnt].evwide = 0;
         out[cnt].evname[0] = 0; out[cnt].evprop[0] = 0;
         cnt++;
@@ -11818,6 +11822,10 @@ static int running_game_uds_member(pid_t pid, const char *name,
     return ucp_extract(ucp, name, out, out_sz);
 }
 
+// Defined further below (next to trp_lock_file). Returns files edited.
+static int trophy_force_unlock_file(const char *npwr, int tid, int gid,
+                                    char *diag, size_t dsz);
+
 // One UDS session in the game process → per-trophy events. want_all posts
 // every entry in the game's tropconf (each with its own event type/target);
 // a single id uses its tropconf entry, or — if the config can't be read —
@@ -11938,7 +11946,7 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
     if (want_all) { memcpy(work, plan, np * sizeof(trop_ent_t)); nw = np; }
     else {
         work[0].id = want_id; work[0].prog = -1; work[0].target = 1;
-        work[0].statid = -1; work[0].evkind = -1;
+        work[0].statid = -1; work[0].gid = 0; work[0].evkind = -1;
         work[0].evwide = 0; work[0].evname[0] = 0; work[0].evprop[0] = 0;
         if (np > 0)
             for (int i = 0; i < np; i++)
@@ -11980,12 +11988,31 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
     char r2[3000];
     int o2 = snprintf(r2, sizeof(r2), "pid=%d ctx=%d hnd=%d plan=%d conf=%s",
                       (int)pid, ctx, hnd, np, conf_diag);
+    // NPWR id of the running set — lifted from the tropconf path embedded
+    // in conf_diag ("ucp=/user/trophy2/nobackup/conf/NPWR24170_00/TROPHY.UCP").
+    char npwr[16] = "";
+    {
+        const char *nps = strstr(conf_diag, "NPWR");
+        if (nps) {
+            size_t nl = 0;
+            while (nps[nl] && nps[nl] != '/' && nps[nl] != ' ' &&
+                   nl < sizeof(npwr) - 1)
+                nl++;
+            memcpy(npwr, nps, nl); npwr[nl] = 0;
+        }
+    }
     int ok = 0, fail = 0;
     for (int i = 0; i < nw && !s.dead; i++) {
         int id = work[i].id, target = work[i].target;
         int posted = 0;
-        int kinds[2]; int natt = 0;
-        if (work[i].evkind >= 0) kinds[natt++] = work[i].evkind;
+        // Verified live: custom counter events update the stat but the
+        // daemon does NOT award the trophy from them (progress row only),
+        // and _UnlockTrophy is ignored for progressive:true trophies.
+        // _UpdateTrophyProgress(progress=target) is the designed award path
+        // for progress-based trophies, so it is always attempted too.
+        int kinds[4]; int natt = 0;
+        if (work[i].evkind == 0) { kinds[natt++] = 0; kinds[natt++] = 1; }
+        else if (work[i].evkind > 0) { kinds[natt++] = work[i].evkind; kinds[natt++] = 1; kinds[natt++] = 0; }
         else { kinds[natt++] = 0; kinds[natt++] = 1; }
         for (int t = 0; t < natt && !s.dead; t++) {
             int k = kinds[t];
@@ -12027,9 +12054,20 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
             if (o2 < (int)sizeof(r2) - 200)
                 o2 += snprintf(r2 + o2, sizeof(r2) - o2, " [id%d %.28s=%lx]",
                                id, knm, rp);
-            if (work[i].evkind >= 0) break;
         }
         if (posted) ok++; else fail++;
+        // The daemon refuses to award progressive trophies from UDS posts
+        // (verified live: counter + _UpdateTrophyProgress + _UnlockTrophy
+        // all returned 0, flag stayed 0x10). Pin the earned state at file
+        // level — a no-op when the daemon already wrote the earn itself.
+        if (posted && npwr[0]) {
+            char fdiag[80] = "";
+            trophy_force_unlock_file(npwr, id, work[i].gid,
+                                     fdiag, sizeof(fdiag));
+            if (o2 < (int)sizeof(r2) - 200)
+                o2 += snprintf(r2 + o2, sizeof(r2) - o2, " [id%d %s]",
+                               id, fdiag);
+        }
     }
     free(work);
     if (f_dh > 0 && !s.dead) rpc_call(&s, f_dh, hnd, 0, 0, 0, 0, 0);
@@ -12171,6 +12209,147 @@ static int trp_lock_file(const char *path, int tid, char *diag, size_t dsz) {
     if (diag) snprintf(diag, dsz, "cleared %d group masks + %d copies%s",
                        cleared_groups, cleared_copies, have_row ? "" : ", no row");
     return 0;
+}
+
+// Reverse of trp_lock_file: set the trophy's bit in its owning 0x700 group
+// mask (+ any byte window mirroring the pre-edit union mask) and mark the
+// 0x800 row earned (flag 0x11, the 0x2000 marker field, and a big-endian
+// "µs since 0001-01-01" timestamp — matching what the daemon writes).
+// Needed because the daemon ignores _UnlockTrophy for progressive:true
+// trophies and does not convert posted stat counters into awards.
+// Returns 0 rewritten, 1 already unlocked, -1 parse, -2 io.
+static int trp_unlock_file(const char *path, int tid, int gid,
+                           char *diag, size_t dsz) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -2;
+    fseek(f, 0, SEEK_END);
+    long flen = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (flen < 0x200 || flen > 1024 * 1024) { fclose(f); return -1; }
+    uint8_t *d = malloc(flen);
+    if (!d) { fclose(f); return -2; }
+    if (fread(d, 1, flen, f) != (size_t)flen) { free(d); fclose(f); return -2; }
+    fclose(f);
+    if (d[0] != 'T' || d[1] != '2' || d[2] != 'P' || d[3] != 'D') {
+        free(d); return -1;
+    }
+
+    int max_id = -1;
+    for (size_t o = 0x200; o + 0x14 <= (size_t)flen; o += 4) {
+        if (!trp_is_rec(d, flen, o, 5, 0xC0)) continue;
+        int id = (int)trp_u32be(d + o + 0x10);
+        if (id < 512 && id > max_id) max_id = id;
+    }
+    if (max_id < 0 || tid < 0 || tid > max_id) { free(d); return -1; }
+    int nbits = max_id + 1, nb = (nbits + 7) / 8;
+    int tbyte = tid >> 3, tbit = tid & 7;
+
+    size_t goff[64]; int ggid[64]; int ngrp = 0;
+    uint8_t *union_mask = calloc(nb, 1);
+    if (!union_mask) { free(d); return -2; }
+    for (size_t o = 0x800; o + 0x10 + 0x30 + (size_t)nb <= (size_t)flen; o += 4) {
+        if (!trp_is_rec(d, flen, o, 7, 0xB0)) continue;
+        if (ngrp < 64) {
+            goff[ngrp] = o + 0x40;
+            ggid[ngrp] = (int)trp_u32be(d + o + 0x10);
+            ngrp++;
+        }
+        for (int j = 0; j < nb; j++) union_mask[j] |= d[o + 0x40 + j];
+    }
+    if (ngrp == 0) { free(union_mask); free(d); return -1; }
+    if ((union_mask[tbyte] >> tbit) & 1) { free(union_mask); free(d); return 1; }
+
+    int set_groups = 0, set_copies = 0;
+    for (int g = 0; g < ngrp; g++) {
+        uint8_t *m = d + goff[g];
+        if (ggid[g] == gid && !((m[tbyte] >> tbit) & 1)) {
+            m[tbyte] |= (uint8_t)(1 << tbit); set_groups++;
+        }
+    }
+    // Unknown/unsupported group id → fall back to the first (base) record.
+    if (!set_groups && !((d[goff[0] + tbyte] >> tbit) & 1)) {
+        d[goff[0] + tbyte] |= (uint8_t)(1 << tbit); set_groups++;
+    }
+    for (size_t o = 0x200; o + (size_t)nb <= (size_t)flen; o += 4) {
+        if (memcmp(d + o, union_mask, nb) != 0) continue;
+        if (!((d[o + tbyte] >> tbit) & 1)) {
+            d[o + tbyte] |= (uint8_t)(1 << tbit); set_copies++;
+        }
+    }
+    free(union_mask);
+
+    int have_row = 0;
+    for (size_t o = 0x800; o + 0x10 + 0x18 <= (size_t)flen; o += 4) {
+        if (!trp_is_rec(d, flen, o, 8, 0x50)) continue;
+        if ((int)trp_u32be(d + o + 0x10) != tid) continue;
+        d[o + 0x14] = 0; d[o + 0x15] = 0; d[o + 0x16] = 0; d[o + 0x17] = 0x11;
+        d[o + 0x18] = 0; d[o + 0x19] = 0; d[o + 0x1a] = 0x20; d[o + 0x1b] = 0;
+        uint64_t ts = 62135596800000000ULL + (uint64_t)time(NULL) * 1000000ULL;
+        for (int b = 0; b < 8; b++)
+            d[o + 0x20 + b] = (uint8_t)(ts >> (56 - 8 * b));
+        have_row = 1;
+        break;
+    }
+
+    // Same safety net as lock: pre-edit .bak, then tmp + rename.
+    {
+        char bak[PATH_MAX];
+        snprintf(bak, sizeof(bak), "%s.bak", path);
+        FILE *in = fopen(path, "rb");
+        if (in) {
+            FILE *out = fopen(bak, "wb");
+            if (out) {
+                uint8_t cpb[8192]; size_t r;
+                while ((r = fread(cpb, 1, sizeof(cpb), in)) > 0)
+                    if (fwrite(cpb, 1, r, out) != r) break;
+                fclose(out);
+            }
+            fclose(in);
+        }
+    }
+    char tmp[PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    f = fopen(tmp, "wb");
+    if (!f) { free(d); return -2; }
+    int wok = fwrite(d, 1, flen, f) == (size_t)flen;
+    fclose(f);
+    free(d);
+    if (!wok) { unlink(tmp); return -2; }
+    if (rename(tmp, path) != 0) { unlink(tmp); return -2; }
+
+    if (diag) snprintf(diag, dsz, "set %d group masks + %d copies%s",
+                       set_groups, set_copies, have_row ? "" : ", no row");
+    return 0;
+}
+
+// Apply trp_unlock_file for every user that has this set registered.
+// Quiet helper — reports back via diag so the caller can append it to the
+// UDS post result line.
+static int trophy_force_unlock_file(const char *npwr, int tid, int gid,
+                                    char *diag, size_t dsz) {
+    DIR *home = opendir("/user/home");
+    if (!home) { if (diag) snprintf(diag, dsz, "file:nohome"); return 0; }
+    int edited = 0, already = 0, failed = 0;
+    struct dirent *e;
+    while ((e = readdir(home))) {
+        if (e->d_name[0] == '.') continue;
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path),
+                 "/user/home/%s/trophy2/nobackup/data/%s/TRPTITLE.DAT",
+                 e->d_name, npwr);
+        FILE *probe = fopen(path, "rb");
+        if (!probe) continue;   // this user never registered the set
+        fclose(probe);
+        char dd[96] = "";
+        int rc = trp_unlock_file(path, tid, gid, dd, sizeof(dd));
+        if (rc == 0) edited++;
+        else if (rc == 1) already++;
+        else failed++;
+    }
+    closedir(home);
+    if (diag) snprintf(diag, dsz, "file:%ded %dalrdy %dfail",
+                       edited, already, failed);
+    return edited;
 }
 
 // Rewrite TRPTITLE.DAT for <npwr> under every user profile that has one.
