@@ -80,6 +80,7 @@ namespace PS5Upload
         MemRegions = 0x6B,
         MemSearch = 0x6C,
         KlogRead = 0x6D,
+        UnmountAll = 0x6E,
         MountGame = 0x6F,
         // App Manager v2
         AppListV2 = 0x70,
@@ -92,7 +93,6 @@ namespace PS5Upload
         PowerAction = 0x77,
         UsbList = 0x78,
         PadInfo = 0x79,
-        Screenshot = 0x7B,
         Notify = 0x7C,
         PadAction = 0x7D,
         IccControl = 0x7E,
@@ -1257,26 +1257,6 @@ namespace PS5Upload
             }
         }
 
-        public async Task<(bool success, string message)> CaptureScreenshotAsync()
-        {
-            await _commandLock.WaitAsync();
-            try
-            {
-                await SendCommandAsync(Command.Screenshot);
-                var (response, data) = await ReceiveResponseAsync(20000);
-                string msg = data.Length > 0 ? Encoding.UTF8.GetString(data).TrimEnd('\0', '\n', '\r') : response.ToString();
-                return (response == Response.Ok, msg);
-            }
-            catch (Exception ex)
-            {
-                return (false, ex.Message);
-            }
-            finally
-            {
-                _commandLock.Release();
-            }
-        }
-
         public Task<(bool success, string message)> NotifyAsync(string text)
             => SendTextCommandAsync(Command.Notify, text);
 
@@ -1527,6 +1507,43 @@ namespace PS5Upload
                 {
                     int remainingMs = (int)(deadline - DateTime.UtcNow).TotalMilliseconds;
                     if (remainingMs <= 0) return (false, "Unmount timed out after 10 minutes");
+
+                    var (response, respData) = await ReceiveResponseAsync(remainingMs);
+                    string message = respData != null ? Encoding.UTF8.GetString(respData).TrimEnd('\0') : "";
+
+                    if (response == Response.Progress)
+                    {
+                        if (!string.IsNullOrEmpty(message)) onProgress?.Invoke(message);
+                        continue;
+                    }
+                    if (response == Response.Ok) return (true, message);
+                    if (response == Response.Error) return (false, message);
+                    return (false, $"Unexpected response: {response}");
+                }
+            }
+            catch (Exception ex)
+            {
+                return (false, ex.Message);
+            }
+            finally
+            {
+                _commandLock.Release();
+            }
+        }
+
+        /// <summary>Unmount every mounted game (same async worker pipeline).</summary>
+        public async Task<(bool success, string message)> UnmountAllGamesAsync(Action<string>? onProgress = null)
+        {
+            await _commandLock.WaitAsync();
+            try
+            {
+                await SendCommandAsync(Command.UnmountAll);
+
+                var deadline = DateTime.UtcNow + TimeSpan.FromMinutes(10);
+                while (true)
+                {
+                    int remainingMs = (int)(deadline - DateTime.UtcNow).TotalMilliseconds;
+                    if (remainingMs <= 0) return (false, "Unmount-all timed out after 10 minutes");
 
                     var (response, respData) = await ReceiveResponseAsync(remainingMs);
                     string message = respData != null ? Encoding.UTF8.GetString(respData).TrimEnd('\0') : "";

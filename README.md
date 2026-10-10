@@ -49,7 +49,7 @@ All-in-one management suite for jailbroken PS5 consoles. One app — on **Window
 
 ## 🚀 Setup (2 minutes)
 
-1. Load a jailbreak / payload loader on the PS5 — tested with **etaHEN** and **Kstuff** (any payload loader that accepts ELFs works).
+1. Load a jailbreak / payload loader on the PS5 — **fully compatible with both etaHEN and Kstuff** (any payload loader that accepts ELFs works). All features including mount/unmount, launch game and DualSense control work on k-stuff.
 2. Open the app → expand **⚙️ Payload Settings** → **📂 Browse** → pick `payload/ps5_suite_server.elf` → **📤 Send Payload** (default port 9021).
 3. The payload installs itself and starts the suite server (ports 9113–9116).
 4. Press **🔍** to auto-discover the console on your LAN, or type its IP → **🔌 Connect**.

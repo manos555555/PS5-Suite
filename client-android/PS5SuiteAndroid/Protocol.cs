@@ -85,7 +85,6 @@ namespace PS5Upload
         PowerAction = 0x77,
         UsbList = 0x78,
         PadInfo = 0x79,
-        Screenshot = 0x7B,
         Notify = 0x7C,
         PadAction = 0x7D,
         IccControl = 0x7E,
@@ -2610,26 +2609,6 @@ namespace PS5Upload
             {
                 await SendCommandAsync(cmd, Encoding.UTF8.GetBytes(arg));
                 var (response, data) = await ReceiveResponseAsync(timeoutMs);
-                string msg = data.Length > 0 ? Encoding.UTF8.GetString(data).TrimEnd('\0', '\n', '\r') : response.ToString();
-                return (response == Response.Ok, msg);
-            }
-            catch (Exception ex)
-            {
-                return (false, ex.Message);
-            }
-            finally
-            {
-                _commandLock.Release();
-            }
-        }
-
-        public async Task<(bool success, string message)> CaptureScreenshotAsync()
-        {
-            await _commandLock.WaitAsync();
-            try
-            {
-                await SendCommandAsync(Command.Screenshot);
-                var (response, data) = await ReceiveResponseAsync(20000);
                 string msg = data.Length > 0 ? Encoding.UTF8.GetString(data).TrimEnd('\0', '\n', '\r') : response.ToString();
                 return (response == Response.Ok, msg);
             }

@@ -390,6 +390,7 @@
                             <TextBlock x:Name="GameCountText" Text="(0 games)" FontSize="12" Foreground="#999999" VerticalAlignment="Center" Margin="0,0,15,0"/>
                             <Button x:Name="RefreshGameListButton" Content="🔄 Refresh" Click="RefreshGameListButton_Click" Padding="10,5" Margin="0,0,8,0"/>
                             <Button x:Name="MountGamesFromListButton" Content="📥 Mount All" Click="MountGamesButton_Click" Padding="10,5" Background="#28A745"/>
+                            <Button x:Name="UnmountAllGamesButton" Content="🗑️ Unmount All" Click="UnmountAllGamesButton_Click" Padding="10,5" Margin="8,0,0,0" Background="#8B0000"/>
                         </WrapPanel>
                     </Border>
 
@@ -1320,13 +1321,9 @@
                                         </StackPanel>
                                     </Border>
 
-                                    <TextBlock Text="📸 Screenshot &amp; 🔔 Notification" FontWeight="Bold" FontSize="16" Foreground="#0E9CFF" Margin="0,0,0,15"/>
+                                    <TextBlock Text="🔔 Notification" FontWeight="Bold" FontSize="16" Foreground="#0E9CFF" Margin="0,0,0,15"/>
                                     <Border Background="#252526" BorderBrush="#3E3E42" BorderThickness="1" CornerRadius="6" Padding="15" Margin="0,0,0,15">
                                         <StackPanel>
-                                            <WrapPanel Margin="0,0,0,10">
-                                                <Button Content="📸 Capture Screen" Click="Screenshot_Click" Padding="12,6" Background="#007ACC" Margin="0,0,10,0"/>
-                                                <TextBlock Text="Saved to PS5 — grab it from Saves &amp; Media" Foreground="#707070" FontSize="11" VerticalAlignment="Center"/>
-                                            </WrapPanel>
                                             <Grid ColumnDefinitions="*,Auto">
                                                 <TextBox x:Name="NotifyTextBox" PlaceholderText="Notification text..." Padding="8,6" Margin="0,0,10,0"/>
                                                 <Button Grid.Column="1" Content="🔔 Send" Click="SendNotify_Click" Padding="12,6" Background="#28A745"/>

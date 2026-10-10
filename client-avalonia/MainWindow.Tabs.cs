@@ -497,6 +497,28 @@ namespace PS5Upload
             }
         }
 
+        private async void UnmountAllGamesButton_Click(object? sender, RoutedEventArgs e)
+        {
+            if (!_protocol.IsConnected) { await ShowMessageAsync("Not connected to PS5", "Error"); return; }
+            if (!await ShowConfirmAsync("Unmount ALL games?\n\nEvery mounted game will be removed from the PS5 home screen.")) return;
+
+            UnmountAllGamesButton.IsEnabled = false;
+            UnmountAllGamesButton.Content = "⏳ Unmounting...";
+            Log("🗑️ Unmount All: Starting...");
+            try
+            {
+                var (success, message) = await _protocol.UnmountAllGamesAsync(msg =>
+                    Dispatcher.UIThread.Post(() => Log($"   {msg}")));
+                if (success) { Log($"✅ {message}"); await RefreshGameListAsync(); }
+                else { Log($"❌ Failed: {message}"); await ShowMessageAsync($"Unmount all failed:\n{message}", "Error"); }
+            }
+            finally
+            {
+                UnmountAllGamesButton.Content = "🗑️ Unmount All";
+                UnmountAllGamesButton.IsEnabled = true;
+            }
+        }
+
         private async void OpenGamePathMenuItem_Click(object? sender, RoutedEventArgs e)
         {
             if (MountedGamesListBox.SelectedItem is PS5MountedGame game)

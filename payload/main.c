@@ -583,6 +583,9 @@ static int wdg_fn_call(void *fn, void *a, void *b, void *c, void *d, int timeout
 static int read_sfo_string(const char* path, const char* want_key, char* out, size_t size);
 static int appdb_direct_register(const char *title_id, const char *game_path);
 static int appdb_direct_unregister(const char *title_id);
+static int scb_register_title(const char *title_id);
+static int scb_appinst_init(void);
+static pid_t proc_find_name(const char *comm);
 static int extract_json_string(const char* json, const char* key, char* out, size_t out_size);
 static int extract_json_int(const char* json, const char* key, unsigned long long* out);
 static int extract_json_object(const char* json, const char* key, char* out, size_t out_size);
@@ -1067,13 +1070,8 @@ static void *pkg_install_worker(void *arg) {
         free(pkg_path);
         return NULL;
     }
-    if (!etahen_present()) {
-        pkg_set_text("PKG install needs etaHEN running");
-        pkg_finish(0, 0x80EE0005, NULL);
-        free(pkg_path);
-        return NULL;
-    }
-
+    // AppInstUtil daemon IPC is alive under kstuff too (proven via the
+    // ShellCore bridge path) — the watchdog contains a wedge either way.
     pkg_set_text("initializing installer");
     int init_rc = wdg_fn_call((void*)sceAppInstUtilInitialize, NULL, NULL, NULL, NULL, 30000);
     if (init_rc != 0 && init_rc != 0x80990001) {
@@ -1427,7 +1425,19 @@ static int install_app(const char *title_id, const char *base_path,
     // The registry row AppInstallAll would create is just sqlite rows in
     // app.db — write them directly instead (no IPC, same result).
     if (!etahen_present()) {
-        send_progress_message("registering via app.db (etaHEN absent)");
+        // Official path under kstuff: run the daemon's own installTitleDir
+        // through the ShellCore bridge — it writes the registry rows AND
+        // notifies the home screen itself (no renderer kill). Fall back to
+        // direct SQLite writes only if the bridge cannot be used.
+        int brc = scb_register_title(title_id);
+        if (brc == 0 || brc == (int)0x80990002) {
+            send_progress_message("registered via ShellCore");
+            return 0;
+        }
+        char dbg[128];
+        snprintf(dbg, sizeof(dbg),
+                 "ShellCore bridge reg failed: 0x%X — fallback app.db", brc);
+        send_progress_message(dbg);
         return appdb_direct_register(title_id, game_path);
     }
 
@@ -1897,19 +1907,28 @@ typedef struct {
     const char *title_id;
     int fg_user;
     int ret, ret_null, ret_sys;
+    int killed_appid, ret_retry;
 } launch_work_t;
 
+// app_id of a currently running game (CUSA/PPSA title), 0 if none.
+// title_filter NULL = any game; otherwise the matching title only.
+static int find_running_game_app(const char *title_filter);
+static void resolve_appmgr_functions(void);
+static int (*g_sceLncUtilKillApp)(int);   // real def in the app-manager block
+
 static int launch_work(launch_work_t *w) {
-    // UserService/LncUtil are daemon IPC too — they wedge the process under
-    // kstuff-light exactly like AppInstUtil. Without etaHEN, refuse cleanly.
-    if (!etahen_present()) {
-        w->ret = w->ret_null = w->ret_sys = -1;
-        return 0;
-    }
+    // Daemon IPC was presumed dead under kstuff, but the AppInstUtil path
+    // (Initialize/AppInstallAll/AppUnInstall) proved responsive — try the
+    // launch sequence under the watchdog either way.
+    resolve_appmgr_functions();
     sceUserServiceInitialize(NULL);
     sceLncUtilInitialize();
     w->fg_user = 0;
     sceUserServiceGetForegroundUser(&w->fg_user);
+
+    // Already running? Report success without touching the foreground app.
+    int same = find_running_game_app(w->title_id);
+    if (same > 0) { w->ret = same; return 0; }
 
     char lnc_param[1024];
     memset(lnc_param, 0, sizeof(lnc_param));
@@ -1929,6 +1948,39 @@ static int launch_work(launch_work_t *w) {
     if (w->ret < 0) {
         w->ret_sys = sceSystemServiceLaunchApp(w->title_id, NULL, NULL);
         if (w->ret_sys == 0) w->ret = 0;
+    }
+    // The daemon often reports an error yet still performs the launch
+    // asynchronously (observed on 13.60: 0x80940010 returned while the game
+    // started seconds later). Poll for the target's eboot.bin before giving
+    // up or killing anything.
+    if (w->ret < 0) {
+        for (int i = 0; i < 80; i++) {
+            int appid = find_running_game_app(w->title_id);
+            if (appid > 0) { w->ret = appid; w->ret_sys = 1; break; }
+            usleep(100 * 1000);
+        }
+    }
+    // Still nothing and another game holds the foreground: close it (what the
+    // console itself does after "close game?") and retry once.
+    if (w->ret < 0) {
+        int victim = find_running_game_app(NULL);
+        if (victim > 0 && g_sceLncUtilKillApp) {
+            w->killed_appid = victim;
+            g_sceLncUtilKillApp(victim);
+            for (int i = 0; i < 40 && find_running_game_app(NULL) > 0; i++)
+                usleep(100 * 1000);
+            w->ret_retry = sceLncUtilLaunchApp(w->title_id, NULL, lnc_param);
+            if (w->ret_retry < 0)
+                w->ret_retry = sceLncUtilLaunchApp(w->title_id, NULL, NULL);
+            if (w->ret_retry >= 0) { w->ret = w->ret_retry; }
+            else {
+                for (int i = 0; i < 60; i++) {
+                    int appid = find_running_game_app(w->title_id);
+                    if (appid > 0) { w->ret = appid; break; }
+                    usleep(100 * 1000);
+                }
+            }
+        }
     }
     return 0;   // completion marker for wdg_fn_call
 }
@@ -2082,12 +2134,13 @@ void release_file_mutex(const char *path) {
 #define CMD_MEM_SEARCH  0x6C        // "pid|start|end|hex" → RESP_DATA match addrs
 #define CMD_KLOG_READ   0x6D        // optional tail bytes  → RESP_DATA kmsg
 #define CMD_MOUNT_GAME  0x6F        // "title_id" → mount a single game
+#define CMD_UNMOUNT_ALL 0x6E        // unmount every mounted game
 
 // Payload self-update: the running server pushes a newer ELF to the local
 // payload loader (elfldr raw-socket protocol — identical to what the PC
 // client does during deploy). The spawned instance sweeps every stale
 // "payload*" process and binds the port — no explicit handoff needed.
-#define SUITE_VERSION      "7.2.4"
+#define SUITE_VERSION      "7.3.0"
 #define SUITE_DIR          "/data/ps5suite"
 #define UPDATE_STAGE_PATH  "/data/ps5suite/update.elf"
 #define UPDATE_MARKER      "/data/ps5suite/update.marker"
@@ -2154,6 +2207,13 @@ static volatile int g_mounted_count = 0;
 // app.db row and got re-registered this run. Drives the UI refresh gate so
 // a pure "already mounted" Mount click never bounces the home screen.
 static int g_healed_registrations = 0;
+// Set whenever a registration change went through DIRECT app.db writes —
+// the only path that leaves SceShellUI unaware (needs a renderer bounce).
+// Daemon-path changes (ShellCore bridge register / AppUnInstall) notify the
+// UI themselves and never set this.
+static volatile int g_ui_dirty = 0;
+// In-flight async unregister workers — refresh decisions wait for them.
+static volatile int g_unreg_pending = 0;
 
 // ============================================================================
 // GLOBAL STATE GUARDS (shared progress socket + counters)
@@ -3025,6 +3085,455 @@ static int appdb_register_work(int mode, const char *title_id,
     return 0;
 }
 
+
+// ============================================================================
+// ShellCore install bridge — registers a title through the daemon's OWN code
+// (the mount bridge technique, adapted). On fw >= 12 the public
+// sceAppInstUtilAppInstallTitleDir RPC is gone and direct SQLite writes leave
+// SceShellUI unaware of the change (hence the renderer kill). Instead we
+// inject a tiny position-independent stub into a code cave inside
+// SceShellCore's executable image and patch the head of its internal
+// AppInstallAll dispatcher: while "armed", that dispatcher runs the daemon's
+// own installTitleDir(title_id, "/user/app/") — real registry write plus the
+// daemon's own UI notification, so the home screen updates live with no
+// renderer kill. The hook is only armed for the duration of one call.
+// ============================================================================
+
+typedef struct {
+    uint32_t fw;          // kernel_get_fw_version() >> 16
+    uint32_t cave_off;    // executable code cave (end-of-text padding)
+    uint32_t cave_size;
+    uint32_t itd_off;     // internal installTitleDir routine
+    uint32_t ia_off;      // internal AppInstallAll dispatcher (patch site)
+    uint8_t  ia_patch;    // bytes replaced by the jump patch
+} scb_fw_t;
+
+// Per-firmware ShellCore image offsets (from the mount bridge' generated
+// table). Runtime prologue checks below guard against a wrong entry.
+static const scb_fw_t k_scb_fw[] = {
+    { 0x0100, 0x1127640, 0x9c0, 0x1adc50, 0xa05c40, 14 }, /* 1.00 */
+    { 0x0101, 0x1127640, 0x9c0, 0x1adc50, 0xa05c40, 14 }, /* 1.01 */
+    { 0x0102, 0x1127640, 0x9c0, 0x1adc50, 0xa05c40, 14 }, /* 1.02 */
+    { 0x0112, 0x11281d0, 0x3e30, 0x1adc30, 0xa063a0, 14 }, /* 1.12 */
+    { 0x0114, 0x11285f0, 0x3a10, 0x1adc30, 0xa06660, 14 }, /* 1.14 */
+    { 0x0200, 0x12a3cf0, 0x310, 0x1df8f0, 0xaf3740, 14 }, /* 2.00 */
+    { 0x0220, 0x12a4160, 0x3ea0, 0x1dfb80, 0xaf3aa0, 14 }, /* 2.20 */
+    { 0x0225, 0x12a5070, 0x2f90, 0x1dfb80, 0xaf3fe0, 14 }, /* 2.25 */
+    { 0x0226, 0x12a6a00, 0x1600, 0x1e0d50, 0xaf57a0, 14 }, /* 2.26 */
+    { 0x0230, 0x12a7880, 0x780, 0x1e0f00, 0xaf6360, 14 }, /* 2.30 */
+    { 0x0250, 0x12aa7c0, 0x1840, 0x1e0ca0, 0xaf7700, 14 }, /* 2.50 */
+    { 0x0270, 0x12aa7c0, 0x1840, 0x1e0ca0, 0xaf7700, 14 }, /* 2.70 */
+    { 0x0300, 0x142c990, 0x3670, 0x2138e0, 0x212ab0, 12 }, /* 3.00 */
+    { 0x0310, 0x142c9d0, 0x3630, 0x213920, 0x212af0, 12 }, /* 3.10 */
+    { 0x0320, 0x142ce20, 0x31e0, 0x2139d0, 0x212ba0, 12 }, /* 3.20 */
+    { 0x0321, 0x142ce20, 0x31e0, 0x2139d0, 0x212ba0, 12 }, /* 3.21 */
+    { 0x0400, 0x13bf980, 0x680, 0x226c20, 0x225e40, 12 }, /* 4.00 */
+    { 0x0403, 0x13bf990, 0x670, 0x226c20, 0x225e40, 12 }, /* 4.03 */
+    { 0x0450, 0x13cb950, 0x6b0, 0x227350, 0x226570, 12 }, /* 4.50 */
+    { 0x0451, 0x13cb950, 0x6b0, 0x227350, 0x226570, 12 }, /* 4.51 */
+    { 0x0500, 0x14893f0, 0x2c10, 0x2556a0, 0x254900, 12 }, /* 5.00 */
+    { 0x0502, 0x14893d0, 0x2c30, 0x2556a0, 0x254900, 12 }, /* 5.02 */
+    { 0x0510, 0x148c510, 0x3af0, 0x256570, 0x2557d0, 12 }, /* 5.10 */
+    { 0x0550, 0x1490b70, 0x3490, 0x256570, 0x2557d0, 12 }, /* 5.50 */
+    { 0x0600, 0x1526ac0, 0x1540, 0x26b9b0, 0x271bb0, 12 }, /* 6.00 */
+    { 0x0602, 0x1526ed0, 0x1130, 0x26b9b0, 0x271bb0, 12 }, /* 6.02 */
+    { 0x0650, 0x1527440, 0xbc0, 0x26ba20, 0x271c20, 12 }, /* 6.50 */
+    { 0x0700, 0x16a8350, 0x3cb0, 0x2852e0, 0x28b690, 12 }, /* 7.00 */
+    { 0x0701, 0x16a8350, 0x3cb0, 0x2852e0, 0x28b690, 12 }, /* 7.01 */
+    { 0x0720, 0x16a8cf0, 0x3310, 0x2852e0, 0x28b690, 12 }, /* 7.20 */
+    { 0x0740, 0x16b6790, 0x1870, 0x2896b0, 0x28fa60, 12 }, /* 7.40 */
+    { 0x0760, 0x16b9d90, 0x2270, 0x2896b0, 0x28fa60, 12 }, /* 7.60 */
+    { 0x0761, 0x16b9d90, 0x2270, 0x2896b0, 0x28fa60, 12 }, /* 7.61 */
+    { 0x0800, 0x1732a90, 0x1570, 0x29a730, 0x2a12f0, 12 }, /* 8.00 */
+    { 0x0820, 0x173ee50, 0x11b0, 0x29a9a0, 0x2a1560, 12 }, /* 8.20 */
+    { 0x0840, 0x173ee50, 0x11b0, 0x29a9a0, 0x2a1560, 12 }, /* 8.40 */
+    { 0x0860, 0x17411b0, 0x2e50, 0x29a750, 0x2a1310, 12 }, /* 8.60 */
+    { 0x0900, 0x17ddca0, 0x2360, 0x2b74d0, 0x2be0e0, 12 }, /* 9.00 */
+    { 0x0905, 0x17ddca0, 0x2360, 0x2b74d0, 0x2be0e0, 12 }, /* 9.05 */
+    { 0x0920, 0x17de380, 0x1c80, 0x2b74d0, 0x2be0e0, 12 }, /* 9.20 */
+    { 0x0940, 0x17deb50, 0x14b0, 0x2b7ba0, 0x2be7b0, 12 }, /* 9.40 */
+    { 0x0960, 0x17e6f20, 0x10e0, 0x2b7c10, 0x2be820, 12 }, /* 9.60 */
+    { 0x1000, 0x17db610, 0x9f0, 0x2b6700, 0x17d1f00, 16 }, /* 10.00 */
+    { 0x1001, 0x17db610, 0x9f0, 0x2b6700, 0x17d1f00, 16 }, /* 10.01 */
+    { 0x1020, 0x17df8e0, 0x720, 0x2b6700, 0x17d61c0, 16 }, /* 10.20 */
+    { 0x1040, 0x17df900, 0x700, 0x2b6760, 0x17d61e0, 16 }, /* 10.40 */
+    { 0x1060, 0x17e1180, 0x2e80, 0x2b80c0, 0x17d7a60, 16 }, /* 10.60 */
+    { 0x1100, 0x18685a0, 0x3a60, 0x2bd880, 0x2c4e60, 15 }, /* 11.00 */
+    { 0x1120, 0x18689a0, 0x3660, 0x2bd930, 0x2c4f10, 15 }, /* 11.20 */
+    { 0x1140, 0x186ace0, 0x1320, 0x2be910, 0x2c5ef0, 15 }, /* 11.40 */
+    { 0x1160, 0x1873d30, 0x2d0, 0x2c2c10, 0x2ca1f0, 15 }, /* 11.60 */
+    { 0x1200, 0x1886360, 0x1ca0, 0x2e0050, 0x2dd100, 12 }, /* 12.00 */
+    { 0x1202, 0x1886360, 0x1ca0, 0x2e0050, 0x2dd100, 12 }, /* 12.02 */
+    { 0x1220, 0x1887200, 0xe00, 0x2e0050, 0x2dd100, 12 }, /* 12.20 */
+    { 0x1240, 0x1887200, 0xe00, 0x2e0050, 0x2dd100, 12 }, /* 12.40 */
+    { 0x1260, 0x188dfa0, 0x2060, 0x2e0320, 0x2dd3d0, 12 }, /* 12.60 */
+    { 0x1270, 0x188dfa0, 0x2060, 0x2e0320, 0x2dd3d0, 12 }, /* 12.70 */
+    { 0x1300, 0x1958090, 0x3f70, 0x31f6e0, 0x31c790, 12 }, /* 13.00 */
+    { 0x1320, 0x19619f0, 0x2610, 0x31ff20, 0x31cfd0, 12 }, /* 13.20 */
+    { 0x1340, 0x1961b70, 0x2490, 0x3200a0, 0x31d150, 12 }, /* 13.40 */
+    { 0x1342, 0x1961b70, 0x2490, 0x3200a0, 0x31d150, 12 }, /* 13.42 */
+    { 0x1360, 0x1962700, 0x1900, 0x320c40, 0x31dcf0, 12 }, /* 13.60 */
+};
+
+#define SCB_AUTHID_DEBUGGER 0x4800000000010003ull
+#define SCB_STR_SIZE 16
+
+// Blob layout (all offsets relative to blob start).
+#define SCB_OFF_ARMED   0x01   // imm8 of "mov al, imm"
+#define SCB_OFF_TITLE0  0x0c   // movabs rax, title q0
+#define SCB_OFF_TITLE1  0x1a   // movabs rax, title q1
+#define SCB_OFF_DIR0    0x29   // movabs rax, dir q0
+#define SCB_OFF_DIR1    0x38   // movabs rax, dir q1
+#define SCB_OFF_ITD     0x57   // movabs r11, installTitleDir
+#define SCB_OFF_TRAMP   0x67   // original prologue bytes
+#define SCB_BLOB_SIZE   0x90   // tramp offset varies with prologue size
+
+static pthread_mutex_t g_scb_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int    g_scb_state;        // 0 unknown, 1 ready, -1 unavailable
+static pid_t  g_scb_pid;
+static uintptr_t g_scb_bridge;    // remote blob address
+static uintptr_t g_scb_ia;        // remote AppInstallAll dispatcher address
+static uint8_t  g_scb_orig[16];
+static int      g_scb_orig_size;
+static int      g_scb_appinst_ready;   // sceAppInstUtilInitialize done
+
+static int scb_remote_read(pid_t pid, uintptr_t addr, void *buf, size_t n) {
+    return mdbg_copyout(pid, (intptr_t)addr, buf, n);
+}
+
+static uintptr_t scb_vmspace_pmap(uintptr_t vmspace) {
+    uint32_t v = kernel_get_fw_version() >> 16;
+    if (v >= 0x0100 && v <= 0x0102) return vmspace + 0x2c0;
+    if (v >= 0x0105 && v <= 0x0550) return vmspace + 0x2e0;
+    if (v >= 0x0600 && v <= 0x1360) return vmspace + 0x2e8;
+    return 0;
+}
+
+// ShellCore text is execute-only — mdbg_copyin cannot write it on fw > 8.20,
+// so writes go through a manual page walk and kernel_copyin on the direct
+// map (same approach as the mount bridge).
+static int scb_remote_write(pid_t pid, uintptr_t addr, const void *buf,
+                            size_t size) {
+    if (!buf || !size) return -1;
+    if ((kernel_get_fw_version() >> 16) <= 0x0820)
+        return mdbg_copyin(pid, buf, (intptr_t)addr, size);
+
+    intptr_t proc = kernel_get_proc(pid);
+    if (!proc) return -1;
+    uintptr_t vmspace = (uintptr_t)kernel_getlong(
+        proc + (uintptr_t)KERNEL_OFFSET_PROC_P_VMSPACE);
+    uintptr_t pmap = vmspace ? scb_vmspace_pmap(vmspace) : 0;
+    if (!pmap) return -1;
+    uint64_t paging[2];
+    if (kernel_copyout((intptr_t)(pmap + 32), paging, sizeof(paging)) != 0 ||
+        !paging[0] || !paging[1] || paging[0] <= paging[1])
+        return -1;
+    const uint64_t cr3 = paging[1];
+    const uint64_t dmap = paging[0] - paging[1];
+
+    const uint8_t *src = (const uint8_t *)buf;
+    while (size) {
+        uint64_t pm = cr3 & 0x000ffffffffff000ull;
+        uint64_t phys = ~0ull, limit = 0;
+        for (int shift = 39; shift >= 12; shift -= 9) {
+            uint64_t idx = (addr >> shift) & 0x1ff;
+            pm = kernel_getlong((intptr_t)(dmap + pm + idx * 8));
+            if (!(pm & 1)) return -1;
+            if ((pm & 0x80) || shift == 12) {
+                pm &= (1ull << 52) - (1ull << shift);
+                pm |= addr & ((1ull << shift) - 1);
+                phys = pm;
+                limit = (pm | ((1ull << shift) - 1)) + 1;
+                break;
+            }
+            pm &= 0x000ffffffffff000ull;
+        }
+        if (phys == ~0ull || limit <= phys) return -1;
+        size_t chunk = (size_t)(limit - phys);
+        if (chunk > size) chunk = size;
+        if (kernel_copyin(src, (intptr_t)(dmap + phys), chunk) != 0)
+            return -1;
+        addr += chunk; src += chunk; size -= chunk;
+    }
+    return 0;
+}
+
+static int scb_ptrace(int request, pid_t pid, void *addr, int data) {
+    static const uint8_t caps[16] = {
+        0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+        0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff};
+    pid_t self = getpid();
+    uint8_t saved[sizeof(caps)];
+    uint64_t auth = kernel_get_ucred_authid(self);
+    if (!auth || kernel_get_ucred_caps(self, saved) != 0) return -1;
+    if (kernel_set_ucred_authid(self, SCB_AUTHID_DEBUGGER) != 0 ||
+        kernel_set_ucred_caps(self, caps) != 0) {
+        kernel_set_ucred_authid(self, auth);
+        kernel_set_ucred_caps(self, saved);
+        return -1;
+    }
+    int r = ptrace(request, pid, (caddr_t)addr, data);
+    kernel_set_ucred_authid(self, auth);
+    kernel_set_ucred_caps(self, saved);
+    return r;
+}
+
+static const scb_fw_t *scb_lookup_fw(void) {
+    uint32_t fw = kernel_get_fw_version() >> 16;
+    for (size_t i = 0; i < sizeof(k_scb_fw)/sizeof(k_scb_fw[0]); i++)
+        if (k_scb_fw[i].fw == fw) return &k_scb_fw[i];
+    return NULL;
+}
+
+static void scb_set64(uint8_t *blob, int off, uint64_t v) {
+    memcpy(blob + off, &v, sizeof(v));
+}
+
+// Build the PIC stub:
+//   mov al, armed         ; armed flag lives in the imm8
+//   test al, al / jz tramp; unarmed calls run the original prologue
+//   sub rsp,40; materialize title_id[16]+dir[16] on the stack
+//   rdi=title rsi=dir edx=1 ecx=0; call installTitleDir; ret
+//   tramp: <original 12 bytes>; movabs r11,ia+patch; jmp r11
+static size_t scb_build_blob(uint8_t *b, uintptr_t itd, const uint8_t *orig,
+                             int orig_size, uintptr_t ret_addr) {
+    memset(b, 0x90, SCB_BLOB_SIZE);
+    static const uint8_t head[] = {
+        0xB0,0x00,             // mov al, 0            @00 (armed @01)
+        0x84,0xC0,             // test al, al          @02
+        0x74,0x61,             // jz +0x61 -> 0x67     @04
+        0x48,0x83,0xEC,0x28,   // sub rsp, 40          @06
+        0x48,0xB8,0,0,0,0,0,0,0,0,  // movabs rax,t0    @0A imm @0C
+        0x48,0x89,0x04,0x24,   // mov [rsp], rax       @14
+        0x48,0xB8,0,0,0,0,0,0,0,0,  // movabs rax,t1    @18 imm @1A
+        0x48,0x89,0x44,0x24,0x08,   // mov [rsp+8],rax  @22
+        0x48,0xB8,0,0,0,0,0,0,0,0,  // movabs rax,d0    @27 imm @29
+        0x48,0x89,0x44,0x24,0x10,   // mov [rsp+16],rax @31
+        0x48,0xB8,0,0,0,0,0,0,0,0,  // movabs rax,d1    @36 imm @38
+        0x48,0x89,0x44,0x24,0x18,   // mov [rsp+24],rax @40
+        0x48,0x8D,0x3C,0x24,   // lea rdi,[rsp]        @45
+        0x48,0x8D,0x74,0x24,0x10,   // lea rsi,[rsp+16] @49
+        0xBA,0x01,0x00,0x00,0x00,   // mov edx, 1       @4E
+        0x31,0xC9,             // xor ecx, ecx         @53
+        0x49,0xBB,0,0,0,0,0,0,0,0,  // movabs r11,itd   @55 imm @57
+        0x41,0xFF,0xD3,        // call r11             @5F
+        0x48,0x83,0xC4,0x28,   // add rsp, 40          @62
+        0xC3                   // ret                  @66
+    };
+    memcpy(b, head, sizeof(head));   // sizeof(head) == 0x67
+    memcpy(b + SCB_OFF_TRAMP, orig, orig_size);
+    b[SCB_OFF_TRAMP + orig_size] = 0x49;      // movabs r11
+    b[SCB_OFF_TRAMP + orig_size + 1] = 0xBB;
+    scb_set64(b, SCB_OFF_TRAMP + orig_size + 2, ret_addr);
+    b[SCB_OFF_TRAMP + orig_size + 10] = 0x41; // jmp r11
+    b[SCB_OFF_TRAMP + orig_size + 11] = 0xFF;
+    b[SCB_OFF_TRAMP + orig_size + 12] = 0xE3;
+    scb_set64(b, SCB_OFF_ITD, itd);
+    return SCB_OFF_TRAMP + orig_size + 13;
+}
+
+static const uint8_t k_scb_prologue[] = {0x55, 0x48, 0x89, 0xE5};
+
+static int scb_verify_remote(pid_t pid, uintptr_t addr, const void *exp,
+                             size_t n) {
+    uint8_t tmp[64];
+    while (n) {
+        size_t c = n < sizeof(tmp) ? n : sizeof(tmp);
+        if (scb_remote_read(pid, addr, tmp, c) != 0 ||
+            memcmp(tmp, exp, c) != 0)
+            return -1;
+        addr += c; exp = (const uint8_t *)exp + c; n -= c;
+    }
+    return 0;
+}
+
+// Attach, write the bridge blob, patch the dispatcher head, detach.
+static int scb_install_bridge(pid_t pid, const scb_fw_t *fw,
+                              uintptr_t base) {
+    uintptr_t cave = base + fw->cave_off;
+    uintptr_t ia   = base + fw->ia_off;
+    uintptr_t itd  = base + fw->itd_off;
+
+    // mdbg_copyout requires an active debugger session on the target —
+    // attach BEFORE any remote read, like the mount bridge does.
+    if (scb_ptrace(PT_ATTACH, pid, NULL, 0) != 0) {
+        dbg_log("scb: ptrace attach failed\n");
+        return -5;
+    }
+    int st = 0;
+    pid_t w;
+    do { w = waitpid(pid, &st, 0); } while (w < 0 && errno == EINTR);
+    int ok = 0;
+    int stage = 2;
+    int have_orig = 0;
+    int foreign = 0;
+    if (w == pid && WIFSTOPPED(st)) {
+        if (scb_verify_remote(pid, itd, k_scb_prologue, 4) == 0) {
+            stage = 3;
+            // Recover a stale self-install: a previous run may have left the
+            // dispatcher patched — the hook lives in ShellCore memory and
+            // survives payload restarts. If ia already jumps to OUR cave,
+            // the original prologue is recoverable from the blob's tramp.
+            uint8_t cur[16] = {0};
+            if (scb_remote_read(pid, ia, cur, sizeof(cur)) == 0 &&
+                cur[0] == 0x48 && cur[1] == 0xB8 &&
+                cur[10] == 0xFF && cur[11] == 0xE0) {
+                uint64_t dst;
+                memcpy(&dst, cur + 2, 8);
+                if (dst == cave) {
+                    uint8_t head[8] = {0};
+                    if (scb_remote_read(pid, cave, head, sizeof(head)) == 0 &&
+                        head[0] == 0xB0 && head[2] == 0x84 &&
+                        head[3] == 0xC0 && head[4] == 0x74 &&
+                        scb_remote_read(pid, cave + SCB_OFF_TRAMP,
+                                        g_scb_orig, fw->ia_patch) == 0) {
+                        g_scb_orig_size = fw->ia_patch;
+                        have_orig = 1;
+                        dbg_log("scb: recovered stale self-hook\n");
+                    } else {
+                        dbg_log("scb: foreign bridge at cave — bail\n");
+                        foreign = 1;
+                    }
+                } else {
+                    dbg_log("scb: foreign hook on dispatcher — bail\n");
+                    foreign = 1;
+                }
+            } else if (scb_verify_remote(pid, ia, k_scb_prologue, 4) == 0 &&
+                       scb_remote_read(pid, ia, g_scb_orig, fw->ia_patch) == 0) {
+                g_scb_orig_size = fw->ia_patch;
+                have_orig = 1;
+            }
+            if (have_orig) {
+                stage = 4;
+                uint8_t blob[SCB_BLOB_SIZE];
+                size_t blob_size = scb_build_blob(blob, itd, g_scb_orig,
+                                                  g_scb_orig_size,
+                                                  ia + g_scb_orig_size);
+                if (blob_size <= fw->cave_size) {
+                    stage = 5;
+                    if (scb_remote_write(pid, cave, blob, blob_size) == 0 &&
+                        scb_verify_remote(pid, cave, blob, blob_size) == 0) {
+                        uint8_t patch[16];
+                        memset(patch, 0x90, sizeof(patch));
+                        patch[0] = 0x48; patch[1] = 0xB8;      // movabs rax
+                        uint64_t dst = cave;
+                        memcpy(patch + 2, &dst, 8);
+                        patch[10] = 0xFF; patch[11] = 0xE0;    // jmp rax
+                        if (fw->ia_patch <= (int)sizeof(patch) &&
+                            scb_remote_write(pid, ia, patch, fw->ia_patch) == 0 &&
+                            scb_verify_remote(pid, ia, patch, fw->ia_patch) == 0) {
+                            ok = 1;
+                        } else {
+                            // A partial dispatcher patch would crash
+                            // ShellCore on the next AppInstallAll — put
+                            // the original bytes back.
+                            scb_remote_write(pid, ia, g_scb_orig,
+                                             g_scb_orig_size);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    scb_ptrace(PT_DETACH, pid, NULL, 0);
+    if (foreign) return -7;
+    if (!ok) {
+        dbg_kv("scb: install failed stage=", (unsigned long)stage);
+        return -stage;
+    }
+    g_scb_bridge = cave;
+    g_scb_ia = ia;
+    return 0;
+}
+
+// Returns 1 when the bridge is present and the dispatcher still jumps to it.
+static int scb_hook_alive(pid_t pid) {
+    if (pid <= 0 || !g_scb_bridge) return 0;
+    uint8_t cur[16];
+    if (scb_remote_read(pid, g_scb_ia, cur, g_scb_orig_size) != 0)
+        return 0;
+    if (cur[0] != 0x48 || cur[1] != 0xB8) return 0;
+    uint64_t dst;
+    memcpy(&dst, cur + 2, 8);
+    return dst == g_scb_bridge;
+}
+
+static int scb_ensure(void) {
+    if (g_scb_state == 1) {
+        pid_t cur = proc_find_name("SceShellCore");
+        if (cur > 0 && cur == g_scb_pid && scb_hook_alive(cur))
+            return 0;
+        g_scb_state = 0;   // ShellCore restarted or hook lost — reinstall
+    }
+    const scb_fw_t *fw = scb_lookup_fw();
+    if (!fw) { dbg_kv("scb: fw lookup miss fw=", kernel_get_fw_version()); g_scb_state = -1; return -1; }
+    pid_t pid = proc_find_name("SceShellCore");
+    if (pid <= 0) pid = proc_find_name("SceShellCore.elf");
+    if (pid <= 0) { dbg_kv("scb: pid lookup failed rc=", (unsigned long)pid); g_scb_state = -1; return -2; }
+    uintptr_t base = (uintptr_t)kernel_dynlib_mapbase_addr(pid, 0);
+    dbg_kx("scb: pid=", (unsigned long)pid);
+    dbg_kx("scb: base=", (unsigned long)base);
+    if (!base) { g_scb_state = -1; return -3; }
+    int rc = scb_install_bridge(pid, fw, base);
+    if (rc != 0) { g_scb_state = -1; return rc; }
+    g_scb_pid = pid;
+    g_scb_state = 1;
+    return 0;
+}
+
+// One-time AppInstUtil client init (needed before AppInstallAll reaches the
+// daemon). Watchdog-guarded: a wedged IPC marks the bridge unusable instead
+// of hanging the server.
+static int scb_appinst_init(void) {
+    if (g_scb_appinst_ready) return 0;
+    int rc = wdg_fn_call((void*)sceAppInstUtilInitialize, NULL, NULL, NULL,
+                         NULL, 30000);
+    if (rc == 0 || rc == (int)0x80990001) {
+        g_scb_appinst_ready = 1;
+        return 0;
+    }
+    return -1;
+}
+
+// Register title_id from /user/app/<id> through ShellCore's own
+// installTitleDir — daemon writes the DB rows and notifies ShellUI itself.
+// Returns the installTitleDir result (0 success, 0x80990002 "restored").
+static int scb_register_title(const char *title_id) {
+    pthread_mutex_lock(&g_scb_mutex);
+    int result = -1;
+    int erc = scb_ensure();
+    if (erc != 0) { result = -0x1000 + erc; goto out; }
+    if (scb_appinst_init() != 0) { result = -0x2000; goto out; }
+
+    pid_t pid = g_scb_pid;
+    uint8_t str[SCB_STR_SIZE * 2];
+    memset(str, 0, sizeof(str));
+    snprintf((char*)str, SCB_STR_SIZE, "%s", title_id);
+    snprintf((char*)str + SCB_STR_SIZE, SCB_STR_SIZE, "/user/app/");
+    // The four qword immediates sit inside movabs opcodes — not contiguous.
+    if (scb_remote_write(pid, g_scb_bridge + SCB_OFF_TITLE0, str, 8) != 0 ||
+        scb_remote_write(pid, g_scb_bridge + SCB_OFF_TITLE1, str + 8, 8) != 0 ||
+        scb_remote_write(pid, g_scb_bridge + SCB_OFF_DIR0, str + SCB_STR_SIZE, 8) != 0 ||
+        scb_remote_write(pid, g_scb_bridge + SCB_OFF_DIR1, str + SCB_STR_SIZE + 8, 8) != 0) {
+        result = -0x3000;
+        goto out;
+    }
+    uint8_t armed = 1;
+    if (scb_remote_write(pid, g_scb_bridge + SCB_OFF_ARMED, &armed, 1) != 0) {
+        result = -0x4000;
+        goto out;
+    }
+    result = wdg_fn_call((void*)sceAppInstUtilAppInstallAll, NULL, NULL,
+                         NULL, NULL, 30000);
+    armed = 0;
+    scb_remote_write(pid, g_scb_bridge + SCB_OFF_ARMED, &armed, 1);
+    if (result == -2)
+        g_scb_state = 0;   // wedged IPC — force hook re-verify next time
+out:
+    pthread_mutex_unlock(&g_scb_mutex);
+    return result;
+}
+
 // Register/unregister a title directly in app.db — used ONLY when etaHEN is
 // absent (daemon IPC would wedge). Watchdog-guarded like every risky call.
 typedef struct { int mode; char title_id[16]; char game_path[PATH_MAX]; int rc; }
@@ -3038,6 +3547,7 @@ static int appdb_direct_register(const char *title_id, const char *game_path) {
     if (!j) return -1;
     j->mode = 1;
     snprintf(j->title_id, sizeof(j->title_id), "%s", title_id);
+    g_ui_dirty = 1;   // direct write — ShellUI won't notice on its own
     if (game_path) snprintf(j->game_path, sizeof(j->game_path), "%s", game_path);
     int wrc = wdg_fn_call((void*)appdb_job_work, j, NULL, NULL, NULL, 15000);
     int rc = (wrc == 0) ? j->rc : -2;
@@ -3115,6 +3625,7 @@ static int appdb_icon_index_ok(const char *title_id) {
 // Move an already-registered title to the front of the home ordering —
 // heals rows that were registered with lastAccessIndex=0.
 static int appdb_bump_icon_index(const char *title_id) {
+    g_ui_dirty = 1;
     sqlite3 *db = NULL;
     if (sqlite3_open("/system_data/priv/mms/app.db", &db) != SQLITE_OK) {
         if (db) sqlite3_close(db);
@@ -3595,7 +4106,10 @@ static int process_game(const char* game_path, char* game_name_out, size_t name_
         // of rewriting the whole registration.
         if (!etahen_present()) {
             if (!appdb_title_exists(title_id)) {
-                if (appdb_direct_register(title_id, game_path) == 0)
+                int brc = scb_register_title(title_id);
+                if (brc == 0 || brc == (int)0x80990002)
+                    g_healed_registrations++;   /* daemon path: no dirty */
+                else if (appdb_direct_register(title_id, game_path) == 0)
                     g_healed_registrations++;
             } else if (!appdb_icon_index_ok(title_id)) {
                 if (appdb_bump_icon_index(title_id) == 0)
@@ -5762,6 +6276,7 @@ static void mount_games_body(mount_job_t* job, int sock) {
     // g_mount_running); readers only sample the count atomically.
     __atomic_store_n(&g_mounted_count, 0, __ATOMIC_SEQ_CST);
     g_healed_registrations = 0;
+    g_ui_dirty = 0;
     dbg_log("mb list cleared\n");
 
     // (AppInstUtil Initialize happens lazily inside register_title() — one
@@ -5938,11 +6453,20 @@ static void mount_games_body(mount_job_t* job, int sock) {
     // actually changed: already-mounted games touch nothing (the heal path
     // only re-registers rows that are missing), so a pure-skip run must not
     // flash the home screen for no reason.
-    if (!etahen_present() &&
-        (mounted_count > 0 || cleaned > 0 || g_healed_registrations > 0)) {
-        send_notification("Refreshing home screen...");
-        usleep(500 * 1000);
-        restart_shellui();
+    // Direct-DB registration bypasses the daemon, so nothing tells the UI
+    // that the registry changed — bounce SceShellUI so new icons appear.
+    // Daemon-path changes (ShellCore bridge / AppUnInstall) notify the UI
+    // themselves and never need this. Wait (bounded) for any async
+    // unregister workers before deciding.
+    if (!etahen_present()) {
+        for (int i = 0; i < 400 && g_unreg_pending > 0; i++)
+            usleep(100 * 1000);
+        if (g_ui_dirty) {
+            send_notification("Refreshing home screen...");
+            usleep(500 * 1000);
+            restart_shellui();
+        }
+        g_ui_dirty = 0;
     }
 }
 
@@ -7626,6 +8150,10 @@ static int (*g_sceLncUtilIsAppSuspended)(int) = NULL;
 static int (*g_sceLncUtilKillApp)(int) = NULL;
 static int (*g_sceLncUtilForceKillApp)(int) = NULL;
 static int (*g_sceLncUtilKickCoredumpOnlyProcMem)(int) = NULL;
+static int (*g_sceSystemServiceRequestReboot)(int) = NULL;
+static int (*g_sceSystemStateMgrTurnOff)(int) = NULL;
+static int (*g_sceShellCoreUtilRequestShutdown)(int) = NULL;
+static int (*g_sceSystemServiceRequestPowerOff)(int) = NULL;
 static int g_appmgr_resolved = 0;
 static pthread_mutex_t g_appmgr_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -7670,6 +8198,10 @@ static void resolve_appmgr_functions(void) {
         SVC_RES(g_sceLncUtilKillApp, "sceLncUtilKillApp", int (*)(int));
         SVC_RES(g_sceLncUtilForceKillApp, "sceLncUtilForceKillApp", int (*)(int));
         SVC_RES(g_sceLncUtilKickCoredumpOnlyProcMem, "sceLncUtilKickCoredumpOnlyProcMem", int (*)(int));
+        SVC_RES(g_sceSystemServiceRequestReboot, "sceSystemServiceRequestReboot", int (*)(int));
+        SVC_RES(g_sceSystemStateMgrTurnOff, "sceSystemStateMgrTurnOff", int (*)(int));
+        SVC_RES(g_sceShellCoreUtilRequestShutdown, "sceShellCoreUtilRequestShutdown", int (*)(int));
+        SVC_RES(g_sceSystemServiceRequestPowerOff, "sceSystemServiceRequestPowerOff", int (*)(int));
 #undef SVC_RES
     }
 
@@ -7677,10 +8209,10 @@ static void resolve_appmgr_functions(void) {
     pthread_mutex_unlock(&g_appmgr_lock);
 }
 
-// Daemon-IPC call wrapper: 3 args max, watchdog-contained, etaHEN-gated.
+// Daemon-IPC call wrapper: 3 args max, watchdog-contained. Proven to answer
+// under kstuff too (AppInstUtil/LncUtil IPC reached the daemons fine).
 static int lnc_call3(void *fn, int a, uint32_t b, void *c) {
     if (!fn) return -1000;
-    if (!etahen_present()) return -1001;
     return wdg_fn_call(fn, (void*)(intptr_t)a, (void*)(uintptr_t)b, c, NULL, 15000);
 }
 
@@ -7731,6 +8263,47 @@ static int appinfo_lookup(pid_t pid, long start_sec, app_info_t *out) {
     g_appinfo_cache[slot].info = ai;
     *out = ai;
     return ok ? 0 : -1;
+}
+
+// app_id of a currently running game (CUSA/PPSA title), 0 if none.
+// title_filter NULL = any game; otherwise the matching title only.
+static int find_running_game_app(const char *title_filter) {
+    resolve_appmgr_functions();
+    if (!g_sceKernelGetAppInfo) return 0;
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PROC, 0 };
+    size_t len = 0;
+    if (sysctl(mib, 4, NULL, &len, NULL, 0) != 0 || !len) return 0;
+    len += len / 2 + 4096;
+    uint8_t *buf = malloc(len);
+    if (!buf) return 0;
+    int found = 0;
+    if (sysctl(mib, 4, buf, &len, NULL, 0) == 0) {
+        for (uint8_t *p = buf; p < buf + len; ) {
+            struct kinfo_proc *ki = (struct kinfo_proc *)p;
+            if (ki->ki_structsize <= 0) break;
+            p += ki->ki_structsize;
+            // Only real games run as eboot.bin — system daemons (SceCdlgApp,
+            // ShellUI...) carry numeric title_ids too and must never match.
+            if (strcmp(ki->ki_comm, "eboot.bin") != 0) continue;
+            app_info_t ai;
+            if (appinfo_lookup(ki->ki_pid, ki->ki_start.tv_sec, &ai) != 0)
+                continue;
+            if (ai.app_id == 0xFFFFFFFFu || ai.app_id == 0) continue;
+            ai.title_id[9] = '\0';
+            if (title_filter) {
+                // title_id may be "PPSA10737" or just the numeric tail "10737"
+                const char *tail = strlen(title_filter) > 5
+                    ? title_filter + strlen(title_filter) - 5 : title_filter;
+                if (strcmp(ai.title_id, title_filter) != 0 &&
+                    strcmp(ai.title_id, tail) != 0)
+                    continue;
+            }
+            found = (int)ai.app_id;
+            break;
+        }
+    }
+    free(buf);
+    return found;
 }
 
 void handle_app_list_v2(client_session_t *session) {
@@ -8113,26 +8686,47 @@ void handle_klog_read(client_session_t *session, const char *arg) {
 // later so the RESP_OK reaches the client before the console goes down.
 // ============================================================================
 static void *reboot_thread(void *arg) {
-    int how = (int)(intptr_t)arg;
+    int is_reboot = (int)(intptr_t)arg;
     usleep(400 * 1000);
     sync();
-    reboot(how);
+    resolve_appmgr_functions();
+    // The raw reboot() syscall halts the OS but never signals the ICC, so
+    // the console goes black yet stays powered — must pull the plug. The
+    // daemon path performs the real power sequence (graceful app close +
+    // SoC power-down). Called on this detached thread: if a call wedges,
+    // the payload stays alive and the syscall fallback still fires below.
+    if (is_reboot) {
+        if (g_sceSystemServiceRequestReboot &&
+            g_sceSystemServiceRequestReboot(0) == 0)
+            return NULL;
+    } else {
+        if (g_sceSystemStateMgrTurnOff &&
+            g_sceSystemStateMgrTurnOff(0) == 0)
+            return NULL;
+        if (g_sceShellCoreUtilRequestShutdown &&
+            g_sceShellCoreUtilRequestShutdown(2) == 0)
+            return NULL;
+        if (g_sceSystemServiceRequestPowerOff &&
+            g_sceSystemServiceRequestPowerOff(0) == 0)
+            return NULL;
+    }
+    reboot(is_reboot ? RB_AUTOBOOT : (RB_HALT | RB_POWEROFF));
     return NULL;    // unreachable unless reboot() failed
 }
 
 void handle_power_action(client_session_t *session, const char *arg) {
-    int how;
+    int is_reboot;
     if (arg && !strcmp(arg, "reboot")) {
-        how = RB_AUTOBOOT;
+        is_reboot = 1;
     } else if (arg && !strcmp(arg, "shutdown")) {
-        how = RB_HALT | RB_POWEROFF;
+        is_reboot = 0;
     } else {
         send_error(session->sock, "usage: reboot|shutdown");
         return;
     }
     send_response(session->sock, RESP_OK, arg, strlen(arg));
     pthread_t t;
-    if (pthread_create(&t, NULL, reboot_thread, (void *)(intptr_t)how) == 0)
+    if (pthread_create(&t, NULL, reboot_thread, (void *)(intptr_t)is_reboot) == 0)
         pthread_detach(t);
 }
 
@@ -8230,19 +8824,42 @@ static int rpc_write(pid_t pid, intptr_t addr, const void *buf, size_t len) {
 
 static pid_t proc_find_name(const char *comm) {
     int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PROC, 0 };
-    size_t len = 0;
-    if (sysctl(mib, 4, NULL, &len, NULL, 0) != 0 || !len) return -1;
-    uint8_t *buf = malloc(len);
-    pid_t found = -1;
-    if (buf && sysctl(mib, 4, buf, &len, NULL, 0) == 0) {
-        size_t sz = ((struct kinfo_proc *)buf)->ki_structsize;
-        for (uint8_t *p = buf; p < buf + len && sz; p += sz) {
-            struct kinfo_proc *ki = (struct kinfo_proc *)p;
-            if (!strcmp(ki->ki_comm, comm)) { found = ki->ki_pid; break; }
+    // Second sysctl races new processes — pad the buffer and retry once.
+    for (int attempt = 0; attempt < 2; attempt++) {
+        size_t len = 0;
+        if (sysctl(mib, 4, NULL, &len, NULL, 0) != 0 || !len) {
+            dbg_kv("pfn: sysctl size failed errno=", (unsigned long)errno);
+            return -2;
+        }
+        len += len / 2 + 4096;
+        uint8_t *buf = malloc(len);
+        if (!buf) return -2;
+        pid_t found = -1;
+        if (sysctl(mib, 4, buf, &len, NULL, 0) == 0) {
+            for (uint8_t *p = buf; p < buf + len; ) {
+                struct kinfo_proc *ki = (struct kinfo_proc *)p;
+                if (ki->ki_structsize <= 0) break;
+                // Match process comm OR the Orbis tdname field (offset 447)
+                // — SceShellCore identifies by tdname on some firmwares.
+                const char *td = ki->ki_structsize > 447
+                    ? (const char *)p + 447 : "";
+                if (!strcmp(ki->ki_comm, comm) || !strcmp(td, comm)) {
+                    found = ki->ki_pid;
+                    break;
+                }
+                p += ki->ki_structsize;
+            }
+            free(buf);
+            return found;
+        }
+        free(buf);
+        if (errno != ENOMEM) {
+            dbg_kv("pfn: sysctl fill failed errno=", (unsigned long)errno);
+            return -2;
         }
     }
-    free(buf);
-    return found;
+    dbg_log("pfn: ENOMEM after retry\n");
+    return -2;
 }
 
 typedef struct {
@@ -8593,9 +9210,7 @@ void handle_pad_info(client_session_t *session) {
     char *out = malloc(2048);
     if (!out) { send_error(session->sock, "Out of memory"); return; }
     int off = 0;
-    if (!etahen_present()) {
-        off = snprintf(out, 2048, "error=pad service needs etaHEN\n");
-    } else {
+    {
         pad_work_t w;
         memset(&w, 0, sizeof(w));
         int wrc = wdg_fn_call((void *)pad_full_work, &w, NULL, NULL, NULL, 8000);
@@ -8631,57 +9246,10 @@ void handle_pad_info(client_session_t *session) {
 }
 
 // ============================================================================
-// SCREENSHOT — sceScreenShotCapture() asks ShellUI to grab whatever is on
-// screen right now. Daemon IPC → etaHEN guard + watchdog worker.
-// ============================================================================
-static int (*g_sceScreenShotCapture)(void) = NULL;
-static int g_ss_resolved = 0;
-
-static int resolve_screenshot(void) {
-    if (g_ss_resolved) return g_sceScreenShotCapture != NULL;
-    static const char *paths[] = {
-        "/system/common/lib/libSceScreenShot.sprx",
-        "/system/priv/lib/libSceScreenShot.sprx",
-        "/preinst2/common/lib/libSceScreenShot.sprx",
-        "libSceScreenShot.sprx",
-        NULL
-    };
-    void *h = NULL;
-    for (int i = 0; paths[i] && !h; i++)
-        h = dlopen(paths[i], RTLD_NOW | RTLD_GLOBAL);
-    if (h) g_sceScreenShotCapture = (void *)dlsym(h, "sceScreenShotCapture");
-    if (!g_sceScreenShotCapture) {
-        uint32_t mod = 0;
-        if (krpc_dynlib_handle(getpid(), "libSceScreenShot.sprx", &mod) == 0 && mod)
-            g_sceScreenShotCapture = krpc_dlsym_checked(getpid(), mod, "sceScreenShotCapture");
-    }
-    g_ss_resolved = 1;
-    return g_sceScreenShotCapture != NULL;
-}
-
-// Resolve inside the watchdog worker — dlopen/krpc calls can park and must
-// never run on the command thread (a park there freezes the whole server).
-static int ss_work(int *rc) {
-    if (!resolve_screenshot()) { *rc = -98; return 0; }
-    *rc = g_sceScreenShotCapture();
-    return 0;
-}
-
-void handle_screenshot(client_session_t *session) {
-    char out[160];
-    if (!etahen_present()) {
-        send_error(session->sock, "screenshot needs etaHEN (ShellUI IPC)");
-        return;
-    }
-    int rc = -1;
-    int wrc = wdg_fn_call((void *)ss_work, &rc, NULL, NULL, NULL, 8000);
-    int n = snprintf(out, sizeof(out), "rc=%d wdg=%d", rc, wrc);
-    if (rc == 0)
-        send_response(session->sock, RESP_OK, out, n);
-    else
-        send_response(session->sock, RESP_ERROR, out, n);
-}
-
+// SCREENSHOT — removed. The capture IPC client needs a registered app-thread
+// context no payload can provide: local calls fail 0x80C1B001, remote calls
+// inside ShellUI/ShellCore/eboot.bin all fail 0x80BE0001 even after a remote
+// sceSysmoduleLoadModule(0x9C). Feature deleted rather than left broken.
 // ============================================================================
 // NOTIFY — push a text notification to the PS5 UI (same kernel API the boot
 // messages already use; plain syscall, no daemon).
@@ -8745,7 +9313,6 @@ static int pad_action_full_work(pad_action_work_t *w) {
 
 void handle_pad_action(client_session_t *session, const char *arg) {
     if (!arg || !*arg) { send_error(session->sock, "usage: lightbar|r,g,b"); return; }
-    if (!etahen_present()) { send_error(session->sock, "pad needs etaHEN"); return; }
 
     pad_action_work_t w;
     memset(&w, 0, sizeof(w));
@@ -9173,17 +9740,20 @@ void handle_launch_game(client_session_t *session, const char *title_id) {
     memset(&w, 0, sizeof(w));
     snprintf(w_title_id, sizeof(w_title_id), "%s", title_id);
     w.title_id = w_title_id;
-    int wrc = wdg_fn_call((void*)launch_work, &w, NULL, NULL, NULL, WDG_TIMEOUT_MS);
+    int wrc = wdg_fn_call((void*)launch_work, &w, NULL, NULL, NULL, 30000);
     int ret = (wrc == 0) ? w.ret : -100 - wrc;
 
     char msg[512];
     if (ret >= 0) {
-        snprintf(msg, sizeof(msg), "Launched %s (app_id=%d)", title_id, ret);
+        snprintf(msg, sizeof(msg), "Launched %s (app_id=%d)%s",
+                 title_id, ret,
+                 w.killed_appid > 0 ? " — closed running game" : "");
         send_ok(session->sock, msg);
     } else {
         snprintf(msg, sizeof(msg),
-                 "Launch failed. fg_user=0x%x  lnc_param=0x%x  lnc_null=0x%x  sys=0x%x",
-                 w.fg_user, ret, w.ret_null, w.ret_sys);
+                 "Launch failed. fg_user=0x%x  lnc_param=0x%x  lnc_null=0x%x  sys=0x%x  retry=0x%x  killed=%d",
+                 w.fg_user, ret, w.ret_null, w.ret_sys, w.ret_retry,
+                 w.killed_appid);
         send_error(session->sock, msg);
     }
 }
@@ -9410,9 +9980,11 @@ typedef struct {
     char title_id[16];
     int  client_sock;
     int  done;              // atomic: heartbeat stops sending once this is set
+    int  all;               // unmount every mounted title, not just title_id
 } unmount_job_t;
 
 static void unmount_body(unmount_job_t* job);
+static void unmount_all_body(unmount_job_t* job);
 
 static void* unmount_worker(void* arg) {
     unmount_job_t* job = (unmount_job_t*)arg;
@@ -9423,7 +9995,8 @@ static void* unmount_worker(void* arg) {
     wdg_install_handler();
     if (sigsetjmp(t_wdg_jmp, 1) == 0) {
         t_wdg_armed = 1;
-        unmount_body(job);
+        if (job->all) unmount_all_body(job);
+        else          unmount_body(job);
         t_wdg_armed = 0;
     } else {
         dbg_log("unmount WORKER CRASHED (longjmp)\n");
@@ -9447,6 +10020,7 @@ static void unmount_body(unmount_job_t* job) {
     int sock = job->client_sock;
 
     dbg_log("unmount_body enter\n");
+    g_ui_dirty = 0;
     // Snapshot whether the title is registered BEFORE cleanup — the UI
     // refresh below is only justified when a registry row actually goes away
     // (icons come from app.db; an unregistered unmount changes nothing).
@@ -9473,10 +10047,84 @@ static void unmount_body(unmount_job_t* job) {
     // UI re-reads it (otherwise the dead icon survives this refresh). Skipped
     // entirely when the title was never registered — nothing to redraw.
     if (!etahen_present() && had_row) {
-        send_notification("Refreshing home screen...");
-        usleep(2500 * 1000);
-        restart_shellui();
+        for (int i = 0; i < 400 && g_unreg_pending > 0; i++)
+            usleep(100 * 1000);
+        if (g_ui_dirty) {
+            send_notification("Refreshing home screen...");
+            usleep(500 * 1000);
+            restart_shellui();
+        }
     }
+    g_ui_dirty = 0;
+}
+
+// Unmount every registered/mounted title: iterate /user/app, run the same
+// full cleanup per title, then a single UI refresh decision at the end.
+static void unmount_all_body(unmount_job_t* job) {
+    int sock = job->client_sock;
+    dbg_log("unmount_all_body enter\n");
+    g_ui_dirty = 0;
+
+    // SAFETY: only OUR mounts carry mount.lnk — real PSN/disc installs live
+    // in /user/app too and must NEVER be touched here. Collect the list
+    // first; cleanup deletes dirs, which would corrupt a live readdir walk.
+    char tids[64][16];
+    int ntids = 0;
+    DIR *d = opendir("/user/app");
+    if (d) {
+        struct dirent *e;
+        while (ntids < 64 && (e = readdir(d))) {
+            if ((strncmp(e->d_name, "CUSA", 4) != 0 &&
+                 strncmp(e->d_name, "PPSA", 4) != 0) ||
+                strlen(e->d_name) != 9)
+                continue;
+            char lnk[PATH_MAX];
+            snprintf(lnk, sizeof(lnk), "/user/app/%s/mount.lnk", e->d_name);
+            char mex[PATH_MAX];
+            snprintf(mex, sizeof(mex), "/system_ex/app/%s", e->d_name);
+            if (access(lnk, F_OK) != 0 && !is_mounted(mex))
+                continue;   // real install or foreign dir — skip
+            snprintf(tids[ntids++], 16, "%s", e->d_name);
+        }
+        closedir(d);
+    }
+
+    if (ntids == 0) {
+        const char *m = "No mounted games";
+        __atomic_store_n(&job->done, 1, __ATOMIC_SEQ_CST);
+        send_resp_locked(sock, RESP_OK, m, (uint32_t)strlen(m) + 1);
+        progress_socket_clear(sock);
+        return;
+    }
+
+    int removed = 0, failed = 0;
+    for (int i = 0; i < ntids; i++) {
+        char pr[64];
+        snprintf(pr, sizeof(pr), "Unmounting %s (%d/%d)...", tids[i], i + 1, ntids);
+        send_progress_message(pr);
+
+        int busy = full_title_cleanup(tids[i], send_progress_message);
+        if (busy) failed++; else removed++;
+    }
+
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "Unmounted %d game(s)%s", removed,
+             failed ? " (some stayed busy)" : "");
+    __atomic_store_n(&job->done, 1, __ATOMIC_SEQ_CST);
+    send_resp_locked(sock, RESP_OK, msg, (uint32_t)strlen(msg) + 1);
+    progress_socket_clear(sock);
+
+    if (!etahen_present()) {
+        for (int i = 0; i < 400 && g_unreg_pending > 0; i++)
+            usleep(100 * 1000);
+        if (g_ui_dirty) {
+            send_notification("Refreshing home screen...");
+            usleep(500 * 1000);
+            restart_shellui();
+        }
+    }
+    g_ui_dirty = 0;
 }
 
 // Heartbeat thread: streams a RESP_PROGRESS every 3s so the client never sits
@@ -9496,6 +10144,43 @@ static void* unmount_heartbeat(void* arg) {
 }
 
 // Handle UNMOUNT_GAME - Unmount a specific game by title ID
+void handle_unmount_all(client_session_t *session) {
+    if (__atomic_exchange_n(&g_mount_running, 1, __ATOMIC_SEQ_CST)) {
+        send_error(session->sock, "Mount/unmount already in progress");
+        return;
+    }
+    unmount_job_t* job = (unmount_job_t*)malloc(sizeof(unmount_job_t));
+    if (!job) {
+        __atomic_store_n(&g_mount_running, 0, __ATOMIC_SEQ_CST);
+        send_error(session->sock, "Out of memory");
+        return;
+    }
+    memset(job, 0, sizeof(*job));
+    job->all = 1;
+    job->client_sock = session->sock;
+    progress_socket_set(session->sock);
+    send_progress_message("Unmounting all games...");
+
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    pthread_t hb_tid;
+    bool hb_ok = (pthread_create(&hb_tid, &at, unmount_heartbeat, job) == 0);
+    if (!hb_ok) pthread_attr_destroy(&at);
+
+    pthread_t w_tid;
+    if (pthread_create(&w_tid, hb_ok ? NULL : &at, unmount_worker, job) != 0) {
+        if (hb_ok) pthread_cancel(hb_tid);
+        pthread_attr_destroy(&at);
+        free(job);
+        __atomic_store_n(&g_mount_running, 0, __ATOMIC_SEQ_CST);
+        progress_socket_clear(session->sock);
+        send_error(session->sock, "Failed to start unmount worker");
+        return;
+    }
+    if (hb_ok) pthread_attr_destroy(&at);
+}
+
 void handle_unmount_game(client_session_t *session, const char *title_id) {
     if (!title_id || strlen(title_id) == 0) {
         send_error(session->sock, "No title ID provided");
@@ -9569,9 +10254,22 @@ static void* unregister_worker(void* arg) {
     snprintf(tid, 16, "%s", j->title_id);
     free(j);
     if (!etahen_present()) {
-        // kstuff-light: no daemon IPC — delete the registry rows directly.
-        appdb_direct_unregister(tid);
+        __atomic_add_fetch(&g_unreg_pending, 1, __ATOMIC_SEQ_CST);
+        // Official daemon IPC: ShellCore removes the rows AND notifies the
+        // UI itself — no renderer kill needed. Only when this fails do we
+        // fall back to direct SQLite writes (which leave the UI unaware,
+        // tracked via g_ui_dirty so the caller can refresh).
+        int existed = appdb_title_exists(tid);
+        int rc = -1;
+        if (scb_appinst_init() == 0)
+            rc = wdg_fn_call((void*)sceAppInstUtilAppUnInstall, (void*)tid,
+                             NULL, NULL, NULL, 20000);
+        if (rc != 0 && existed)
+            g_ui_dirty = 1;
+        if (rc != 0)
+            appdb_direct_unregister(tid);
         free(tid);
+        __atomic_sub_fetch(&g_unreg_pending, 1, __ATOMIC_SEQ_CST);
         return NULL;
     }
     wdg_fn_call((void*)sceAppInstUtilInitialize, NULL, NULL, NULL, NULL, 30000);
@@ -14138,6 +14836,9 @@ void *client_thread(void *arg) {
                     handle_unmount_game(session, (const char *)data);
                 }
                 break;
+            case CMD_UNMOUNT_ALL:
+                handle_unmount_all(session);
+                break;
             case CMD_GET_GAME_ICON:
                 if (data) {
                     handle_get_game_icon(session, (const char *)data);
@@ -14264,7 +14965,7 @@ void *client_thread(void *arg) {
                 handle_pad_info(session);
                 break;
             case CMD_SCREENSHOT:
-                handle_screenshot(session);
+                send_error(session->sock, "screenshot capture unsupported");
                 break;
             case CMD_NOTIFY:
                 if (data) handle_notify(session, (const char *)data);

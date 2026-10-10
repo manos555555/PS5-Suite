@@ -415,8 +415,6 @@
                                     <TextBlock Text="📸 Screenshots" Foreground="#0E9CFF" FontWeight="Bold" FontSize="14" VerticalAlignment="Center"/>
                                     <Button Grid.Column="1" Content="🔄" Background="#3E3E42" Padding="8" Click="ScreenshotsRefreshButton_Click"/>
                                 </Grid>
-                                <Button Content="📸 Capture Screenshot" Background="#007ACC" Foreground="White"
-                                        Padding="12" HorizontalAlignment="Stretch" Click="CaptureScreenshotButton_Click"/>
                                 <ListBox x:Name="ScreenshotsListBox" Background="#1E1E1E" MaxHeight="260">
                                     <ListBox.ItemTemplate>
                                         <DataTemplate>

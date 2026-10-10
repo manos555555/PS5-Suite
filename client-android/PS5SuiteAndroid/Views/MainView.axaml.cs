@@ -644,19 +644,6 @@ public partial class MainView : UserControl
         catch (Exception ex) { UpdateStatus($"Screenshots error: {ex.Message}"); }
     }
 
-    private async void CaptureScreenshotButton_Click(object? sender, RoutedEventArgs e)
-    {
-        if (!RequireConnection()) return;
-        UpdateStatus("Capturing screenshot on PS5...");
-        try
-        {
-            var (ok, msg) = await _protocol!.CaptureScreenshotAsync();
-            UpdateStatus(ok ? $"📸 {msg}" : $"Screenshot failed: {msg}");
-            if (ok) await Task.Delay(1500).ContinueWith(_ => Dispatcher.UIThread.Post(() => ScreenshotsRefreshButton_Click(null, null!)));
-        }
-        catch (Exception ex) { UpdateStatus($"Screenshot error: {ex.Message}"); }
-    }
-
     private async void ScreenshotDeleteButton_Click(object? sender, RoutedEventArgs e)
     {
         if (!RequireConnection()) return;

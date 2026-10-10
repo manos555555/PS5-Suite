@@ -1559,7 +1559,7 @@ namespace PS5Upload
         }
 
         // ============================================================
-        // LIGHT BAR / VIBRATION / SCREENSHOT / NOTIFY / LED / BEEPER
+        // LIGHT BAR / VIBRATION / NOTIFY / LED / BEEPER
         // ============================================================
         private async void LightBar_Click(object? sender, RoutedEventArgs e)
         {
@@ -1571,20 +1571,6 @@ namespace PS5Upload
                 Log(success ? $"🎨 Light bar set ({rgb})" : $"❌ Light bar: {message}");
             }
             catch (Exception ex) { Log($"❌ Light bar error: {ex.Message}"); }
-        }
-
-        private async void Screenshot_Click(object? sender, RoutedEventArgs e)
-        {
-            if (!_protocol.IsConnected) { await ShowMessageAsync("Not connected to PS5", "Error"); return; }
-            try
-            {
-                Log("📸 Requesting screenshot...");
-                var (success, message) = await _protocol.CaptureScreenshotAsync();
-                Log(success
-                    ? $"✅ Screenshot captured ({message}) — find it under Saves & Media → Screenshots"
-                    : $"❌ Screenshot failed: {message}");
-            }
-            catch (Exception ex) { Log($"❌ Screenshot error: {ex.Message}"); }
         }
 
         private async void SendNotify_Click(object? sender, RoutedEventArgs e)
