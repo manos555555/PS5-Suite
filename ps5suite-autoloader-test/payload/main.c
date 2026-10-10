@@ -1414,7 +1414,7 @@ static int handle_fan_set_threshold(int sock, int temp_c) {
 //   2. Try AppInstallTitleDir first (handles duplicates internally)
 //   3. Fallback to AppInstallAll for FW 12.00+
 // Note: v7.2.4 removed pre-mount Initialize+UnInstall calls — they caused
-// home screen refresh. the mount bridge doesn't use them either.
+// home screen refresh and aren't needed.
 
 // install_app - dump_installer style registration
 // Returns 0 on success, negative on failure
@@ -3520,7 +3520,7 @@ static int process_game(const char* game_path, char* game_name_out, size_t name_
     // v7.2.4: Removed pre-mount Initialize + UnInstall calls.
     // These daemon IPC calls triggered ShellCore to refresh the home screen,
     // causing visible flicker even when mounting a single game.
-    // the mount bridge doesn't use them — AppInstallTitleDir handles duplicates
+    // They're unnecessary — AppInstallTitleDir handles duplicates
     // internally, and our direct SQLite path already DELETEs before INSERT.
     // The old calls were:
     //   sceAppInstUtilInitialize()

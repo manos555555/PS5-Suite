@@ -1413,7 +1413,7 @@ static int handle_fan_set_threshold(int sock, int temp_c) {
 //   2. Try AppInstallTitleDir first (handles duplicates internally)
 //   3. Fallback to AppInstallAll for FW 12.00+
 // Note: v7.2.4 removed pre-mount Initialize+UnInstall calls — they caused
-// home screen refresh. the mount bridge doesn't use them either.
+// home screen refresh and aren't needed.
 
 // install_app - dump_installer style registration
 // Returns 0 on success, negative on failure
@@ -3087,8 +3087,8 @@ static int appdb_register_work(int mode, const char *title_id,
 
 
 // ============================================================================
-// ShellCore install bridge — registers a title through the daemon's OWN code
-// (the mount bridge technique, adapted). On fw >= 12 the public
+// ShellCore install bridge — registers a title through the daemon's OWN code.
+// On fw >= 12 the public
 // sceAppInstUtilAppInstallTitleDir RPC is gone and direct SQLite writes leave
 // SceShellUI unaware of the change (hence the renderer kill). Instead we
 // inject a tiny position-independent stub into a code cave inside
@@ -3108,8 +3108,8 @@ typedef struct {
     uint8_t  ia_patch;    // bytes replaced by the jump patch
 } scb_fw_t;
 
-// Per-firmware ShellCore image offsets (from the mount bridge' generated
-// table). Runtime prologue checks below guard against a wrong entry.
+// Per-firmware ShellCore image offsets. Runtime prologue checks below
+// guard against a wrong entry.
 static const scb_fw_t k_scb_fw[] = {
     { 0x0100, 0x1127640, 0x9c0, 0x1adc50, 0xa05c40, 14 }, /* 1.00 */
     { 0x0101, 0x1127640, 0x9c0, 0x1adc50, 0xa05c40, 14 }, /* 1.01 */
@@ -3211,7 +3211,7 @@ static uintptr_t scb_vmspace_pmap(uintptr_t vmspace) {
 
 // ShellCore text is execute-only — mdbg_copyin cannot write it on fw > 8.20,
 // so writes go through a manual page walk and kernel_copyin on the direct
-// map (same approach as the mount bridge).
+// map.
 static int scb_remote_write(pid_t pid, uintptr_t addr, const void *buf,
                             size_t size) {
     if (!buf || !size) return -1;
@@ -3355,7 +3355,7 @@ static int scb_install_bridge(pid_t pid, const scb_fw_t *fw,
     uintptr_t itd  = base + fw->itd_off;
 
     // mdbg_copyout requires an active debugger session on the target —
-    // attach BEFORE any remote read, like the mount bridge does.
+    // attach BEFORE any remote read.
     if (scb_ptrace(PT_ATTACH, pid, NULL, 0) != 0) {
         dbg_log("scb: ptrace attach failed\n");
         return -5;
@@ -4165,7 +4165,7 @@ static int process_game(const char* game_path, char* game_name_out, size_t name_
     // v7.2.4: Removed pre-mount Initialize + UnInstall calls.
     // These daemon IPC calls triggered ShellCore to refresh the home screen,
     // causing visible flicker even when mounting a single game.
-    // the mount bridge doesn't use them — AppInstallTitleDir handles duplicates
+    // They're unnecessary — AppInstallTitleDir handles duplicates
     // internally, and our direct SQLite path already DELETEs before INSERT.
     // The old calls were:
     //   sceAppInstUtilInitialize()
