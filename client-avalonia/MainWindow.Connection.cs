@@ -170,7 +170,6 @@ namespace PS5Upload
             {
                 ConnectButton.IsEnabled = false;
                 Log("🔌 Disconnecting from PS5...");
-                Log("🔌 Disconnecting from PS5...");
                 StopHwAutoRefresh();
                 _protocol.Disconnect();
                 _shellActive = false;
@@ -822,24 +821,28 @@ namespace PS5Upload
 
         private async void DeleteMenuItem_Click(object? sender, RoutedEventArgs e)
         {
+            if (_isDeleting) return;
             if (PS5FilesListBox.SelectedItem is PS5FileItem item)
             {
                 if (await ShowConfirmAsync($"Delete {item.Name}?"))
                 {
+                    _isDeleting = true;
                     try
                     {
-                        if (item.IsDirectory) { Log($"🗑️ Deleting folder: {item.Name}"); await _protocol.DeleteDirAsync(item.FullPath); Log($"✅ Folder deletion complete: {item.Name}"); }
+                        if (item.IsDirectory) { Log($"🗑️ Deleting folder: {item.Name}"); bool ok = await _protocol.DeleteDirAsync(item.FullPath); Log(ok ? $"✅ Folder deletion complete: {item.Name}" : $"❌ Folder deletion failed: {item.Name}"); }
                         else { Log($"🗑️ Deleting file: {item.Name}"); await _protocol.DeleteFileAsync(item.FullPath); Log($"✅ File deletion complete: {item.Name}"); }
                         await Task.Delay(1500);
                         await LoadPS5DirectoryAsync(_currentPS5Path);
                     }
                     catch (Exception ex) { await ShowMessageAsync($"Delete failed: {ex.Message}", "Error"); Log($"❌ Delete failed: {ex.Message}"); }
+                    finally { _isDeleting = false; }
                 }
             }
         }
 
         private async void DeleteSelectedMenuItem_Click(object? sender, RoutedEventArgs e)
         {
+            if (_isDeleting) return;
             var selectedItems = (PS5FilesListBox.SelectedItems ?? Array.Empty<object>()).Cast<PS5FileItem>().ToList();
             if (selectedItems.Count == 0) { await ShowMessageAsync("No items selected."); return; }
 
@@ -851,24 +854,30 @@ namespace PS5Upload
 
             if (!await ShowConfirmAsync(message, "Confirm Bulk Delete")) return;
 
-            Log($"🗑️ Starting bulk delete of {selectedItems.Count} items...");
-            int successCount = 0, failCount = 0;
-            foreach (var item in selectedItems)
+            _isDeleting = true;
+            try
             {
-                try
+                Log($"🗑️ Starting bulk delete of {selectedItems.Count} items...");
+                int successCount = 0, failCount = 0;
+                foreach (var item in selectedItems)
                 {
-                    if (item.IsDirectory) await _protocol.DeleteDirAsync(item.FullPath);
-                    else await _protocol.DeleteFileAsync(item.FullPath);
-                    successCount++;
-                    Log($"✅ Deleted: {item.Name}");
-                    await Task.Delay(300);
+                    try
+                    {
+                        bool ok;
+                        if (item.IsDirectory) ok = await _protocol.DeleteDirAsync(item.FullPath);
+                        else ok = await _protocol.DeleteFileAsync(item.FullPath);
+                        if (ok) { successCount++; Log($"✅ Deleted: {item.Name}"); }
+                        else { failCount++; Log($"❌ Failed to delete {item.Name}: server error"); }
+                        await Task.Delay(300);
+                    }
+                    catch (Exception ex) { Log($"❌ Failed to delete {item.Name}: {ex.Message}"); failCount++; }
                 }
-                catch (Exception ex) { Log($"❌ Failed to delete {item.Name}: {ex.Message}"); failCount++; }
+                Log($"🗑️ Bulk delete complete: {successCount} succeeded, {failCount} failed");
+                await Task.Delay(500);
+                await LoadPS5DirectoryAsync(_currentPS5Path);
+                await ShowMessageAsync($"Bulk delete complete!\n\n✅ {successCount} deleted\n❌ {failCount} failed");
             }
-            Log($"🗑️ Bulk delete complete: {successCount} succeeded, {failCount} failed");
-            await Task.Delay(500);
-            await LoadPS5DirectoryAsync(_currentPS5Path);
-            await ShowMessageAsync($"Bulk delete complete!\n\n✅ {successCount} deleted\n❌ {failCount} failed");
+            finally { _isDeleting = false; }
         }
 
         private async void DownloadMenuItem_Click(object? sender, RoutedEventArgs e)

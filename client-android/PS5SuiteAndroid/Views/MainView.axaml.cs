@@ -25,9 +25,6 @@ public partial class MainView : UserControl
     private ObservableCollection<PS5SaveFile> _saves = new();
     private ObservableCollection<PS5Screenshot> _screenshots = new();
     private ObservableCollection<string> _logLines = new();
-    private readonly List<StoreItem> _storeItems = new();
-    private static readonly HttpClient _storeHttp = new() { Timeout = TimeSpan.FromSeconds(20) };
-
     public MainView()
     {
         InitializeComponent();
@@ -88,7 +85,7 @@ public partial class MainView : UserControl
     {
         if (NavList.SelectedIndex < 0 || PageConnect == null) return;
         var pages = new Control[] {
-            PageConnect, PageFiles, PageGames, PageStore, PageProspero,
+            PageConnect, PageFiles, PageGames, PageProspero,
             PageTrophies, PageSaves, PageSystem, PageTools, PageDevices, PageLog
         };
         for (int i = 0; i < pages.Length; i++)
@@ -101,8 +98,8 @@ public partial class MainView : UserControl
             switch (NavList.SelectedIndex)
             {
                 case 2: if (!_gamesLoadedOnce) { _gamesLoadedOnce = true; _ = RefreshGamesAsync(); } break;
-                case 4: if (!_prosperoLoadedOnce) { _prosperoLoadedOnce = true; _ = RefreshProsperoAsync(); } break;
-                case 5: if (!_trophyLoadedOnce) { _trophyLoadedOnce = true; _ = RefreshTrophiesAsync(); } break;
+                case 3: if (!_prosperoLoadedOnce) { _prosperoLoadedOnce = true; _ = RefreshProsperoAsync(); } break;
+                case 4: if (!_trophyLoadedOnce) { _trophyLoadedOnce = true; _ = RefreshTrophiesAsync(); } break;
             }
         }
     }
@@ -791,144 +788,6 @@ public partial class MainView : UserControl
             UpdateStatus(ok ? "Notification sent" : $"Notify failed: {msg}");
         }
         catch (Exception ex) { UpdateStatus($"Notify error: {ex.Message}"); }
-    }
-
-    // ============================================================
-    // HOMEBREW STORE (pkg-zone.com catalog)
-    // ============================================================
-
-    private sealed class StoreItem : System.ComponentModel.INotifyPropertyChanged
-    {
-        public string Name { get; set; } = "";
-        public string Id { get; set; } = "";
-        public string Version { get; set; } = "";
-        public string Author { get; set; } = "";
-
-        private Bitmap? _cover;
-        public Bitmap? Cover
-        {
-            get => _cover;
-            set { _cover = value; PropertyChanged?.Invoke(this, new System.ComponentModel.PropertyChangedEventArgs(nameof(Cover))); }
-        }
-
-        public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
-    }
-
-    private static string StoreClean(string s)
-        => System.Net.WebUtility.HtmlDecode(s).Trim();
-
-    private async void StoreRefresh_Click(object? sender, RoutedEventArgs e)
-    {
-        try
-        {
-            StoreStatusText.Text = "Fetching pkg-zone.com catalog...";
-            UpdateStatus("Fetching homebrew catalog...");
-
-            var items = new List<StoreItem>();
-            var articleRx = new System.Text.RegularExpressions.Regex(
-                @"<article class=""pkg[\s\S]*?</article>",
-                System.Text.RegularExpressions.RegexOptions.Compiled);
-            var idRx = new System.Text.RegularExpressions.Regex(
-                @"/details/([A-Z0-9]+)", System.Text.RegularExpressions.RegexOptions.Compiled);
-            var verRx = new System.Text.RegularExpressions.Regex(
-                @"<div class=""number text-white text-sm"">\s*([^<]+)", System.Text.RegularExpressions.RegexOptions.Compiled);
-            var titleRx = new System.Text.RegularExpressions.Regex(
-                @"<div class=""title font-bold"">([^<]+)</div>", System.Text.RegularExpressions.RegexOptions.Compiled);
-            var authorRx = new System.Text.RegularExpressions.Regex(
-                @"<div class=""dark:text-gray-300"">([^<]*)</div>", System.Text.RegularExpressions.RegexOptions.Compiled);
-
-            var seen = new HashSet<string>();
-            for (int page = 1; page <= 15; page++)
-            {
-                string url = $"https://pkg-zone.com/?console=ps5&page={page}";
-                string html;
-                try { html = await _storeHttp.GetStringAsync(url); }
-                catch (Exception ex)
-                {
-                    if (page == 1) throw;
-                    UpdateStatus($"Store page {page} unreachable ({ex.Message})");
-                    break;
-                }
-                var arts = articleRx.Matches(html);
-                if (arts.Count == 0) break;
-                int newOnes = 0;
-                foreach (System.Text.RegularExpressions.Match m in arts)
-                {
-                    string block = m.Value;
-                    if (!block.Contains("Supports PS5")) continue;
-                    var idM = idRx.Match(block);
-                    if (!idM.Success || !seen.Add(idM.Groups[1].Value)) continue;
-                    items.Add(new StoreItem
-                    {
-                        Id = idM.Groups[1].Value,
-                        Name = StoreClean(titleRx.Match(block).Groups[1].Value is var tv && tv.Length > 0 ? tv : idM.Groups[1].Value),
-                        Version = StoreClean(verRx.Match(block).Groups[1].Value ?? ""),
-                        Author = StoreClean(authorRx.Match(block).Groups[1].Value ?? ""),
-                    });
-                    newOnes++;
-                }
-                if (newOnes == 0) break;
-                StoreStatusText.Text = $"Fetched {items.Count} packages...";
-            }
-
-            _storeItems.Clear();
-            _storeItems.AddRange(items);
-            ApplyStoreFilter();
-            StoreStatusText.Text = $"{items.Count} PS5 packages";
-            UpdateStatus($"Store catalog: {items.Count} packages");
-
-            _ = Task.Run(async () =>
-            {
-                foreach (var it in _storeItems)
-                {
-                    try
-                    {
-                        var bytes = await _storeHttp.GetByteArrayAsync($"https://pkg-zone.com/images/{it.Id}/cover.png");
-                        using var ms = new MemoryStream(bytes);
-                        var bmp = new Bitmap(ms);
-                        await Dispatcher.UIThread.InvokeAsync(() => { it.Cover = bmp; });
-                    }
-                    catch { }
-                }
-            });
-        }
-        catch (Exception ex)
-        {
-            StoreStatusText.Text = "Fetch failed";
-            UpdateStatus($"Store error: {ex.Message}");
-        }
-    }
-
-    private void ApplyStoreFilter()
-    {
-        string q = StoreSearchBox.Text?.Trim() ?? "";
-        var view = string.IsNullOrEmpty(q)
-            ? _storeItems
-            : _storeItems.Where(i => i.Name.Contains(q, StringComparison.OrdinalIgnoreCase)
-                                  || i.Id.Contains(q, StringComparison.OrdinalIgnoreCase)
-                                  || i.Author.Contains(q, StringComparison.OrdinalIgnoreCase)).ToList();
-        StoreListBox.ItemsSource = view;
-    }
-
-    private void StoreSearch_TextChanged(object? sender, TextChangedEventArgs e) => ApplyStoreFilter();
-
-    private async void StoreInstall_Click(object? sender, RoutedEventArgs e)
-    {
-        if (!RequireConnection()) return;
-        string? id = (sender as Control)?.Tag as string;
-        if (string.IsNullOrEmpty(id)) return;
-        var item = _storeItems.FirstOrDefault(i => i.Id == id);
-        string name = item?.Name ?? id;
-        try
-        {
-            string url = $"https://pkg-zone.com/download/ps5/{id}/latest";
-            UpdateStatus($"Installing {name}...");
-            var (success, result) = await _protocol!.InstallPkgAsync(url);
-            UpdateStatus(success
-                ? $"Install accepted: {name} — check the PS5 home screen"
-                : $"Install failed: {result}");
-        }
-        catch (Exception ex) { UpdateStatus($"Install error: {ex.Message}"); }
     }
 
     // ============================================================

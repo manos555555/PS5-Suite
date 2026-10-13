@@ -24,15 +24,26 @@ namespace PS5Upload
 
         private void TrophySetSortComboBox_SelectionChanged(object? sender, SelectionChangedEventArgs e) => ApplyTrophySetFilter();
 
+        private void TrophyUserComboBox_SelectionChanged(object? sender, SelectionChangedEventArgs e) => ApplyTrophySetFilter();
+
         private void ApplyTrophySetFilter()
         {
             if (TrophySetsListBox == null || TrophySetSearchBox == null || TrophySetSortComboBox == null) return;
             var prevNpwr = (TrophySetsListBox.SelectedItem as PS5TrophySet)?.NpCommunicationId;
+            var prevUid = (TrophySetsListBox.SelectedItem as PS5TrophySet)?.UserId;
+
+            string? filterUser = null;
+            if (TrophyUserComboBox?.SelectedItem is string sel && sel.StartsWith("Profile "))
+                filterUser = sel.Substring(8);
 
             var q = TrophySetSearchBox.Text?.Trim() ?? "";
-            IEnumerable<PS5TrophySet> view = string.IsNullOrEmpty(q)
-                ? _trophySets
-                : _trophySets.Where(s =>
+            IEnumerable<PS5TrophySet> view = _trophySets;
+
+            if (filterUser != null)
+                view = view.Where(s => s.UserId == filterUser);
+
+            if (!string.IsNullOrEmpty(q))
+                view = view.Where(s =>
                     s.GameName.Contains(q, StringComparison.OrdinalIgnoreCase) ||
                     s.NpCommunicationId.Contains(q, StringComparison.OrdinalIgnoreCase) ||
                     s.TitleId.Contains(q, StringComparison.OrdinalIgnoreCase));
@@ -54,7 +65,8 @@ namespace PS5Upload
                 : $"({list.Count}/{_trophySets.Count} sets)";
             if (prevNpwr != null)
                 TrophySetsListBox.SelectedItem =
-                    list.FirstOrDefault(s => s.NpCommunicationId == prevNpwr);
+                    list.FirstOrDefault(s => s.NpCommunicationId == prevNpwr && s.UserId == prevUid)
+                    ?? list.FirstOrDefault(s => s.NpCommunicationId == prevNpwr);
         }
 
         private bool _trophyLoading;
@@ -100,9 +112,27 @@ namespace PS5Upload
                 }
 
                 _trophySets = sets;
-                // ApplyTrophySetFilter rebuilds the view and restores the set the
-                // user was working on — without this the next Unlock click hits
-                // a null selection and silently no-ops.
+
+                var users = sets.Select(s => s.UserId)
+                    .Where(u => !string.IsNullOrEmpty(u))
+                    .Distinct()
+                    .OrderBy(u => u)
+                    .ToList();
+                await Dispatcher.UIThread.InvokeAsync(() =>
+                {
+                    var prevSel = TrophyUserComboBox.SelectedItem as string;
+                    var items = new List<string>();
+                    if (users.Count > 1)
+                        items.Add("All Profiles");
+                    foreach (var u in users)
+                        items.Add($"Profile {u}");
+                    if (items.Count == 0)
+                        items.Add("No profiles");
+                    TrophyUserComboBox.ItemsSource = items;
+                    int idx = prevSel != null ? items.IndexOf(prevSel) : -1;
+                    TrophyUserComboBox.SelectedIndex = idx >= 0 ? idx : 0;
+                });
+
                 await Dispatcher.UIThread.InvokeAsync(() => ApplyTrophySetFilter());
                 Log($"🏆 {sets.Count} trophy sets, {sets.Sum(s => s.TotalCount)} trophies total");
 

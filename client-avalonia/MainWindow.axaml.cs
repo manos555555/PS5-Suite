@@ -25,6 +25,7 @@ namespace PS5Upload
         private ObservableCollection<PS5FileItem> _ps5Files = new();
         private ObservableCollection<PS5FileItem> _ps5FilesFiltered = new();
         private string _currentPS5Path = "/data";
+        private bool _isDeleting;
         private CancellationTokenSource? _uploadCancellation;
         private string _ps5IpAddress = "";
         private string _searchQuery = "";

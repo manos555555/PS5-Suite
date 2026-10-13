@@ -5,8 +5,8 @@
     <SupportedOSPlatformVersion>23</SupportedOSPlatformVersion>
     <Nullable>enable</Nullable>
     <ApplicationId>com.manos.ps5suite</ApplicationId>
-    <ApplicationVersion>9</ApplicationVersion>
-    <ApplicationDisplayVersion>7.3.0</ApplicationDisplayVersion>
+    <ApplicationVersion>10</ApplicationVersion>
+    <ApplicationDisplayVersion>7.4.0</ApplicationDisplayVersion>
     <ApplicationTitle>PS5 Suite</ApplicationTitle>
     <AndroidPackageFormat>apk</AndroidPackageFormat>
     <AndroidEnableProfiledAot>false</AndroidEnableProfiledAot>

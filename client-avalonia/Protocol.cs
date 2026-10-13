@@ -1952,52 +1952,45 @@ namespace PS5Upload
             byte[] pathBytes = Encoding.UTF8.GetBytes(path + "\0");
             await SendCommandAsync(Command.DeleteDir, pathBytes);
             
-            // Payload does NOT send initial OK - goes straight to progress messages
-            // Keep reading until we get the final OK/ERROR response
-            bool deletionComplete = false;
-            
+            bool success = false;
+            bool done = false;
+
             try
             {
-                while (!deletionComplete)
+                while (!done)
                 {
-                    var (progressResponse, progressData) = await ReceiveResponseAsync();
-                    
-                    if (progressResponse == Response.Progress)
+                    var (resp, respData) = await ReceiveResponseAsync();
+
+                    if (resp == Response.Progress)
                     {
-                        string message = Encoding.UTF8.GetString(progressData).TrimEnd('\0');
+                        string message = Encoding.UTF8.GetString(respData).TrimEnd('\0');
                         OnProgressMessage?.Invoke(message);
                     }
-                    else if (progressResponse == Response.Ok)
+                    else if (resp == Response.Ok)
                     {
-                        // Final OK response received - deletion complete
                         OnProgressMessage?.Invoke("🔚 Received final OK - deletion complete");
-                        deletionComplete = true;
+                        success = true;
+                        done = true;
                     }
-                    else if (progressResponse == Response.Error)
+                    else if (resp == Response.Error)
                     {
-                        // Error response received
                         OnProgressMessage?.Invoke("❌ Received error response");
-                        deletionComplete = true;
+                        done = true;
                     }
                     else
                     {
-                        // Unexpected response - log it
-                        OnProgressMessage?.Invoke($"⚠️ Unexpected response: {progressResponse}");
-                        deletionComplete = true;
+                        OnProgressMessage?.Invoke($"⚠️ Unexpected response: {resp}");
+                        done = true;
                     }
                 }
             }
             catch (Exception ex)
             {
-                // Connection closed - log it
                 OnProgressMessage?.Invoke($"⚠️ Connection closed: {ex.Message}");
             }
-            
-            // Give server a moment to fully close the deletion thread
-            // CRITICAL: Increased delay to prevent race condition with next delete
+
             await Task.Delay(500);
-            
-            return true;
+            return success;
             }
             finally
             {
@@ -3789,6 +3782,7 @@ namespace PS5Upload
             ? Trophies.Count(t => t.IsUnlocked)
             : EarnedFallback >= 0 ? EarnedFallback : Trophies.Count(t => t.IsUnlocked);
         public int TotalCount => Trophies.Count;
+        public string UserIdDisplay => string.IsNullOrEmpty(UserId) ? "" : $"👤 {UserId}";
         public string ProgressDisplay => TotalCount == 0
             ? "—"
             : (StateKnown || EarnedFallback >= 0)
@@ -3834,8 +3828,8 @@ namespace PS5Upload
                 : "Locked";
         public string HiddenDisplay => Hidden ? "🙈" : "";
         public string GroupDisplay => string.IsNullOrEmpty(GroupId) || GroupId == "default" ? "Base" : GroupId;
-        public bool CanUnlock => StateKnown && !IsUnlocked;
-        public bool CanLock => StateKnown && IsUnlocked;
+        public bool CanUnlock => StateKnown && !IsUnlocked && Grade != "P";
+        public bool CanLock => StateKnown && IsUnlocked && Grade != "P";
 
         private Avalonia.Media.IImage? _icon;
         public Avalonia.Media.IImage? Icon

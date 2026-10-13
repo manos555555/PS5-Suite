@@ -153,6 +153,9 @@ typedef struct {
 } pkg_install_info_t;
 
 // Meta info input structure
+// NOTE: the daemon reads 8 bytes PAST icon_url (offset 0x30). If nonzero it
+// takes the patch path and refuses plain installs (measured on 13.60).
+// Keep the tail in the struct and zero it — relying on adjacent .bss is luck.
 typedef struct {
     const char *uri;               // Package path or URL
     const char *ex_uri;            // Extra URI (usually empty)
@@ -160,6 +163,8 @@ typedef struct {
     const char *content_id;
     const char *content_name;      // Display name during install
     const char *icon_url;
+    uint64_t    plain_install;     // must be 0 for a plain install
+    uint64_t    reserved[7];       // keep zero — future fw reads further
 } pkg_meta_info_t;
 
 // PlayGo info structure
@@ -1106,6 +1111,22 @@ static void *pkg_install_worker(void *arg) {
                      probe_cid, (int)probe_is_app, (unsigned)prc);
     }
 
+    // Signature sniff: \x7fFIH at 0 with byte 0x05 = 0x80 means a
+    // retail/submitted image; 0x00 is a debug (fPKG) image. Only used to
+    // explain a refusal — never gates the install attempt itself.
+    int pkg_signed_retail = 0;
+    if (pkg_path[0] == '/') {
+        int hfd = open(pkg_path, O_RDONLY);
+        if (hfd >= 0) {
+            unsigned char hdr[8] = {0};
+            if (read(hfd, hdr, sizeof(hdr)) == sizeof(hdr) &&
+                hdr[0] == 0x7F && hdr[1] == 'F' && hdr[2] == 'I' && hdr[3] == 'H' &&
+                (hdr[5] & 0x80))
+                pkg_signed_retail = 1;
+            close(hfd);
+        }
+    }
+
     // Display name in the PS5 Downloads notification = the package's own
     // filename (basename, .pkg stripped) instead of a generic suite label.
     // URL sources carry %XX escapes and a query string — decode and trim.
@@ -1175,10 +1196,24 @@ static void *pkg_install_worker(void *arg) {
     }
 
     if (rc != 0) {
-        pkg_set_text("install refused (first=0x%08X last=0x%08X)", first_rc, (unsigned)rc);
+        // A retail-signed image (FIH + signed byte 0x80) is rejected by the
+        // stock installer daemon - installing one needs the HEN-side patches
+        // etaHEN carries; bare k-stuff has none. AppInstallPkg is NOT a
+        // viable fallback: on 13.60 it returns APP_BROKEN, and even when it
+        // returns 0 it leaves a dead tile (appmeta written, /user/app never
+        // populated). Report honestly instead of trying it.
+        if (pkg_signed_retail)
+            pkg_set_text("retail-signed pkg - console installer accepts "
+                         "debug-signed (fPKG) images only under k-stuff");
+        else
+            pkg_set_text("install refused (first=0x%08X last=0x%08X)", first_rc, (unsigned)rc);
         pkg_finish(0, (unsigned)rc, NULL);
         free(pkg_path);
         return NULL;
+    }
+
+    if (!pkg_info.content_id[0] && probe_cid[0]) {
+        memcpy(pkg_info.content_id, probe_cid, PKG_CONTENTID_SIZE);
     }
 
     pthread_mutex_lock(&g_pkg_state_lock);
@@ -2140,7 +2175,7 @@ void release_file_mutex(const char *path) {
 // payload loader (elfldr raw-socket protocol — identical to what the PC
 // client does during deploy). The spawned instance sweeps every stale
 // "payload*" process and binds the port — no explicit handoff needed.
-#define SUITE_VERSION      "7.3.0"
+#define SUITE_VERSION      "7.4.0"
 #define SUITE_DIR          "/data/ps5suite"
 #define UPDATE_STAGE_PATH  "/data/ps5suite/update.elf"
 #define UPDATE_MARKER      "/data/ps5suite/update.marker"
@@ -2162,6 +2197,7 @@ void release_file_mutex(const char *path) {
 #define CMD_NOTIFY         0x7C  // "text" → PS5 UI notification
 #define CMD_PAD_ACTION     0x7D  // "lightbar|r,g,b" | "vibrate|l,s"
 #define CMD_ICC_CONTROL    0x7E  // "led|n" "buzzer|n" "buzzervol|n" "buzzermute|n" "ledcolor|b,w,o"
+#define CMD_PFS_TEST       0x7F  // "pkgpath" → diagnostic pfs mount probe
 
 // Trophy viewer (NpTrophy V2) — read-only for now: lists every registered
 // trophy set and ships the raw tropconf/tropmeta JSON + TRPTITLE.DAT so the
@@ -4610,50 +4646,43 @@ int mkdir_recursive(const char *path) {
     return 0;
 }
 
-// Global deletion progress counter (protected by g_progress_mutex)
-static int g_delete_count = 0;
-static int g_total_files = 0;
-static time_t g_last_notify = 0;
+// Per-thread deletion context — avoids global counter races when a
+// previous detached delete thread is still running after reconnect.
+typedef struct {
+    int delete_count;
+    int total_files;
+    int scan_count;
+    time_t last_notify;
+    time_t last_scan_notify;
+    int client_sock;
+} delete_ctx_t;
 
-// Global scan counter for progress updates (reset before each scan)
-static int g_scan_count = 0;
-static time_t g_last_scan_notify = 0;
-
-// Count files in directory recursively with progress updates
-int count_files_recursive(const char *path) {
+static int count_files_ctx(const char *path, delete_ctx_t *ctx) {
     DIR *dir = opendir(path);
-    if (!dir) {
-        return 0;
-    }
+    if (!dir) return 0;
 
     int count = 0;
     struct dirent *entry;
     char child[MAX_PATH];
-    
+
     while ((entry = readdir(dir)) != NULL) {
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
             continue;
-        }
         snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
 
         struct stat st;
-        if (stat(child, &st) != 0) {
-            continue;
-        }
+        if (stat(child, &st) != 0) continue;
         if (S_ISDIR(st.st_mode)) {
-            count++;  // Count the directory itself
-            count += count_files_recursive(child);  // Count its contents
+            count += count_files_ctx(child, ctx);
         } else {
             count++;
-            g_scan_count++;
-            
-            // Send progress every 500 files or every 3 seconds during counting
+            ctx->scan_count++;
             time_t now = time(NULL);
-            if (g_scan_count % 500 == 0 || (now - g_last_scan_notify) >= 3) {
+            if (ctx->scan_count % 500 == 0 || (now - ctx->last_scan_notify) >= 3) {
                 char msg[256];
-                snprintf(msg, sizeof(msg), "📊 Scanning... found %d files so far", g_scan_count);
+                snprintf(msg, sizeof(msg), "📊 Scanning... found %d files so far", ctx->scan_count);
                 send_progress_message(msg);
-                g_last_scan_notify = now;
+                ctx->last_scan_notify = now;
             }
         }
     }
@@ -4714,42 +4743,56 @@ static void send_resp_locked(int sock, uint8_t resp, const void *data, uint32_t 
     pthread_mutex_unlock(&g_progress_mutex);
 }
 
-// Recursive directory deletion with progress reporting
-int rmdir_recursive(const char *path) {
+// Recursive directory deletion with per-thread progress reporting
+static int rmdir_recursive_ctx(const char *path, delete_ctx_t *ctx) {
     DIR *dir = opendir(path);
-    if (!dir) {
-        return -1;
-    }
+    if (!dir) return -1;
 
     struct dirent *entry;
     char child[MAX_PATH];
     while ((entry = readdir(dir)) != NULL) {
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
             continue;
-        }
         snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
 
         struct stat st;
-        if (stat(child, &st) != 0) {
-            continue;
-        }
+        if (stat(child, &st) != 0) continue;
         if (S_ISDIR(st.st_mode)) {
-            rmdir_recursive(child);
+            rmdir_recursive_ctx(child, ctx);
         } else {
-            unlink_guarded(child);   // never let a busy vnode hang the delete
-            g_delete_count++;
-            
-            // Send progress every 50 files or every 2 seconds
+            unlink_guarded(child);
+            ctx->delete_count++;
             time_t now = time(NULL);
-            if (g_delete_count % 50 == 0 || (now - g_last_notify) >= 2) {
-                int percentage = (g_total_files > 0) ? (g_delete_count * 100 / g_total_files) : 0;
+            if (ctx->delete_count % 50 == 0 || (now - ctx->last_notify) >= 2) {
+                int pct = (ctx->total_files > 0) ? (ctx->delete_count * 100 / ctx->total_files) : 0;
                 char msg[256];
-                snprintf(msg, sizeof(msg), "🗑️ Deleting... %d/%d files (%d%%)", 
-                         g_delete_count, g_total_files, percentage);
+                snprintf(msg, sizeof(msg), "🗑️ Deleting... %d/%d files (%d%%)",
+                         ctx->delete_count, ctx->total_files, pct);
                 send_progress_message(msg);
-                g_last_notify = now;
+                ctx->last_notify = now;
             }
         }
+    }
+    closedir(dir);
+    return rmdir_guarded(path);
+}
+
+// Plain recursive delete (no progress) — used by unmount, cleanup, etc.
+int rmdir_recursive(const char *path) {
+    DIR *dir = opendir(path);
+    if (!dir) return -1;
+    struct dirent *entry;
+    char child[MAX_PATH];
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+        snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
+        struct stat st;
+        if (stat(child, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode))
+            rmdir_recursive(child);
+        else
+            unlink_guarded(child);
     }
     closedir(dir);
     return rmdir_guarded(path);
@@ -5222,83 +5265,57 @@ void handle_delete_file(client_session_t *session, const char *path) {
 typedef struct {
     char path[MAX_PATH];
     int client_sock;
+    delete_ctx_t ctx;
 } delete_thread_data_t;
 
-// Background deletion thread
+// Background deletion thread — all counters are per-thread via ctx
 void* delete_thread_func(void* arg) {
     delete_thread_data_t* data = (delete_thread_data_t*)arg;
-    
-    // Reset ALL progress counters
-    g_delete_count = 0;
-    g_scan_count = 0;
-    g_last_notify = time(NULL);
-    g_last_scan_notify = time(NULL);
+
+    memset(&data->ctx, 0, sizeof(data->ctx));
+    data->ctx.client_sock = data->client_sock;
+    data->ctx.last_notify = time(NULL);
+    data->ctx.last_scan_notify = time(NULL);
     progress_socket_set(data->client_sock);
-    
-    // Count total files first
+
     char start_msg[256];
     snprintf(start_msg, sizeof(start_msg), "📊 Scanning folder: %s", data->path);
     send_progress_message(start_msg);
-    
-    g_total_files = count_files_recursive(data->path);
-    
-    if (g_total_files == 0) {
-        char empty_msg[256];
-        snprintf(empty_msg, sizeof(empty_msg), "⚠️ Folder is empty or already deleted");
-        send_progress_message(empty_msg);
-        
-        // Still try to delete the empty folder itself
+
+    data->ctx.total_files = count_files_ctx(data->path, &data->ctx);
+
+    if (data->ctx.total_files == 0) {
+        send_progress_message("⚠️ Folder is empty or already deleted");
         rmdir(data->path);
-        
-        // Send final OK response even for empty folders
-        send_resp_locked(g_client_sock, RESP_OK, NULL, 0);
+        send_resp_locked(data->client_sock, RESP_OK, NULL, 0);
         progress_socket_clear(data->client_sock);
         free(data);
         return NULL;
     }
-    
+
     char count_msg[256];
-    snprintf(count_msg, sizeof(count_msg), "📊 Total: %d files to delete", g_total_files);
+    snprintf(count_msg, sizeof(count_msg), "📊 Total: %d files to delete", data->ctx.total_files);
     send_progress_message(count_msg);
-    
-    // Start deletion
-    char del_msg[256];
-    snprintf(del_msg, sizeof(del_msg), "🗑️ Starting deletion...");
-    send_progress_message(del_msg);
-    
-    // Perform deletion in background
-    int result = rmdir_recursive(data->path);
-    
-    // Send completion message
+    send_progress_message("🗑️ Starting deletion...");
+
+    int result = rmdir_recursive_ctx(data->path, &data->ctx);
+
+    struct timespec ts = { 0, 200000000 };
     if (result == 0) {
         char msg[256];
-        snprintf(msg, sizeof(msg), "✅ Deleted %d files (100%%)", g_delete_count);
+        snprintf(msg, sizeof(msg), "✅ Deleted %d files (100%%)", data->ctx.delete_count);
         send_progress_message(msg);
         send_notification(msg);
-        
-        // Send final OK response to signal completion
-        send_resp_locked(g_client_sock, RESP_OK, NULL, 0);
-        
-        // Wait for data to be sent before cleanup
-        struct timespec ts;
-        ts.tv_sec = 0;
-        ts.tv_nsec = 200000000; // 200ms
+        send_resp_locked(data->client_sock, RESP_OK, NULL, 0);
         nanosleep(&ts, NULL);
     } else {
         char msg[256];
-        snprintf(msg, sizeof(msg), "❌ Failed to delete folder (%d files removed)", g_delete_count);
+        snprintf(msg, sizeof(msg), "❌ Failed to delete folder (%d files removed)", data->ctx.delete_count);
         send_progress_message(msg);
-        
-        // Send error response
-        send_resp_locked(g_client_sock, RESP_ERROR, NULL, 0);
-        
-        // Wait for data to be sent before cleanup
-        struct timespec ts;
-        ts.tv_sec = 0;
-        ts.tv_nsec = 200000000; // 200ms
+        send_resp_locked(data->client_sock, RESP_ERROR, NULL, 0);
         nanosleep(&ts, NULL);
     }
-    
+
     progress_socket_clear(data->client_sock);
     free(data);
     return NULL;
@@ -7195,6 +7212,10 @@ static int (*g_sceFsInitMountSaveDataOpt)(save_mount_opt_t*) = NULL;
 static int (*g_sceFsInitUmountSaveDataOpt)(save_mount_opt_t*) = NULL;
 static int (*g_sceFsMountSaveData)(save_mount_opt_t*, const char*, const char*, void*) = NULL;
 static int (*g_sceFsUmountSaveData)(save_mount_opt_t*, const char*, void*, int) = NULL;
+static int (*g_sceFsInitMountGamePkgOpt)(save_mount_opt_t*) = NULL;
+static int (*g_sceFsMountGamePkg)(save_mount_opt_t*, const char*, const char*, void*) = NULL;
+static int (*g_sceFsInitMountDownloadDataOpt)(save_mount_opt_t*) = NULL;
+static int (*g_sceFsMountDownloadData)(save_mount_opt_t*, const char*, const char*, void*) = NULL;
 static int g_savefs_resolved = 0;
 
 static pthread_mutex_t g_save_mtx = PTHREAD_MUTEX_INITIALIZER;
@@ -7229,6 +7250,10 @@ static int resolve_savefs(void) {
         g_sceFsInitUmountSaveDataOpt = (int (*)(save_mount_opt_t*))dlsym(h, "sceFsInitUmountSaveDataOpt");
         g_sceFsMountSaveData         = (int (*)(save_mount_opt_t*, const char*, const char*, void*))dlsym(h, "sceFsMountSaveData");
         g_sceFsUmountSaveData        = (int (*)(save_mount_opt_t*, const char*, void*, int))dlsym(h, "sceFsUmountSaveData");
+        g_sceFsInitMountGamePkgOpt   = (int (*)(save_mount_opt_t*))dlsym(h, "sceFsInitMountGamePkgOpt");
+        g_sceFsMountGamePkg          = (int (*)(save_mount_opt_t*, const char*, const char*, void*))dlsym(h, "sceFsMountGamePkg");
+        g_sceFsMountDownloadData     = (int (*)(save_mount_opt_t*, const char*, const char*, void*))dlsym(h, "sceFsMountDownloadData");
+        g_sceFsInitMountDownloadDataOpt = (int (*)(save_mount_opt_t*))dlsym(h, "sceFsInitMountDownloadDataOpt");
     }
 
     // Fallback: module may already be loaded in our process under a different
@@ -8764,6 +8789,203 @@ void handle_usb_list(client_session_t *session) {
     if (off == 0) off = snprintf(out, 4096, "NONE\n");
     send_response(session->sock, RESP_DATA, out, off);
     free(out);
+}
+
+// ============================================================================
+// PFS TEST — diagnostics: try to kernel-mount a .pkg (FIH) as a "pfs" image.
+// The kernel's pfs driver unwraps the embedded EKC; on a retail console a
+// retail-signed image should decrypt. If this mounts, a retail pkg can be
+// extracted read-only and repacked — no installer changes needed.
+// ============================================================================
+#define PFS_TEST_MNT "/data/pkgmnt0"
+
+// FreeBSD md(4): attach a file as vnode-backed block device via /dev/mdctl,
+// then the pfs driver can consume it (it demands a block dev — ENOTBLK on files).
+// PS5 ABI (from SceShellCore disasm): ioctl 0xC1C06D00, 0x1c0-byte struct,
+// version=0, type=2 (MD_VNODE), sectorsize=0x200, options=0x04 (AUTOUNIT).
+struct ps5_md_ioctl {
+    unsigned  md_version;     // 0x00
+    unsigned  md_unit;        // 0x04
+    int       md_type;        // 0x08  (2 = vnode)
+    char     *md_file;        // 0x10
+    long long md_mediasize;   // 0x18
+    unsigned  md_sectorsize;  // 0x20
+    unsigned  md_options;     // 0x24
+    uint64_t  md_base;        // 0x28
+    int       md_fwheads;     // 0x30
+    int       md_fwsectors;   // 0x34
+    int       md_pad[97];     // 0x38..0x1bc
+};
+#define PS5_MDIOCATTACH 0xC1C06D00
+
+void handle_pfs_test(client_session_t *session, const char *pkgpath) {
+    char out[4096]; int off = 0;
+    struct stat st;
+    if (stat(pkgpath, &st) != 0) {
+        snprintf(out, sizeof(out), "no such pkg: %s (errno=%d)", pkgpath, errno);
+        send_error(session->sock, out); return;
+    }
+    rmdir(PFS_TEST_MNT);
+    if (mkdir(PFS_TEST_MNT, 0777) != 0 && errno != EEXIST) {
+        snprintf(out, sizeof(out), "mkdir %s failed errno=%d", PFS_TEST_MNT, errno);
+        send_error(session->sock, out); return;
+    }
+
+    // --- FIH header: image region = [q@0x10, q@0x20) ---
+    uint64_t fih[0x10] = {0};
+    {
+        int fd = open(pkgpath, O_RDONLY);
+        if (fd >= 0) { pread(fd, fih, sizeof(fih), 0); close(fd); }
+    }
+    uint64_t img_off = fih[2];   // 0x10 → image start
+    uint64_t img_end = fih[3];   // 0x18 → image end (includes plaintext superblock)
+    off += snprintf(out + off, sizeof(out)-off,
+                    "FIH: img_off=%#llx img_end=%#llx signed=%d\n",
+                    (unsigned long long)img_off, (unsigned long long)img_end,
+                    fih[0] >> 40 == 0 ? 0 : (int)((fih[0] >> 40) & 0xff));
+    if (img_off == 0 || img_end <= img_off || img_end > (uint64_t)st.st_size) {
+        off += snprintf(out + off, sizeof(out)-off, "bad FIH fields\n");
+        rmdir(PFS_TEST_MNT); send_response(session->sock, RESP_DATA, out, off); return;
+    }
+
+    // --- extract image region to a standalone file ---
+    const char *img = "/data/pkg_img.pfs";
+    {
+        unlink(img);
+        int in = open(pkgpath, O_RDONLY), o = open(img, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+        char *buf = malloc(1 << 20);
+        uint64_t left = img_end - img_off, pos = img_off;
+        int ok = (in >= 0 && o >= 0 && buf);
+        while (ok && left) {
+            size_t want = left < (1 << 20) ? (size_t)left : (1 << 20);
+            ssize_t n = pread(in, buf, want, (off_t)pos);
+            if (n <= 0) { ok = 0; break; }
+            if (write(o, buf, (size_t)n) != n) { ok = 0; break; }
+            pos += (uint64_t)n; left -= (uint64_t)n;
+        }
+        if (in >= 0) close(in); if (o >= 0) close(o); free(buf);
+        off += snprintf(out + off, sizeof(out)-off,
+                        "extract image -> %s (%s)\n", img, ok ? "ok" : "FAILED");
+        if (!ok) { rmdir(PFS_TEST_MNT); send_response(session->sock, RESP_DATA, out, off); return; }
+    }
+
+    // --- key blob: the pkg's plaintext PFS superblock sits at FIH q@0x20,
+    //     EKC at superblock+0x800 (same as save images) ---
+    uint64_t sb_off = fih[4];   // 0x20 → superblock offset
+    static uint8_t keybuf[SAVE_KEYBUF_LEN];
+    memset(keybuf, 0, sizeof(keybuf));
+    if (save_pread60(pkgpath, (off_t)sb_off + 0x800, keybuf) != 0) {
+        off += snprintf(out + off, sizeof(out)-off, "no key blob at sb+0x800\n");
+        unlink(img); rmdir(PFS_TEST_MNT); send_response(session->sock, RESP_DATA, out, off); return;
+    }
+    off += snprintf(out + off, sizeof(out)-off, "ekc magic: %.8s\n", keybuf);
+    errno = 0;
+    int kr = save_decrypt_key(keybuf);
+    off += snprintf(out + off, sizeof(out)-off,
+                    "pfsmgr key decrypt -> rc=%d errno=%d\n", kr, errno);
+    if (kr != 0) {
+        unlink(img); rmdir(PFS_TEST_MNT); send_response(session->sock, RESP_DATA, out, off); return;
+    }
+
+    // --- superblock diff vs a real save image ---
+    {
+        const char *saveimg = "/user/home/1b68ce95/savedata_prospero/PPSA10737/sdimg_LNEESaveSlot1";
+        uint8_t sblk[0x100], pblk[0x100];
+        int sfd = open(saveimg, O_RDONLY);
+        int pfd = open(pkgpath, O_RDONLY);
+        memset(sblk, 0, sizeof(sblk)); memset(pblk, 0, sizeof(pblk));
+        if (sfd >= 0) { pread(sfd, sblk, sizeof(sblk), 0); close(sfd); }
+        if (pfd >= 0) { pread(pfd, pblk, sizeof(pblk), (off_t)sb_off); close(pfd); }
+        off += snprintf(out + off, sizeof(out)-off, "save_sblk: ");
+        for (int i = 0; i < 64; i++) off += snprintf(out + off, sizeof(out)-off, "%02x", sblk[i]);
+        off += snprintf(out + off, sizeof(out)-off, "\npkg_sblk:  ");
+        for (int i = 0; i < 64; i++) off += snprintf(out + off, sizeof(out)-off, "%02x", pblk[i]);
+        off += snprintf(out + off, sizeof(out)-off, "\ndiff<0x100:");
+        for (int i = 0; i < 0x100 && off < 3800; i++)
+            if (sblk[i] != pblk[i]) off += snprintf(out + off, sizeof(out)-off, " %02x", i);
+        off += snprintf(out + off, sizeof(out)-off, "\nkey: ");
+        for (int i = 0; i < 32; i++) off += snprintf(out + off, sizeof(out)-off, "%02x", keybuf[0x60 + i]);
+        off += snprintf(out + off, sizeof(out)-off, "\n");
+    }
+
+    // --- mount the extracted pfs image with the decrypted key ---
+    if (!resolve_savefs()) {
+        off += snprintf(out + off, sizeof(out)-off, "savefs syms unresolved\n");
+        unlink(img); rmdir(PFS_TEST_MNT); send_response(session->sock, RESP_DATA, out, off); return;
+    }
+    memset(&g_save_mopt, 0, sizeof(g_save_mopt));
+    g_sceFsInitMountSaveDataOpt(&g_save_mopt);
+    g_save_mopt.budgetid = "system";
+    signal(SIGPIPE, SIG_DFL);
+    int rc = wdg_fn_call((void*)g_sceFsMountSaveData, &g_save_mopt,
+                         (void*)img, (void*)PFS_TEST_MNT, keybuf + 0x60, 30000);
+    off += snprintf(out + off, sizeof(out)-off, "sceFsMountSaveData -> rc=%d\n", rc);
+
+    // Try the game-pkg mount API — that's the retail path. The opt struct is
+    // bigger than the save one — use a fat zeroed buffer and let Init fill it.
+    if (rc < 0) {
+        static uint8_t gopt[0x800];
+        off += snprintf(out + off, sizeof(out)-off, "GamePkg syms: init=%p mnt=%p\n",
+                        g_sceFsInitMountGamePkgOpt, g_sceFsMountGamePkg);
+        if (g_sceFsInitMountGamePkgOpt && g_sceFsMountGamePkg) {
+            memset(gopt, 0, sizeof(gopt));
+            g_sceFsInitMountGamePkgOpt((save_mount_opt_t*)gopt);
+            int r2 = wdg_fn_call((void*)g_sceFsMountGamePkg, gopt,
+                                 (void*)img, (void*)PFS_TEST_MNT, keybuf + 0x60, 30000);
+            off += snprintf(out + off, sizeof(out)-off, "sceFsMountGamePkg(img,key) -> rc=%d\n", r2);
+            if (r2 >= 0) rc = r2;
+            else {
+                memset(gopt, 0, sizeof(gopt));
+                g_sceFsInitMountGamePkgOpt((save_mount_opt_t*)gopt);
+                r2 = wdg_fn_call((void*)g_sceFsMountGamePkg, gopt,
+                                 (void*)pkgpath, (void*)PFS_TEST_MNT, keybuf + 0x60, 30000);
+                off += snprintf(out + off, sizeof(out)-off, "sceFsMountGamePkg(pkg,key) -> rc=%d\n", r2);
+                if (r2 >= 0) rc = r2;
+            }
+        }
+        // DownloadData mount — the download0.dat volume path
+        if (rc < 0 && g_sceFsInitMountDownloadDataOpt && g_sceFsMountDownloadData) {
+            memset(gopt, 0, sizeof(gopt));
+            g_sceFsInitMountDownloadDataOpt((save_mount_opt_t*)gopt);
+            int r2 = wdg_fn_call((void*)g_sceFsMountDownloadData, gopt,
+                                 (void*)pkgpath, (void*)PFS_TEST_MNT, keybuf + 0x60, 30000);
+            off += snprintf(out + off, sizeof(out)-off, "sceFsMountDownloadData(pkg,key) -> rc=%d\n", r2);
+            if (r2 >= 0) rc = r2;
+        }
+    }
+
+    const char *used = NULL;
+    if (rc >= 0) used = "pfs(key)";
+    else {
+        // fallback: md-attach the image + raw pfs nmount (no key support but cheap)
+        int mdfd = open("/dev/mdctl", O_RDWR);
+        if (mdfd >= 0) {
+            static struct ps5_md_ioctl md;
+            memset(&md, 0, sizeof(md));
+            md.md_type = 2; md.md_file = (char *)img;
+            md.md_mediasize = (long long)(img_end - img_off);
+            md.md_sectorsize = 0x200; md.md_options = 0x04;
+            errno = 0;
+            int arc = ioctl(mdfd, PS5_MDIOCATTACH, &md);
+            off += snprintf(out + off, sizeof(out)-off,
+                            "mdctl attach img -> rc=%d errno=%d unit=%u\n", arc, errno, md.md_unit);
+            close(mdfd);
+        }
+    }
+
+    if (used) {
+        DIR *d = opendir(PFS_TEST_MNT);
+        if (d) {
+            struct dirent *e; int cnt = 0;
+            while ((e = readdir(d)) && cnt++ < 32 && off < 3800)
+                off += snprintf(out + off, sizeof(out) - off, "  %s%s\n",
+                                e->d_name, e->d_type == 4 ? "/" : "");
+            closedir(d);
+        } else off += snprintf(out + off, sizeof(out) - off, "opendir errno=%d\n", errno);
+        unmount_guarded(PFS_TEST_MNT, 0);
+    }
+    rmdir(PFS_TEST_MNT);
+    send_response(session->sock, RESP_DATA, out, off);
 }
 
 // ============================================================================
@@ -12064,39 +12286,53 @@ void handle_trophy_list(client_session_t *session) {
                 ucp_extract_prefix(ucp_path, "tropmeta_", &mt, &mts, NULL, 0);
         }
 
-        // Per-user unlock state (T2PD/TRPTITLE.DAT) — first uid that has it.
-        uint8_t *trp = NULL; size_t trp_sz = 0;
-        char uid[32] = "";
+        // Per-user unlock state — emit one set entry per uid that has
+        // TRPTITLE.DAT, so the client can show/filter by profile.
+        int emitted = 0;
         DIR *home = opendir("/user/home");
         if (home) {
             struct dirent *he;
-            while ((he = readdir(home))) {
+            while ((he = readdir(home)) && count < 64) {
                 if (he->d_name[0] == '.') continue;
                 char tp[PATH_MAX];
                 snprintf(tp, sizeof(tp),
                          "/user/home/%s/trophy2/nobackup/data/%s/TRPTITLE.DAT",
                          he->d_name, npwr);
-                if (read_whole_file(tp, &trp, &trp_sz) == 0) {
-                    snprintf(uid, sizeof(uid), "%s", he->d_name);
-                    break;
-                }
+                uint8_t *trp = NULL; size_t trp_sz = 0;
+                if (read_whole_file(tp, &trp, &trp_sz) != 0) continue;
+
+                size_t need = 1 + strlen(npwr) + 1 + strlen(tid) + 1 + strlen(he->d_name)
+                            + 4 + cfs + 4 + mts + 4 + trp_sz;
+                if (off + need >= cap) { free(trp); break; }
+
+                buf[off++] = (uint8_t)strlen(npwr); memcpy(buf + off, npwr, strlen(npwr)); off += strlen(npwr);
+                buf[off++] = (uint8_t)strlen(tid);  memcpy(buf + off, tid, strlen(tid));   off += strlen(tid);
+                buf[off++] = (uint8_t)strlen(he->d_name); memcpy(buf + off, he->d_name, strlen(he->d_name)); off += strlen(he->d_name);
+                uint32_t l;
+                l = (uint32_t)cfs;    memcpy(buf + off, &l, 4); off += 4; memcpy(buf + off, cf, cfs);  off += cfs;
+                l = (uint32_t)mts;    memcpy(buf + off, &l, 4); off += 4; if (mt) { memcpy(buf + off, mt, mts); off += mts; }
+                l = (uint32_t)trp_sz; memcpy(buf + off, &l, 4); off += 4; memcpy(buf + off, trp, trp_sz); off += trp_sz;
+                free(trp);
+                count++;
+                emitted++;
             }
             closedir(home);
         }
-
-        size_t need = 1 + strlen(npwr) + 1 + strlen(tid) + 1 + strlen(uid)
-                    + 4 + cfs + 4 + mts + 4 + trp_sz;
-        if (off + need >= cap) { free(cf); free(mt); free(trp); break; }
-
-        buf[off++] = (uint8_t)strlen(npwr); memcpy(buf + off, npwr, strlen(npwr)); off += strlen(npwr);
-        buf[off++] = (uint8_t)strlen(tid);  memcpy(buf + off, tid, strlen(tid));   off += strlen(tid);
-        buf[off++] = (uint8_t)strlen(uid);  memcpy(buf + off, uid, strlen(uid));   off += strlen(uid);
-        uint32_t l;
-        l = (uint32_t)cfs;   memcpy(buf + off, &l, 4); off += 4; memcpy(buf + off, cf, cfs); off += cfs;
-        l = (uint32_t)mts;   memcpy(buf + off, &l, 4); off += 4; if (mt) { memcpy(buf + off, mt, mts); off += mts; }
-        l = (uint32_t)trp_sz;memcpy(buf + off, &l, 4); off += 4; if (trp) { memcpy(buf + off, trp, trp_sz); off += trp_sz; }
-        free(cf); free(mt); free(trp);
-        count++;
+        if (emitted == 0 && count < 64) {
+            size_t need = 1 + strlen(npwr) + 1 + strlen(tid) + 1
+                        + 4 + cfs + 4 + mts + 4;
+            if (off + need < cap) {
+                buf[off++] = (uint8_t)strlen(npwr); memcpy(buf + off, npwr, strlen(npwr)); off += strlen(npwr);
+                buf[off++] = (uint8_t)strlen(tid);  memcpy(buf + off, tid, strlen(tid));   off += strlen(tid);
+                buf[off++] = 0;
+                uint32_t l;
+                l = (uint32_t)cfs; memcpy(buf + off, &l, 4); off += 4; memcpy(buf + off, cf, cfs); off += cfs;
+                l = (uint32_t)mts; memcpy(buf + off, &l, 4); off += 4; if (mt) { memcpy(buf + off, mt, mts); off += mts; }
+                l = 0;             memcpy(buf + off, &l, 4); off += 4;
+                count++;
+            }
+        }
+        free(cf); free(mt);
     }
     closedir(conf);
 
@@ -14978,6 +15214,10 @@ void *client_thread(void *arg) {
             case CMD_ICC_CONTROL:
                 if (data) handle_icc_control(session, (const char *)data);
                 else send_error(session->sock, "Usage: led|n buzzer|n buzzervol|n buzzermute|n ledcolor|b,w,o");
+                break;
+            case CMD_PFS_TEST:
+                if (data) handle_pfs_test(session, (const char *)data);
+                else send_error(session->sock, "Usage: pkgpath");
                 break;
             case CMD_LAUNCH_GAME:
                 if (data) {

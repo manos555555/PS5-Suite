@@ -50,7 +50,6 @@
                         <ListBoxItem>🔌 Connect</ListBoxItem>
                         <ListBoxItem>📁 File Transfer</ListBoxItem>
                         <ListBoxItem>🎮 Games</ListBoxItem>
-                        <ListBoxItem>🛒 Homebrew Store</ListBoxItem>
                         <ListBoxItem>🌐 Prospero Store</ListBoxItem>
                         <ListBoxItem>🏆 Trophies</ListBoxItem>
                         <ListBoxItem>💾 Saves &amp; Media</ListBoxItem>
@@ -182,49 +181,6 @@
                                             </TextBlock>
                                             <TextBlock Text="{Binding SizeText}" FontSize="11" Foreground="#808080"/>
                                         </StackPanel>
-                                    </Grid>
-                                </Border>
-                            </DataTemplate>
-                        </ListBox.ItemTemplate>
-                    </ListBox>
-                </Grid>
-            </Panel>
-
-            <!-- Store Tab -->
-            <Panel x:Name="PageStore" IsVisible="False">
-                <Grid RowDefinitions="Auto,*">
-                    <Border Grid.Row="0" Background="#252526" Padding="10">
-                        <StackPanel Spacing="8">
-                            <Grid ColumnDefinitions="*,Auto">
-                                <TextBox x:Name="StoreSearchBox" Watermark="Search homebrew..."
-                                         Background="#2D2D30" BorderBrush="#3E3E42" Padding="10"
-                                         TextChanged="StoreSearch_TextChanged"/>
-                                <Button Grid.Column="1" Content="🔄" Background="#3E3E42" Padding="10" Click="StoreRefresh_Click"/>
-                            </Grid>
-                            <TextBlock x:Name="StoreStatusText" Text="Tap 🔄 to fetch pkg-zone catalog" Foreground="#808080" FontSize="11"/>
-                        </StackPanel>
-                    </Border>
-                    <ListBox Grid.Row="1" x:Name="StoreListBox" Background="#1E1E1E">
-                        <ListBox.ItemTemplate>
-                            <DataTemplate>
-                                <Border Background="#2D2D30" CornerRadius="8" Padding="12" Margin="4">
-                                    <Grid ColumnDefinitions="Auto,*,Auto">
-                                        <Border Grid.Column="0" Width="52" Height="52" Background="#3E3E42"
-                                                CornerRadius="8" Margin="0,0,12,0" ClipToBounds="True">
-                                            <Panel>
-                                                <TextBlock Text="📦" FontSize="24" HorizontalAlignment="Center" VerticalAlignment="Center"/>
-                                                <Image Source="{Binding Cover}" Stretch="UniformToFill"/>
-                                            </Panel>
-                                        </Border>
-                                        <StackPanel Grid.Column="1" VerticalAlignment="Center" Margin="0,0,8,0">
-                                            <TextBlock Text="{Binding Name}" FontSize="13" FontWeight="Bold" TextTrimming="CharacterEllipsis"/>
-                                            <TextBlock Text="{Binding Id}" FontSize="11" Foreground="#0E9CFF"/>
-                                            <TextBlock FontSize="10" Foreground="#808080">
-                                                <Run Text="{Binding Version}"/><Run Text="  ·  "/><Run Text="{Binding Author}"/>
-                                            </TextBlock>
-                                        </StackPanel>
-                                        <Button Grid.Column="2" Content="📥" Background="#007ACC" Foreground="White"
-                                                Padding="8" VerticalAlignment="Center" Tag="{Binding Id}" Click="StoreInstall_Click"/>
                                     </Grid>
                                 </Border>
                             </DataTemplate>

@@ -3,7 +3,7 @@
     <TargetFramework>net8.0</TargetFramework>
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
-    <Version>7.3.0</Version>
+    <Version>7.4.0</Version>
   </PropertyGroup>
   
   <ItemGroup>

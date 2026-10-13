@@ -461,58 +461,6 @@
                             </Grid>
                         </TabItem>
 
-                        <!-- Homebrew Store (PKG-Zone catalog) -->
-                        <TabItem Header="🛒 Homebrew Store">
-                            <Grid>
-                                <Grid.RowDefinitions>
-                                    <RowDefinition Height="Auto"/>
-                                    <RowDefinition Height="*"/>
-                                </Grid.RowDefinitions>
-                                <Border Grid.Row="0" Background="#252526" CornerRadius="4" Padding="12" Margin="0,0,0,15">
-                                    <WrapPanel>
-                                        <TextBlock Text="🛒 PKG-Zone" FontSize="16" FontWeight="Bold" Foreground="#007ACC" VerticalAlignment="Center" Margin="0,0,15,0"/>
-                                        <Button Content="🔄 Refresh Catalog" Click="StoreRefresh_Click" Padding="10,5" Margin="0,0,8,0"/>
-                                        <TextBox x:Name="StoreSearchBox" PlaceholderText="Filter..." Width="200" Margin="0,0,8,0" TextChanged="StoreSearch_TextChanged"/>
-                                        <TextBlock x:Name="StoreStatusText" Text="" Foreground="#999999" VerticalAlignment="Center"/>
-                                    </WrapPanel>
-                                </Border>
-                                <ListBox Grid.Row="1" x:Name="StoreListBox" Background="#1E1E1E" BorderThickness="0">
-                                    <ListBox.ItemTemplate>
-                                        <DataTemplate>
-                                            <Border Background="#2D2D30" CornerRadius="6" Padding="12" Margin="3">
-                                                <Grid>
-                                                    <Grid.ColumnDefinitions>
-                                                        <ColumnDefinition Width="Auto"/>
-                                                        <ColumnDefinition Width="*"/>
-                                                        <ColumnDefinition Width="Auto"/>
-                                                    </Grid.ColumnDefinitions>
-                                                    <Grid Grid.Column="0" Width="64" Height="64" Margin="0,0,15,0">
-                                                        <Border Background="#3E3E42" CornerRadius="8">
-                                                            <TextBlock Text="📦" FontSize="28" HorizontalAlignment="Center" VerticalAlignment="Center"/>
-                                                        </Border>
-                                                        <Border CornerRadius="8" ClipToBounds="True">
-                                                            <Image Source="{Binding Cover}" Stretch="UniformToFill"/>
-                                                        </Border>
-                                                    </Grid>
-                                                    <StackPanel Grid.Column="1" VerticalAlignment="Center">
-                                                        <TextBlock Text="{Binding Name}" FontSize="15" FontWeight="Bold"/>
-                                                        <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
-                                                            <TextBlock Text="{Binding Id}" FontSize="12" Foreground="#007ACC" FontWeight="SemiBold"/>
-                                                            <TextBlock Text=" • " Foreground="#666666"/>
-                                                            <TextBlock Text="{Binding Version}" FontSize="12" Foreground="#FFC107"/>
-                                                            <TextBlock Text=" • " Foreground="#666666"/>
-                                                            <TextBlock Text="{Binding Author}" FontSize="12" Foreground="#9CDCFE"/>
-                                                        </StackPanel>
-                                                    </StackPanel>
-                                                    <Button Grid.Column="2" Content="📥 Install" Click="StoreInstall_Click" Tag="{Binding Id}" Padding="12,6" Background="#28A745" VerticalAlignment="Center"/>
-                                                </Grid>
-                                            </Border>
-                                        </DataTemplate>
-                                    </ListBox.ItemTemplate>
-                                </ListBox>
-                            </Grid>
-                        </TabItem>
-
                         <!-- Prospero Store Site (homebrew.page native PS5 catalog) -->
                         <TabItem Header="🌐 Prospero Store Site">
                             <Grid>
@@ -614,9 +562,11 @@
                                         <Grid.ColumnDefinitions>
                                             <ColumnDefinition Width="*"/>
                                             <ColumnDefinition Width="Auto"/>
+                                            <ColumnDefinition Width="Auto"/>
                                         </Grid.ColumnDefinitions>
                                         <TextBox x:Name="TrophySetSearchBox" PlaceholderText="🔍 Search games..." TextChanged="TrophySetSearchBox_TextChanged" Background="#1E1E1E" BorderBrush="#3E3E42" VerticalContentAlignment="Center"/>
-                                        <ComboBox Grid.Column="1" x:Name="TrophySetSortComboBox" Width="150" Margin="8,0,0,0" SelectedIndex="0" SelectionChanged="TrophySetSortComboBox_SelectionChanged" VerticalContentAlignment="Center">
+                                        <ComboBox Grid.Column="1" x:Name="TrophyUserComboBox" MinWidth="160" Margin="8,0,0,0" SelectedIndex="0" SelectionChanged="TrophyUserComboBox_SelectionChanged" VerticalContentAlignment="Center"/>
+                                        <ComboBox Grid.Column="2" x:Name="TrophySetSortComboBox" Width="150" Margin="8,0,0,0" SelectedIndex="0" SelectionChanged="TrophySetSortComboBox_SelectionChanged" VerticalContentAlignment="Center">
                                             <ComboBoxItem>Name A→Z</ComboBoxItem>
                                             <ComboBoxItem>Name Z→A</ComboBoxItem>
                                             <ComboBoxItem>Progress ↑</ComboBoxItem>
@@ -649,6 +599,7 @@
                                                                 <TextBlock Text=" • " Foreground="#666666"/>
                                                                 <TextBlock Text="{Binding ProgressDisplay}" FontSize="11" Foreground="#9CDCFE"/>
                                                             </StackPanel>
+                                                            <TextBlock Text="{Binding UserIdDisplay}" FontSize="10" Foreground="#888888" Margin="0,2,0,0"/>
                                                         </StackPanel>
                                                     </Grid>
                                                 </Border>
