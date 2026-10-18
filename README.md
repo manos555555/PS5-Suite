@@ -1,4 +1,4 @@
-# 🎮 PS5 Suite v7.2.4 — Complete PS5 Management Platform
+# 🎮 PS5 Suite v7.5.0 — Complete PS5 Management Platform
 
 **By Manos**
 
@@ -37,13 +37,20 @@ All-in-one management suite for jailbroken PS5 consoles. One app — on **Window
 
 | Asset | Platform |
 |---|---|
-| `PS5Suite-Windows-x64.exe` | Windows 10/11 64-bit — self-contained, no .NET install needed |
-| `PS5Suite-Linux-x64` | Linux 64-bit — `chmod +x` and run |
-| `PS5Suite-Linux-ARM64` | ARM64 Linux (Raspberry Pi, etc.) |
-| `PS5Suite-macOS-x64.zip` | Intel Macs — unzip → double-click `PS5Suite.app` (Gatekeeper: right-click → Open) |
-| `PS5Suite-macOS-ARM64.zip` | Apple Silicon (M1/M2/M3/M4) — same, exec permissions preserved |
+| `PS5Suite.exe` | Windows 10/11 64-bit — self-contained, no .NET install needed |
+| `PS5Suite-Linux-x64.zip` | Linux 64-bit — unzip, `chmod +x ./PS5Suite` and run |
+| `PS5Suite-Linux-ARM64.zip` | ARM64 Linux (Raspberry Pi, etc.) — same steps |
+| `PS5Suite-macOS-x64.zip` | Intel Macs — unzip, `chmod +x ./PS5Suite`, `xattr -dr com.apple.quarantine ./PS5Suite` |
+| `PS5Suite-macOS-ARM64.zip` | Apple Silicon (M1/M2/M3/M4) — same steps |
 | `PS5Suite.apk` | **Android** — signed APK, full feature parity with desktop |
 | `ps5_suite_server.elf` | **Required** on-console server component |
+
+### ✨ New in v7.5.0
+
+- **File manager context menu** — Create Folder, Change Permissions (chmod dialog: Owner/Group/Others checkboxes synced with a live octal field), Properties, Copy Path, Open Terminal Here, Download Selected (multi-select), Refresh, Sort By — plus a **permissions column** in the PS5 file list (octal mode next to each name).
+- **Android app fully fixed** — the shared UI was refactored to single-view controls so the APK actually launches, and it gained a responsive mobile layout (hamburger drawer, single-pane file tabs).
+- **LED/beep fix** — changing LED colours/effects no longer disables the console's beep in Settings → Beep and Light (issue #12, verified on hardware).
+- Payload + client bumped together — the v7.5.0 client requires the v7.5.0 `ps5_suite_server.elf` (the directory-listing wire format gained permission bits).
 
 ---
 
@@ -84,7 +91,8 @@ Two side-by-side panes: your PC on the left, the PS5 on the right.
 
 **PS5 remote pane**
 - Full filesystem browser: path bar + **Go**, ⭐ **favorites** (saved per console), live **search/filter** box.
-- Right-click menu: **⬇️ Download**, **📝 Rename**, **📋 Copy**, **✂️ Move**, **🗑️ Delete**, **🗑️ Delete Selected** (multi-select).
+- **Permissions column** — every file/folder shows its octal mode (e.g. `0755`) next to its size, read live via `stat()` on the console.
+- Right-click menu: **⬇️ Download**, **⬇️ Download Selected** (multi-select), **📁 Create Folder**, **📝 Rename**, **📋 Copy**, **✂️ Move**, **� Change Permissions** (chmod dialog — R/W/X checkboxes for Owner/Group/Others synced with octal), **ℹ️ Properties** (size, type, octal+rwx mode, timestamps), **📋 Copy Path**, **💻 Open Terminal Here**, **�🗑️ Delete**, **🗑️ Delete Selected**, **🔄 Refresh**, **Sort By** — Name/Size/Date (folders stay on top).
 - Downloads ask where to save on the PC; folders download recursively.
 
 **Transfer engine**
@@ -268,15 +276,15 @@ Everything is read **live from the console** — nothing hardcoded; values the c
 | Payload proxy port | 13801+ |
 
 - All heavy work (transfers, FPKG builds) runs on background threads — the UI never freezes.
-- **The Android app is the same Avalonia codebase** — shared protocol layer, same dark theme and the same feature set as the desktop build, wrapped in a hamburger-navigation layout for touch. Source is in `client-android/`; a signed `PS5Suite.apk` ships in every release.
+- **The Android app is the same Avalonia codebase** — shared protocol layer, same dark theme and the same feature set as the desktop build; on narrow screens it switches to a hamburger-drawer layout with single-pane file tabs. Source is in `client-avalonia-android/`; a signed `PS5Suite.apk` ships in every release.
 
 ---
 
 ## 📱 Android app
 
 - Same Avalonia UI/protocol as desktop — every feature above works on Android: transfers, games (mount/launch/stop), both stores, trophies, saves, system info, tools, devices, debug log.
-- Side **☰ hamburger menu** navigation, signed APK, version synced with desktop releases.
-- Install → enter PS5 IP → Connect. Same payload, same ports.
+- **Responsive mobile layout** — on phone-width screens the sidebar collapses into a **☰ drawer** (tap outside or a menu item to close), the Local/PS5 file panes become a tab switcher, and the storage info bar stacks vertically. On desktop-sized windows the full layout stays.
+- Signed APK, version synced with desktop releases. Install → enter PS5 IP → Connect. Same payload, same ports.
 
 ---
 
