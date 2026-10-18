@@ -50,6 +50,7 @@
 extern int  sceKernelGetCpuTemperature(int *temperature);
 extern int  sceKernelGetSocSensorTemperature(int sensor_id, int *temperature);
 extern long sceKernelGetCpuFrequency(void);
+// Fills a 0x70-byte block: 8 rails of {mW, mV, mA} as uint32, then aux words.
 extern int sceKernelGetSocPowerConsumption(uint32_t *power_mw);
 extern size_t sceKernelGetDirectMemorySize(void);
 
@@ -10963,13 +10964,25 @@ void handle_get_temps(client_session_t *session) {
         
         // Power consumption API — call at most once every 5 seconds.
         // Separate tracker so the 1s sensor cache doesn't force a re-read of this API.
+        // NOTE: sceKernelGetSocPowerConsumption fills a 0x70-byte block
+        // (8 rails x {mW, mV, mA} as uint32 + aux words), NOT a single int —
+        // it needs its own large buffer, never a shared 4-byte slot.
         static time_t last_power_read = 0;
         static uint32_t last_power_mw = 0;
         if ((now - last_power_read) >= 5) {
-            int pw = 0;
-            if (wdg_out_int((void *)&sceKernelGetSocPowerConsumption, &pw) == 0) {
-                // Reject abnormal readings (> 500 W is impossible for PS5)
-                if (pw >= 0 && (uint32_t)pw < 500000) last_power_mw = (uint32_t)pw;
+            static uint32_t pwbuf[32]; // 128 bytes > 0x70
+            memset(pwbuf, 0, sizeof(pwbuf));
+            int r = wdg_fn_call((void *)&sceKernelGetSocPowerConsumption,
+                                pwbuf, NULL, NULL, NULL, WDG_INFO_TIMEOUT_MS);
+            if (r != -2) {
+                // Rail mW words at buf[0], buf[3], ..., buf[21]; total = sum.
+                uint64_t total = 0; int rails = 0;
+                for (int k = 0; k < 8; k++) {
+                    uint32_t mw = pwbuf[k * 3];
+                    if (mw > 0 && mw < 500000) { total += mw; rails++; }
+                }
+                if (rails > 0 && total > 0 && total < 500000)
+                    last_power_mw = (uint32_t)total;
             }
             last_power_read = now;
         }
