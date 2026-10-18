@@ -1,4 +1,4 @@
-# 🎮 PS5 Suite v7.5.0 — Complete PS5 Management Platform
+# 🎮 PS5 Suite v7.6.0 — Complete PS5 Management Platform
 
 **By Manos**
 
@@ -44,6 +44,17 @@ All-in-one management suite for jailbroken PS5 consoles. One app — on **Window
 | `PS5Suite-macOS-ARM64.zip` | Apple Silicon (M1/M2/M3/M4) — same steps |
 | `PS5Suite.apk` | **Android** — signed APK, full feature parity with desktop |
 | `ps5_suite_server.elf` | **Required** on-console server component |
+
+### ✨ New in v7.6.0
+
+- **Trophies on next-gen SDK titles** — games that never load `libSceNpTrophy2` (e.g. Onimusha: Way of the Sword and other UDS-driven releases) now work: the payload detects the title through `libSceNpUniversalDataSystem`, resolves each trophy's real unlock event from the game's own `stats_extraction.json` (custom events like `UnlockTrophy`/`trophyId`, not just the legacy `_UnlockTrophy`), and posts it through the game's UDS pipeline — the console's trophy daemon grants the award itself, with the **real system notification** and a daemon-written `TRPTITLE.DAT`.
+- **Newer `TRPTITLE.DAT` layouts parsed correctly** — titles that keep hash data in the group-mask field no longer show `—/N` or get mistaken for unlocked; state rows are authoritative there, and the file editor never writes bits into non-bitmask fields.
+- **Profile names in the trophy list** — sets show the real PSN username (e.g. `👤 manosmoyrtzakis`) instead of the hex user id, and the profile filter lists names too.
+- **Per-save icons** — the saves list now shows each save's own `icon0.png` fetched live from the console, and the automatic `sce_bu_*` backup twins the system keeps are filtered out of the list.
+- **Save mount/unmount hardening** — correct save-manager authid, atomic staged-image write-back (temp file + size check + rename), and a discard-unmount mode for read-only backups so a backup can never modify the original.
+- **Post-unlock refresh** — the trophy list re-polls until the daemon flushes the new state to disk, so the count updates by itself.
+- **Android packaging** — the APK ships directly as `PS5Suite.apk`, and `publish.ps1` auto-detects a Java 17+ JDK (Android Studio JBR first), so builds no longer break on machines whose `JAVA_HOME` points at an old JDK.
+- Payload + client bumped together — the v7.6.0 client requires the v7.6.0 `ps5_suite_server.elf`.
 
 ### ✨ New in v7.5.0
 
@@ -132,7 +143,7 @@ Two side-by-side panes: your PC on the left, the PS5 on the right.
 ### 🏆 TROPHIES
 
 - Lists every trophy set on the console (per game) with real data parsed from TRPTITLE.DAT — names, descriptions, grades (bronze/silver/gold/platinum), icons, hidden status and earned timestamps.
-- **🔓 Unlock** — awards a trophy live through the running game (the matching title must be running — the app tells you if it isn't).
+- **🔓 Unlock** — awards a trophy live through the running game's own trophy pipeline (the matching title must be running — the app tells you if it isn't). Works on both legacy `libSceNpTrophy2` titles and newer UDS-driven games: each trophy's real unlock event is resolved dynamically from the game's `stats_extraction.json`, and the console's daemon performs the award — real notification, real state file.
 - **🔒 Lock** — re-locks a trophy by rewriting the set's unlock bitmasks in place (group masks, row flags and timestamps cleared) — as if it was never earned.
 - Search/filter across sets, live refresh after every change.
 

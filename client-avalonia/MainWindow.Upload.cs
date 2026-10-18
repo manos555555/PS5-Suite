@@ -628,7 +628,7 @@ namespace PS5Upload
                             long localSize = LocalIo.GetLength(file.localPath);
                             long remoteSize = existingFiles[fn!];
                             var dlg = new DuplicateFileDialog(fn!, localSize, remoteSize);
-                            await dlg.ShowDialog(this);
+                            await OverlayDialogs.ShowAsync(dlg);
                             switch (dlg.UserAction)
                             {
                                 case DuplicateFileDialog.FileAction.Replace: try { await _protocol.DeleteFileAsync(file.remotePath); } catch { } filesToUpload.Add(file); break;

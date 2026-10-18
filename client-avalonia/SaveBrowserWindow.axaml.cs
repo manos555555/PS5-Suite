@@ -13,8 +13,14 @@ namespace PS5Upload
     // Modal browser for the decrypted save mounted at /data/save_mnt.
     // Reuses the regular remote-file commands (LIST_DIR / DOWNLOAD / UPLOAD /
     // DELETE / MKDIR) — the mount point behaves like any other directory.
-    public partial class SaveBrowserWindow : Window
+    public partial class SaveBrowserWindow : UserControl, OverlayDialogs.IOverlayClosable
     {
+        /// <summary>Raised when the view wants its host overlay to close.</summary>
+        public event Action? RequestClose;
+
+        /// <summary>True when the user chose "Unmount &amp; Close" (read after the overlay closes).</summary>
+        public bool UnmountRequested { get; private set; }
+
         private readonly PS5Protocol _protocol;
         private readonly string _rootPath;
         private readonly string _ps5Ip;
@@ -55,7 +61,7 @@ namespace PS5Upload
             _ps5Ip = ps5Ip;
             _rootPath = rootPath.TrimEnd('/');
             _currentPath = _rootPath;
-            Opened += async (_, __) => await RefreshAsync();
+            AttachedToVisualTree += async (_, __) => await RefreshAsync();
         }
 
         private void SetStatus(string s) => StatusText.Text = s;
@@ -174,21 +180,18 @@ namespace PS5Upload
 
         private async void NewFolderButton_Click(object? sender, RoutedEventArgs e)
         {
-            var dlg = new Window
+            string? name = null;
+            await OverlayDialogs.ShowAsync(close =>
             {
-                Title = "New Folder",
-                Width = 360, Height = 140,
-                Background = Avalonia.Media.Brush.Parse("#1E1E1E"),
-                WindowStartupLocation = WindowStartupLocation.CenterOwner
-            };
-            var nameBox = new TextBox { PlaceholderText = "Folder name", Margin = new Avalonia.Thickness(10) };
-            var okBtn = new Button { Content = "Create", HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Center, Padding = new Avalonia.Thickness(20, 6) };
-            var panel = new StackPanel { Spacing = 8 };
-            panel.Children.Add(nameBox);
-            panel.Children.Add(okBtn);
-            dlg.Content = panel;
-            okBtn.Click += (_, __) => dlg.Close(nameBox.Text);
-            var name = await dlg.ShowDialog<string?>(this);
+                var nameBox = new TextBox { PlaceholderText = "Folder name", Margin = new Avalonia.Thickness(0, 0, 0, 8) };
+                var okBtn = new Button { Content = "Create", HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Center, Padding = new Avalonia.Thickness(20, 6) };
+                var panel = new StackPanel { Spacing = 8 };
+                panel.Children.Add(new TextBlock { Text = "New Folder", FontSize = 17, FontWeight = Avalonia.Media.FontWeight.SemiBold, Foreground = Avalonia.Media.Brushes.White, Margin = new Avalonia.Thickness(0, 0, 0, 8) });
+                panel.Children.Add(nameBox);
+                panel.Children.Add(okBtn);
+                okBtn.Click += (_, __) => { name = nameBox.Text; close(); };
+                return panel;
+            }, maxWidth: 360);
             if (string.IsNullOrWhiteSpace(name)) return;
             try
             {
@@ -213,8 +216,16 @@ namespace PS5Upload
             await RefreshAsync();
         }
 
-        private void CloseStayMountedButton_Click(object? sender, RoutedEventArgs e) => Close(false);
+        private void CloseStayMountedButton_Click(object? sender, RoutedEventArgs e)
+        {
+            UnmountRequested = false;
+            RequestClose?.Invoke();
+        }
 
-        private void UnmountCloseButton_Click(object? sender, RoutedEventArgs e) => Close(true);
+        private void UnmountCloseButton_Click(object? sender, RoutedEventArgs e)
+        {
+            UnmountRequested = true;
+            RequestClose?.Invoke();
+        }
     }
 }

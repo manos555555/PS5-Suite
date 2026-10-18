@@ -23,6 +23,7 @@ namespace PS5Upload
         Rename = 0x07,
         CopyFile = 0x08,
         MoveFile = 0x09,
+        Chmod = 0x0A,
         StartUpload = 0x10,
         UploadChunk = 0x11,
         EndUpload = 0x12,
@@ -71,6 +72,7 @@ namespace PS5Upload
         SaveUnmount = 0x62,
         SaveMountStatus = 0x63,
         SaveDelete = 0x64,
+        SaveIcon = 0x65,
 
         ProcList = 0x66,
         RestartUI = 0x67,
@@ -1433,12 +1435,16 @@ namespace PS5Upload
             finally { _commandLock.Release(); }
         }
 
-        public async Task<(bool success, string message)> SaveUnmountAsync(Action<string>? onProgress = null)
+        public async Task<(bool success, string message)> SaveUnmountAsync(Action<string>? onProgress = null, bool discard = false)
         {
             await _commandLock.WaitAsync();
             try
             {
-                await SendCommandAsync(Command.SaveUnmount);
+                // "discard" = read-only session (backup/browse): the staged
+                // image is dropped and the original sealed file is left
+                // byte-identical instead of being rewritten.
+                await SendCommandAsync(Command.SaveUnmount,
+                    discard ? Encoding.UTF8.GetBytes("discard") : null);
                 var deadline = DateTime.UtcNow + TimeSpan.FromMinutes(3);
                 while (true)
                 {
@@ -1653,6 +1659,30 @@ namespace PS5Upload
             return shots.OrderByDescending(s => s.ModifiedTime).ToList();
         }
 
+        // Per-save icon: the payload looks up <savename>_icon0.png in the
+        // console's savedata_meta dirs, then falls back to the title icon.
+        public async Task<byte[]?> GetSaveIconAsync(string savePath)
+        {
+            await _commandLock.WaitAsync();
+            try
+            {
+                byte[] data = Encoding.UTF8.GetBytes(savePath + "\0");
+                await SendCommandAsync(Command.SaveIcon, data);
+                var (response, respData) = await ReceiveResponseAsync();
+                if (response != Response.Data || respData == null || respData.Length == 0)
+                    return null;
+                return respData;
+            }
+            catch
+            {
+                return null;
+            }
+            finally
+            {
+                _commandLock.Release();
+            }
+        }
+
         // NEW: Get icon0.png binary data for a game
         public async Task<byte[]?> GetGameIconAsync(string titleId)
         {
@@ -1740,6 +1770,7 @@ namespace PS5Upload
                         NpCommunicationId = rdStr(),
                         TitleId = rdStr(),
                         UserId = rdStr(),
+                        UserName = rdStr(),
                         TropConfJson = rdBlob(),
                         TropMetaJson = rdBlob(),
                         TrpTitleData = rdBlob()
@@ -1874,6 +1905,7 @@ namespace PS5Upload
                     string name = Encoding.UTF8.GetString(br.ReadBytes(nameLen));
                     long size = br.ReadInt64();
                     long timestamp = br.ReadInt64();
+                    int mode = br.ReadInt32();
 
                     // Clamp timestamp to valid DateTimeOffset range
                     DateTime dt;
@@ -1898,7 +1930,8 @@ namespace PS5Upload
                         Name = name,
                         IsDirectory = type == 1,
                         Size = size,
-                        Timestamp = dt
+                        Timestamp = dt,
+                        Permissions = mode
                     };
                 }
 
@@ -2052,6 +2085,27 @@ namespace PS5Upload
                 Array.Copy(dstBytes, 0, data, srcBytes.Length, dstBytes.Length);
                 
                 await SendCommandAsync(Command.MoveFile, data);
+                var (response, _) = await ReceiveResponseAsync();
+                return response == Response.Ok;
+            }
+            finally
+            {
+                _commandLock.Release();
+            }
+        }
+
+        public async Task<bool> ChmodAsync(string path, uint mode)
+        {
+            await _commandLock.WaitAsync();
+            try
+            {
+                byte[] modeBytes = BitConverter.GetBytes(mode);
+                byte[] pathBytes = Encoding.UTF8.GetBytes(path + "\0");
+                byte[] data = new byte[4 + pathBytes.Length];
+                Array.Copy(modeBytes, 0, data, 0, 4);
+                Array.Copy(pathBytes, 0, data, 4, pathBytes.Length);
+
+                await SendCommandAsync(Command.Chmod, data);
                 var (response, _) = await ReceiveResponseAsync();
                 return response == Response.Ok;
             }
@@ -3377,6 +3431,7 @@ namespace PS5Upload
         public bool IsDirectory { get; set; }
         public long Size { get; set; }
         public DateTime Timestamp { get; set; }
+        public int Permissions { get; set; }
     }
 
     public class UploadProgress
@@ -3444,6 +3499,32 @@ namespace PS5Upload
         public int Permissions { get; set; }
         public bool IsDirectory { get; set; }
         public bool IsSymlink { get; set; }
+
+        public string TypeName => IsSymlink ? "Symbolic Link" : IsDirectory ? "Directory" : "File";
+
+        public string ModeString
+        {
+            get
+            {
+                string[] perms = { "---", "--x", "-w-", "-wx", "r--", "r-x", "rw-", "rwx" };
+                return perms[(Permissions >> 6) & 7] + perms[(Permissions >> 3) & 7] + perms[Permissions & 7];
+            }
+        }
+
+        public string ModeOctal => Convert.ToString(Permissions, 8).PadLeft(4, '0');
+
+        public string SizeFormatted
+        {
+            get
+            {
+                if (IsDirectory) return "-";
+                string[] sizes = { "B", "KB", "MB", "GB", "TB" };
+                double len = Size;
+                int order = 0;
+                while (len >= 1024 && order < sizes.Length - 1) { order++; len /= 1024; }
+                return $"{len:0.##} {sizes[order]}";
+            }
+        }
     }
 
     public class PS5SystemInfo
@@ -3782,7 +3863,10 @@ namespace PS5Upload
             ? Trophies.Count(t => t.IsUnlocked)
             : EarnedFallback >= 0 ? EarnedFallback : Trophies.Count(t => t.IsUnlocked);
         public int TotalCount => Trophies.Count;
-        public string UserIdDisplay => string.IsNullOrEmpty(UserId) ? "" : $"👤 {UserId}";
+        public string UserName { get; set; } = "";
+        public string UserIdDisplay => string.IsNullOrEmpty(UserName)
+            ? (string.IsNullOrEmpty(UserId) ? "" : $"👤 {UserId}")
+            : $"👤 {UserName}";
         public string ProgressDisplay => TotalCount == 0
             ? "—"
             : (StateKnown || EarnedFallback >= 0)

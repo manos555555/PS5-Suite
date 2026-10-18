@@ -10,7 +10,7 @@
     <AssemblyName>PS5Suite</AssemblyName>
     <RootNamespace>PS5Upload</RootNamespace>
     <ApplicationIcon>ps5_logo.ico</ApplicationIcon>
-    <Version>7.4.0</Version>
+    <Version>7.6.0</Version>
     <Authors>Manos</Authors>
     <Description>PS5 Suite - Complete PS5 Management Platform</Description>
     <Copyright>Copyright © 2026 Manos</Copyright>

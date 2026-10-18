@@ -203,6 +203,7 @@ extern int sceSystemServiceLaunchApp(const char *title_id, const char **argv, vo
 extern int sceUserServiceInitialize(void *priority);
 extern int sceUserServiceGetForegroundUser(int *user_id);
 extern int sceUserServiceGetLoginUserIdList(int userIdList[4]);
+extern int sceUserServiceGetUserName(int user_id, char *userName, size_t size);
 // libScePad — linked statically (-lScePad) so the kernel dynlinker loads the
 // module at process start. dlopen'ing it later could hard-freeze the server.
 extern int scePadInit(void);
@@ -2114,6 +2115,7 @@ void release_file_mutex(const char *path) {
 #define CMD_RENAME 0x07
 #define CMD_COPY_FILE 0x08
 #define CMD_MOVE_FILE 0x09
+#define CMD_CHMOD 0x0A
 #define CMD_START_UPLOAD 0x10
 #define CMD_UPLOAD_CHUNK 0x11
 #define CMD_END_UPLOAD 0x12
@@ -2160,6 +2162,7 @@ void release_file_mutex(const char *path) {
 #define CMD_SAVE_UNMOUNT 0x62       // Unmount + write modified image back
 #define CMD_SAVE_MOUNT_STATUS 0x63  // What is mounted at /data/save_mnt
 #define CMD_SAVE_DELETE 0x64        // Delete save image (+ .bin companion)
+#define CMD_SAVE_ICON   0x65        // "save image path" → per-save icon0.png
 #define CMD_PROC_LIST 0x66          // pid|comm list of all processes
 #define CMD_RESTART_UI 0x67         // Restart SceShellUI (renderer) → app.db re-read
 #define CMD_SELF_UPDATE 0x68        // Stage/URL → hand new ELF to local loader
@@ -2175,7 +2178,7 @@ void release_file_mutex(const char *path) {
 // payload loader (elfldr raw-socket protocol — identical to what the PC
 // client does during deploy). The spawned instance sweeps every stale
 // "payload*" process and binds the port — no explicit handoff needed.
-#define SUITE_VERSION      "7.4.0"
+#define SUITE_VERSION      "7.6.0"
 #define SUITE_DIR          "/data/ps5suite"
 #define UPDATE_STAGE_PATH  "/data/ps5suite/update.elf"
 #define UPDATE_MARKER      "/data/ps5suite/update.marker"
@@ -5176,7 +5179,7 @@ void handle_list_dir(client_session_t *session, const char *path) {
         }
         
         uint16_t name_len = (uint16_t)strlen(entry->d_name);
-        size_t needed = 1 + 2 + name_len + 8 + 8;
+        size_t needed = 1 + 2 + name_len + 8 + 8 + 4;
         
         if ((size_t)(ptr - buffer) + needed > buf_size) {
             // Try to grow the buffer (up to 32MB) rather than dropping entries
@@ -5192,32 +5195,26 @@ void handle_list_dir(client_session_t *session, const char *path) {
             ptr = buffer + used;
         }
         
-        // Determine type and get file size
+        // Determine type and get file size + permission bits
         uint8_t type = 0;
         uint64_t size = 0;
         uint64_t timestamp = 0;
+        uint32_t mode = 0777;
         
         snprintf(full_path, sizeof(full_path), "%s/%s", norm_path, entry->d_name);
         struct stat st;
+        int stat_ok = (stat(full_path, &st) == 0);
         
         if (entry->d_type == DT_DIR) {
             type = 1;
         } else if (entry->d_type == DT_UNKNOWN) {
             // d_type not supported on this filesystem - use stat() as fallback
-            if (stat(full_path, &st) == 0) {
-                if (S_ISDIR(st.st_mode)) {
-                    type = 1;
-                } else {
-                    size = st.st_size;
-                    timestamp = st.st_mtime;
-                }
-            }
-        } else {
-            // Regular file - get size
-            if (stat(full_path, &st) == 0) {
-                size = st.st_size;
-                timestamp = st.st_mtime;
-            }
+            if (stat_ok && S_ISDIR(st.st_mode)) type = 1;
+        }
+        if (stat_ok) {
+            if (type == 0) size = st.st_size;
+            timestamp = st.st_mtime;
+            mode = (uint32_t)(st.st_mode & 0777);
         }
         
         *ptr++ = type;
@@ -5229,6 +5226,8 @@ void handle_list_dir(client_session_t *session, const char *path) {
         ptr += 8;
         memcpy(ptr, &timestamp, 8);
         ptr += 8;
+        memcpy(ptr, &mode, 4);
+        ptr += 4;
         
         entry_count++;
     }
@@ -5245,6 +5244,31 @@ void handle_create_dir(client_session_t *session, const char *path) {
         send_ok(session->sock, "Directory created");
     } else {
         send_error(session->sock, "Failed to create directory");
+    }
+}
+
+// Handle CHMOD - Change file/directory permissions
+// Data format: mode (4 bytes, uint32) + path (null-terminated string)
+void handle_chmod(client_session_t *session, const uint8_t *data, uint32_t data_len) {
+    if (data_len < 5) {
+        send_error(session->sock, "Invalid chmod data");
+        return;
+    }
+
+    uint32_t mode;
+    memcpy(&mode, data, 4);
+    const char *path = (const char *)(data + 4);
+
+    char norm_path[MAX_PATH];
+    snprintf(norm_path, sizeof(norm_path), "%s", path);
+    normalize_path(norm_path);
+
+    if (chmod(norm_path, (mode_t)mode) == 0) {
+        send_ok(session->sock, "Permissions changed");
+    } else {
+        char err[256];
+        snprintf(err, sizeof(err), "Failed to change permissions: %s", strerror(errno));
+        send_error(session->sock, err);
     }
 }
 
@@ -6719,6 +6743,138 @@ void handle_get_game_list(client_session_t *session) {
     free(response);
 }
 
+// Locate a title's icon0.png across every known source. Returns an open
+// FILE* (found path copied to out_path) or NULL.
+static FILE *open_title_icon(const char *title_id, char *out_path, size_t out_sz) {
+    FILE *f = NULL;
+
+    // 1. /user/appmeta/{title_id}/icon0.png
+    snprintf(out_path, out_sz, "/user/appmeta/%s/icon0.png", title_id);
+    f = fopen(out_path, "rb");
+
+    // 2. /user/app/{title_id}/sce_sys/icon0.png
+    if (!f) {
+        snprintf(out_path, out_sz, "/user/app/%s/sce_sys/icon0.png", title_id);
+        f = fopen(out_path, "rb");
+    }
+
+    // 3. Follow mount.lnk to the original game path
+    if (!f) {
+        char mount_lnk[PATH_MAX];
+        snprintf(mount_lnk, sizeof(mount_lnk), "/user/app/%s/mount.lnk", title_id);
+        FILE *lnk = fopen(mount_lnk, "r");
+        if (lnk) {
+            char game_path[PATH_MAX] = {0};
+            if (fgets(game_path, sizeof(game_path), lnk)) {
+                game_path[strcspn(game_path, "\r\n")] = '\0';
+                snprintf(out_path, out_sz, "%s/sce_sys/icon0.png", game_path);
+                f = fopen(out_path, "rb");
+            }
+            fclose(lnk);
+        }
+    }
+
+    // 4. Scan /user/home/*/savedata_*_meta/user/{title_id}/ for any
+    //    *_icon0.png — covers saves of games no longer installed/mounted.
+    //    PS5 meta is savedata_prospero_meta, PS4 is savedata_meta. Backup
+    //    copies (sce_bu_*_icon0.png) are only used as a last resort.
+    if (!f) {
+        const char *metas[] = { "savedata_prospero_meta", "savedata_meta" };
+        for (int mi = 0; mi < 2 && !f; mi++) {
+            DIR *home_dir = opendir("/user/home");
+            if (!home_dir) break;
+            struct dirent *user_ent;
+            while ((user_ent = readdir(home_dir)) && !f) {
+                if (!strcmp(user_ent->d_name, ".") || !strcmp(user_ent->d_name, "..")) continue;
+
+                char meta_dir[PATH_MAX];
+                snprintf(meta_dir, sizeof(meta_dir),
+                         "/user/home/%s/%s/user/%s",
+                         user_ent->d_name, metas[mi], title_id);
+
+                DIR *md = opendir(meta_dir);
+                if (!md) continue;
+
+                char bu_fallback[PATH_MAX] = {0};
+                struct dirent *file_ent;
+                while ((file_ent = readdir(md))) {
+                    // Pick any file ending in "_icon0.png"
+                    size_t nlen = strlen(file_ent->d_name);
+                    if (nlen > 10 &&
+                        strstr(file_ent->d_name, "icon0.png") != NULL) {
+                        if (!strncmp(file_ent->d_name, "sce_bu_", 7)) {
+                            snprintf(bu_fallback, sizeof(bu_fallback), "%s/%s",
+                                     meta_dir, file_ent->d_name);
+                            continue;
+                        }
+                        snprintf(out_path, out_sz, "%s/%s", meta_dir, file_ent->d_name);
+                        f = fopen(out_path, "rb");
+                        if (f) break;
+                    }
+                }
+                closedir(md);
+                if (!f && bu_fallback[0]) {
+                    snprintf(out_path, out_sz, "%s", bu_fallback);
+                    f = fopen(out_path, "rb");
+                }
+            }
+            closedir(home_dir);
+        }
+    }
+
+    // 5. Unmounted games on disk — scan the game storage dirs for
+    //    {title_id} or {title_id}-app and read sce_sys/icon0.png.
+    if (!f) {
+        for (int pi = 0; pi < (int)NUM_GAME_SCAN_PATHS && !f; pi++) {
+            DIR *gd = opendir(GAME_SCAN_PATHS[pi]);
+            if (!gd) continue;
+            struct dirent *ge;
+            while ((ge = readdir(gd)) && !f) {
+                if (!strcmp(ge->d_name, ".") || !strcmp(ge->d_name, "..")) continue;
+                if (strncmp(ge->d_name, title_id, strlen(title_id)) != 0) continue;
+                snprintf(out_path, out_sz,
+                         "%s/%s/sce_sys/icon0.png", GAME_SCAN_PATHS[pi], ge->d_name);
+                f = fopen(out_path, "rb");
+            }
+            closedir(gd);
+        }
+    }
+
+    return f;
+}
+
+// Stream an already-open icon file as RESP_DATA.
+static void send_icon_payload(client_session_t *session, FILE *f) {
+    fseek(f, 0, SEEK_END);
+    long icon_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (icon_size <= 0 || icon_size > 2 * 1024 * 1024) {  // Max 2MB
+        fclose(f);
+        send_error(session->sock, "Invalid icon size");
+        return;
+    }
+
+    char *icon_data = malloc(icon_size);
+    if (!icon_data) {
+        fclose(f);
+        send_error(session->sock, "Out of memory");
+        return;
+    }
+
+    size_t read_bytes = fread(icon_data, 1, icon_size, f);
+    fclose(f);
+
+    if ((long)read_bytes != icon_size) {
+        free(icon_data);
+        send_error(session->sock, "Failed to read icon");
+        return;
+    }
+
+    send_response(session->sock, RESP_DATA, icon_data, icon_size);
+    free(icon_data);
+}
+
 // Handle GET_GAME_ICON - Send icon0.png binary for a given title_id
 void handle_get_game_icon(client_session_t *session, const char *title_id) {
     if (__atomic_load_n(&g_mount_running, __ATOMIC_SEQ_CST)) {
@@ -6740,121 +6896,84 @@ void handle_get_game_icon(client_session_t *session, const char *title_id) {
     
     // Try multiple icon paths (prefer appmeta, then user/app, then game source)
     char icon_path[PATH_MAX];
+    FILE *f = open_title_icon(title_id, icon_path, sizeof(icon_path));
+    if (!f) {
+        send_error(session->sock, "Icon not found");
+        return;
+    }
+    send_icon_payload(session, f);
+}
+
+// SAVE_ICON — data = full save image path
+//   /user/home/<user>/savedata(_prospero)/<TITLE>/<file>
+// Per-save icons live at <dir>_meta/user/<TITLE>/<savename>_icon0.png where
+// savename drops the `sdimg_` prefix. Falls back to the title-level icon.
+void handle_save_icon(client_session_t *session, const char *path) {
+    if (__atomic_load_n(&g_mount_running, __ATOMIC_SEQ_CST)) {
+        send_error(session->sock, "Mount in progress");
+        return;
+    }
+    char user[64] = {0}, title[16] = {0};
+    const char *p = path;
+    if (!p || strncmp(p, "/user/home/", 11)) { send_error(session->sock, "Bad save path"); return; }
+    p += 11;
+    const char *s1 = strchr(p, '/');                    // end of <user>
+    if (!s1 || s1 - p <= 0 || s1 - p >= (long)sizeof(user)) { send_error(session->sock, "Bad save path"); return; }
+    memcpy(user, p, s1 - p);
+    p = s1 + 1;
+    const char *s2 = strchr(p, '/');                    // end of <dir>
+    if (!s2) { send_error(session->sock, "Bad save path"); return; }
+    p = s2 + 1;
+    const char *s3 = strchr(p, '/');                    // end of <title>
+    if (!s3 || s3 - p != 9 || !s3[1]) { send_error(session->sock, "Bad save path"); return; }
+    memcpy(title, p, 9);
+    const char *file = s3 + 1;
+    if (strncmp(title, "CUSA", 4) && strncmp(title, "PPSA", 4)) {
+        send_error(session->sock, "Bad save path");
+        return;
+    }
+    const char *savename = !strncmp(file, "sdimg_", 6) ? file + 6 : file;
+
+    char icon_path[PATH_MAX];
     FILE *f = NULL;
-    
-    // 1. /user/appmeta/{title_id}/icon0.png
-    snprintf(icon_path, sizeof(icon_path), "/user/appmeta/%s/icon0.png", title_id);
-    f = fopen(icon_path, "rb");
-    
-    // 2. /user/app/{title_id}/sce_sys/icon0.png
-    if (!f) {
-        snprintf(icon_path, sizeof(icon_path), "/user/app/%s/sce_sys/icon0.png", title_id);
+    const char *metas[] = { "savedata_meta", "savedata_prospero_meta" };
+    for (int mi = 0; mi < 2 && !f; mi++) {
+        char mdir[PATH_MAX];
+        snprintf(mdir, sizeof(mdir), "/user/home/%s/%s/user/%s", user, metas[mi], title);
+        // Exact per-save icon first, then any *_icon0.png (prefer non-sce_bu_).
+        snprintf(icon_path, sizeof(icon_path), "%s/%s_icon0.png", mdir, savename);
         f = fopen(icon_path, "rb");
-    }
-    
-    // 3. Follow mount.lnk to the original game path
-    if (!f) {
-        char mount_lnk[PATH_MAX];
-        snprintf(mount_lnk, sizeof(mount_lnk), "/user/app/%s/mount.lnk", title_id);
-        FILE *lnk = fopen(mount_lnk, "r");
-        if (lnk) {
-            char game_path[PATH_MAX] = {0};
-            if (fgets(game_path, sizeof(game_path), lnk)) {
-                game_path[strcspn(game_path, "\r\n")] = '\0';
-                snprintf(icon_path, sizeof(icon_path), "%s/sce_sys/icon0.png", game_path);
-                f = fopen(icon_path, "rb");
-            }
-            fclose(lnk);
-        }
-    }
-    
-    // 4. Scan /user/home/*/savedata_prospero_meta/user/{title_id}/ for any *_icon0.png
-    //    This covers saves for games that are no longer installed/mounted.
-    if (!f) {
-        DIR *home_dir = opendir("/user/home");
-        if (home_dir) {
-            struct dirent *user_ent;
-            while ((user_ent = readdir(home_dir)) && !f) {
-                if (!strcmp(user_ent->d_name, ".") || !strcmp(user_ent->d_name, "..")) continue;
-                
-                char meta_dir[PATH_MAX];
-                snprintf(meta_dir, sizeof(meta_dir),
-                         "/user/home/%s/savedata_prospero_meta/user/%s",
-                         user_ent->d_name, title_id);
-                
-                DIR *md = opendir(meta_dir);
-                if (!md) continue;
-                
-                struct dirent *file_ent;
-                while ((file_ent = readdir(md))) {
-                    // Pick any file ending in "_icon0.png"
-                    size_t nlen = strlen(file_ent->d_name);
-                    if (nlen > 10 && 
-                        strstr(file_ent->d_name, "icon0.png") != NULL) {
-                        snprintf(icon_path, sizeof(icon_path),
-                                 "%s/%s", meta_dir, file_ent->d_name);
+        if (!f) {
+            DIR *md = opendir(mdir);
+            if (md) {
+                char bu_fallback[PATH_MAX] = {0};
+                struct dirent *e;
+                while ((e = readdir(md))) {
+                    size_t nlen = strlen(e->d_name);
+                    if (nlen > 10 && strstr(e->d_name, "icon0.png") != NULL) {
+                        if (!strncmp(e->d_name, "sce_bu_", 7)) {
+                            snprintf(bu_fallback, sizeof(bu_fallback), "%s/%s", mdir, e->d_name);
+                            continue;
+                        }
+                        snprintf(icon_path, sizeof(icon_path), "%s/%s", mdir, e->d_name);
                         f = fopen(icon_path, "rb");
                         if (f) break;
                     }
                 }
                 closedir(md);
+                if (!f && bu_fallback[0]) {
+                    snprintf(icon_path, sizeof(icon_path), "%s", bu_fallback);
+                    f = fopen(icon_path, "rb");
+                }
             }
-            closedir(home_dir);
         }
     }
-
-    // 5. Unmounted games on disk — scan the game storage dirs for
-    //    {title_id} or {title_id}-app and read sce_sys/icon0.png.
-    if (!f) {
-        for (int pi = 0; pi < (int)NUM_GAME_SCAN_PATHS && !f; pi++) {
-            DIR *gd = opendir(GAME_SCAN_PATHS[pi]);
-            if (!gd) continue;
-            struct dirent *ge;
-            while ((ge = readdir(gd)) && !f) {
-                if (!strcmp(ge->d_name, ".") || !strcmp(ge->d_name, "..")) continue;
-                if (strncmp(ge->d_name, title_id, strlen(title_id)) != 0) continue;
-                snprintf(icon_path, sizeof(icon_path),
-                         "%s/%s/sce_sys/icon0.png", GAME_SCAN_PATHS[pi], ge->d_name);
-                f = fopen(icon_path, "rb");
-            }
-            closedir(gd);
-        }
-    }
-
+    if (!f) f = open_title_icon(title, icon_path, sizeof(icon_path));
     if (!f) {
         send_error(session->sock, "Icon not found");
         return;
     }
-    
-    // Get file size
-    fseek(f, 0, SEEK_END);
-    long icon_size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    
-    if (icon_size <= 0 || icon_size > 2 * 1024 * 1024) {  // Max 2MB
-        fclose(f);
-        send_error(session->sock, "Invalid icon size");
-        return;
-    }
-    
-    char *icon_data = malloc(icon_size);
-    if (!icon_data) {
-        fclose(f);
-        send_error(session->sock, "Out of memory");
-        return;
-    }
-    
-    size_t read_bytes = fread(icon_data, 1, icon_size, f);
-    fclose(f);
-    
-    if ((long)read_bytes != icon_size) {
-        free(icon_data);
-        send_error(session->sock, "Failed to read icon");
-        return;
-    }
-    
-    send_response(session->sock, RESP_DATA, icon_data, icon_size);
-    free(icon_data);
+    send_icon_payload(session, f);
 }
 
 // Handle GET_GAME_PIC - Send pic0.png or pic1.png binary for a given title_id
@@ -7322,7 +7441,13 @@ static int save_mount_internal(const char *src) {
                 memset(&uopt, 0, sizeof(uopt));
                 g_sceFsInitUmountSaveDataOpt(&uopt);
                 signal(SIGPIPE, SIG_DFL);
+                // Sealed-image fs calls are gated on the save-manager authid
+                // (garlic keeps it for the whole lifecycle).
+                pid_t me = getpid();
+                uint64_t oa = kernel_get_ucred_authid(me);
+                if (oa) kernel_set_ucred_authid(me, 0x4800000000000010ULL);
                 wdg_fn_call((void*)g_sceFsUmountSaveData, &uopt, (void*)SAVE_MNT, NULL, NULL, 20000);
+                if (oa) kernel_set_ucred_authid(me, oa);
                 sync();
             }
         }
@@ -7346,6 +7471,10 @@ static int save_mount_internal(const char *src) {
     // same copy dance).
     const char *base = strrchr(src, '/');
     base = base ? base + 1 : src;
+    // PS4 sealed saves pair sdimg_<name> with a <name>.bin companion — the
+    // `sdimg_` prefix is NOT part of the .bin filename (garlic layout,
+    // verified on hardware: sdimg_Default-cv1-sv7 ↔ Default-cv1-sv7.bin).
+    const char *savename = !strncmp(base, "sdimg_", 6) ? base + 6 : base;
     const char *local = src;
     char staged[PATH_MAX];
     if (strncmp(src, "/data/", 6) != 0) {
@@ -7356,14 +7485,14 @@ static int save_mount_internal(const char *src) {
             return -1;
         }
         chmod(staged, 0755);
-        // PS4 companion sealed-key file rides along
+        // PS4 companion sealed-key file rides along under its real name
         if (is_ps4) {
             char bin_src[PATH_MAX], bin_dst[PATH_MAX];
             int dlen = (int)(base - src);  // includes trailing '/'
             if (dlen > 0 && dlen < (int)sizeof(bin_src) - 1) {
                 memcpy(bin_src, src, dlen);
-                snprintf(bin_src + dlen, sizeof(bin_src) - dlen, "%s.bin", base);
-                snprintf(bin_dst, sizeof(bin_dst), "%s/%s.bin", SAVE_LOCAL_DIR, base);
+                snprintf(bin_src + dlen, sizeof(bin_src) - dlen, "%s.bin", savename);
+                snprintf(bin_dst, sizeof(bin_dst), "%s/%s.bin", SAVE_LOCAL_DIR, savename);
                 struct stat bst;
                 if (stat(bin_src, &bst) == 0)
                     copy_file(bin_src, bin_dst);
@@ -7380,34 +7509,43 @@ static int save_mount_internal(const char *src) {
     // and writes the 0x20-byte key at +0x60 — garlic's exact layout).
     if (is_ps4) {
         char bin_path[PATH_MAX];
-        snprintf(bin_path, sizeof(bin_path), "%s/%s.bin", SAVE_LOCAL_DIR, base);
-        if (strncmp(local, "/data/", 6) != 0) {  // src already under /data
-            int dlen = (int)(base - src);
-            if (dlen > 0 && dlen < (int)sizeof(bin_path) - 1) {
-                memcpy(bin_path, src, dlen);
-                snprintf(bin_path + dlen, sizeof(bin_path) - dlen, "%s.bin", base);
+        if (local == src) {   // already under /data — companion sits beside it
+            int dlen = (int)(base - src);  // includes trailing '/'
+            if (dlen <= 0 || dlen >= (int)sizeof(bin_path) - 1) {
+                snprintf(g_save_err, sizeof(g_save_err), "Bad PS4 save path");
+                return -1;
             }
+            memcpy(bin_path, src, dlen);
+            snprintf(bin_path + dlen, sizeof(bin_path) - dlen, "%s.bin", savename);
+        } else {
+            snprintf(bin_path, sizeof(bin_path), "%s/%s.bin", SAVE_LOCAL_DIR, savename);
         }
         if (save_pread60(bin_path, 0, g_save_keybuf) != 0) {
+            if (local != src) unlink(local);
             snprintf(g_save_err, sizeof(g_save_err), "Missing/unreadable PS4 sealed key: %s", bin_path);
             return -1;
         }
     } else {
         if (save_pread60(local, 0x800, g_save_keybuf) != 0) {
+            if (local != src) unlink(local);
             snprintf(g_save_err, sizeof(g_save_err), "Cannot read key blob at offset 0x800");
             return -1;
         }
     }
 
     if (save_decrypt_key(g_save_keybuf) != 0) {
+        if (local != src) unlink(local);
         snprintf(g_save_err, sizeof(g_save_err), "pfsmgr key decryption failed (/dev/pfsmgr unavailable?)");
         return -1;
     }
     uint8_t *key = g_save_keybuf + 0x60;
 
-    // Mount — garlic swaps to authid 0x4800000000000010 for this call. Try
-    // with our ShellCore authid first; only swap on failure, and restore
-    // immediately (the authid is process-wide).
+    // Mount — garlic runs the ENTIRE mount→umount lifecycle under the
+    // save-manager authid (0x4800000000000010): the kernel gates both the
+    // mount AND the sealed write-back at umount on that credential. Running
+    // the umount under our ShellCore authid produced invalidly-sealed images
+    // on hardware (saves wiped by the OS integrity check). Swap it in for the
+    // call, restore immediately after — and do the same at umount time.
     memset(&g_save_mopt, 0, sizeof(g_save_mopt));
     g_sceFsInitMountSaveDataOpt(&g_save_mopt);
     g_save_mopt.budgetid = "system";
@@ -7415,19 +7553,18 @@ static int save_mount_internal(const char *src) {
     mkdir(SAVE_MNT, 0777);
     signal(SIGPIPE, SIG_DFL);   // mount may raise SIGPIPE — don't die on it
 
+    pid_t me = getpid();
+    uint64_t old_authid = kernel_get_ucred_authid(me);
+    if (old_authid) kernel_set_ucred_authid(me, 0x4800000000000010ULL);
     send_progress_message("save: calling sceFsMountSaveData");
     int r = wdg_fn_call((void*)g_sceFsMountSaveData, &g_save_mopt, (void*)local,
                         (void*)SAVE_MNT, key, 45000);
-    if (r < 0 && r != -2) {
-        // Retry under garlic's save-manager authid — some FWs gate the mount
-        // to that credential specifically.
-        pid_t me = getpid();
-        uint64_t old_authid = kernel_get_ucred_authid(me);
-        kernel_set_ucred_authid(me, 0x4800000000000010ULL);
-        send_progress_message("save: retrying with save-mgr authid");
+    if (old_authid) kernel_set_ucred_authid(me, old_authid);
+    if (r < 0 && r != -2 && old_authid) {
+        // Fallback for FWs that reject the save-mgr creds on mount.
+        send_progress_message("save: retrying under default creds");
         r = wdg_fn_call((void*)g_sceFsMountSaveData, &g_save_mopt, (void*)local,
                         (void*)SAVE_MNT, key, 45000);
-        kernel_set_ucred_authid(me, old_authid);
     }
 
     // Positive return = mount handle (success); negative = error. Verify the
@@ -7451,7 +7588,9 @@ static int save_mount_internal(const char *src) {
     return 0;
 }
 
-static int save_umount_internal(void) {
+// discard=1 → unmount and THROW AWAY the staged image (read-only sessions
+// like backup/browse: the original sealed file is never rewritten).
+static int save_umount_internal(int discard) {
     g_save_err[0] = 0;
     int had_state = g_save_mounted;
     if (!had_state) {
@@ -7472,24 +7611,62 @@ static int save_umount_internal(void) {
     memset(&uopt, 0, sizeof(uopt));
     g_sceFsInitUmountSaveDataOpt(&uopt);
     signal(SIGPIPE, SIG_DFL);
+    // The sealed write-back is gated on the save-manager authid, same as the
+    // mount — garlic never drops it for the session. Swap in for the call.
+    pid_t me = getpid();
+    uint64_t old_authid = kernel_get_ucred_authid(me);
+    if (old_authid) kernel_set_ucred_authid(me, 0x4800000000000010ULL);
     int r = wdg_fn_call((void*)g_sceFsUmountSaveData, &uopt, (void*)SAVE_MNT, NULL, NULL, 45000);
+    if (old_authid) kernel_set_ucred_authid(me, old_authid);
     sync();
 
-    if (had_state) {
-        // Write the (possibly modified) staged image back over the original.
-        if (strcmp(g_save_local, g_save_src) != 0) {
-            if (copy_file(g_save_local, g_save_src) != 0)
+    if (r < 0) {
+        // NEVER copy a possibly half-flushed staged image over the original
+        // (a timed-out umount can still be writing it in the background).
+        // Keep the mounted state so the user can retry the unmount.
+        snprintf(g_save_err, sizeof(g_save_err),
+                 "sceFsUmountSaveData failed (%d) — save left untouched, still mounted; retry unmount", r);
+        return r;
+    }
+
+    if (had_state && !discard && strcmp(g_save_local, g_save_src) != 0) {
+        // Write the (possibly modified) staged image back over the original —
+        // ATOMICALLY: copy to a sibling temp, verify size (PFS images are
+        // fixed-size), sync, then rename over the original. A mid-copy
+        // failure can never truncate the real save.
+        struct stat ss, os;
+        if (stat(g_save_local, &ss) == 0 && stat(g_save_src, &os) == 0 &&
+            S_ISREG(ss.st_mode) && ss.st_size == os.st_size) {
+            char tmp[PATH_MAX];
+            snprintf(tmp, sizeof(tmp), "%s.wb", g_save_src);
+            if (copy_file(g_save_local, tmp) == 0) {
+                sync();
+                if (rename(tmp, g_save_src) != 0) {
+                    unlink(tmp);
+                    snprintf(g_save_err, sizeof(g_save_err),
+                             "Unmounted but write-back rename failed — original kept (%s)", g_save_src);
+                }
+            } else {
+                unlink(tmp);
                 snprintf(g_save_err, sizeof(g_save_err),
-                         "Unmounted but write-back failed (%s -> %s)", g_save_local, g_save_src);
-            unlink(g_save_local);
+                         "Unmounted but write-back failed (%s -> %s) — original kept", g_save_local, g_save_src);
+            }
+        } else {
+            snprintf(g_save_err, sizeof(g_save_err),
+                     "Staged image missing/size mismatch — original untouched (%s)", g_save_src);
         }
-        // Keep the staged PS4 key file out of the staging dir too
+    }
+
+    // Drop the staged scratch files — they're copies, safe to unlink now.
+    if (had_state && g_save_local[0] && strcmp(g_save_local, g_save_src) != 0)
+        unlink(g_save_local);
+    if (had_state && g_save_is_ps4) {
         const char *base = strrchr(g_save_local, '/');
-        if (base) {
-            char leftover[PATH_MAX];
-            snprintf(leftover, sizeof(leftover), "%s%s.bin", SAVE_LOCAL_DIR, base);
-            unlink(leftover);
-        }
+        const char *sname = base ? base + 1 : g_save_local;
+        if (!strncmp(sname, "sdimg_", 6)) sname += 6;
+        char leftover[PATH_MAX];
+        snprintf(leftover, sizeof(leftover), "%s/%s.bin", SAVE_LOCAL_DIR, sname);
+        unlink(leftover);
     }
     rmdir(SAVE_MNT);
 
@@ -7543,12 +7720,17 @@ void handle_save_scan(client_session_t *session) {
 
                     // In the PS4-legacy `savedata` dir, sdimg_* files are only
                     // real saves when the sealed .bin key companion exists
-                    // (garlic's filter). PS5 `savedata_prospero` images are
+                    // (garlic's filter). The companion drops the `sdimg_`
+                    // prefix: sdimg_Foo pairs with Foo.bin — verified on
+                    // hardware (CUSA09417: sdimg_Default-cv1-sv7 ↔
+                    // Default-cv1-sv7.bin). PS5 `savedata_prospero` images are
                     // self-contained — no companion needed, name irrelevant.
                     int has_bin = 0;
                     {
+                        const char *keyname = fe->d_name;
+                        if (!strncmp(keyname, "sdimg_", 6)) keyname += 6;
                         char binp[PATH_MAX];
-                        snprintf(binp, sizeof(binp), "%s.bin", fpath);
+                        snprintf(binp, sizeof(binp), "%s/%s.bin", tdir, keyname);
                         struct stat bst;
                         if (stat(binp, &bst) == 0) has_bin = 1;
                     }
@@ -7600,11 +7782,15 @@ void handle_save_mount(client_session_t *session, const char *path) {
     }
 }
 
-// SAVE_UNMOUNT — unmount + write the modified image back.
-void handle_save_unmount(client_session_t *session) {
-    send_progress_message("save: unmounting & writing back...");
+// SAVE_UNMOUNT — unmount; optional data "discard" drops the staged image
+// instead of writing it back (read-only sessions — the original sealed
+// image is left byte-identical).
+void handle_save_unmount(client_session_t *session, const char *data) {
+    int discard = data && !strncmp(data, "discard", 7);
+    send_progress_message(discard ? "save: unmounting (discarding staged copy)..."
+                                  : "save: unmounting & writing back...");
     pthread_mutex_lock(&g_save_mtx);
-    int r = save_umount_internal();
+    int r = save_umount_internal(discard);
     pthread_mutex_unlock(&g_save_mtx);
     if (r == 0) {
         if (g_save_err[0])
@@ -9559,18 +9745,23 @@ void handle_pad_action(client_session_t *session, const char *arg) {
 //   0x40829505  get_dynamic_led  -> reads the 130-byte state struct
 //   0x80829504  set_dynamic_led  -> writes the same struct (ICC validates)
 //   0x8001950c  dim setting      (0..2 — same as sceKernelIccSetDynamicLedDim)
-//   0x8001950e  enable flag      (0=off, 1=on — verified on hardware)
+//   0x8001950e  beeper OFF setting (1=off) — NOT an LED enable flag. Calling it
+//              with 1 silently turns the system's beep off in Settings -> Beep
+//              and Light (issue #12, confirmed independently by ps5-signal).
 //   0x80019501  set_buzzer
-// State struct: bytes 0-3 = header (00 00 | count u16), then 6-byte records
-//   { u8 channel_id; u8 flag=1; u8 unk; u8 level; u8 unk2; u8 mode }
+// State struct: 4-byte header (00 00 | count u16), then a 42-byte block per
+// channel: { u8 channel_id; u8 step_count; step_count * 5-byte steps
+// { u8 type; u8 level; u8 t0; u8 t1; u8 t2 } }. A held colour is one step:
+//   { id, 1, 0x02, level, 0x05, 0x02, 0x00 } — "off" is the same with level 0.
 // Channel ids verified live: 0x01=blue, 0x11=white, 0x21=amber.
-// Records float inside the blob — scan for (id,0x01) pairs, never offsets.
 // ============================================================================
 #define ICC_INDICATOR_DEV  "/dev/icc_indicator"
 #define ICC_LED_STATE_SIZE 130
 #define ICC_CH_BLUE   0x01
 #define ICC_CH_WHITE  0x11
 #define ICC_CH_AMBER  0x21
+#define ICC_BLOCK_START 4
+#define ICC_BLOCK_SIZE  42
 
 static pthread_mutex_t g_led_mtx = PTHREAD_MUTEX_INITIALIZER;
 
@@ -9592,17 +9783,19 @@ static int icc_dyn_set(const uint8_t *st) {
     return rc;
 }
 
-static int icc_flag(uint8_t v) {
-    int fd = open(ICC_INDICATOR_DEV, O_RDWR);
-    if (fd < 0) return -errno;
-    uint8_t b[8] = { v, 0 };
-    int r = ioctl(fd, 0x8001950eul, b);
-    int rc = r ? -errno : 0;
-    close(fd);
-    return rc;
+// Find a channel's 42-byte block inside the state blob; -1 if absent.
+// Blocks sit at fixed strides (4 + i*42); the header count says how many.
+static int icc_block(const uint8_t *st, uint8_t id) {
+    int count = st[2] | (st[3] << 8);
+    for (int i = 0; i < count && ICC_BLOCK_START + (i + 1) * ICC_BLOCK_SIZE <= ICC_LED_STATE_SIZE; i++) {
+        int at = ICC_BLOCK_START + i * ICC_BLOCK_SIZE;
+        if (st[at] == id) return at;
+    }
+    return -1;
 }
 
-// Find a channel's 6-byte record inside the state blob; -1 if absent.
+// Fallback for state layouts that don't match the 42-byte block model:
+// locate the (id, step_count=1) pair floating in the blob; -1 if absent.
 static int icc_chan_off(const uint8_t *st, uint8_t id) {
     for (int i = 2; i + 5 < ICC_LED_STATE_SIZE; i++)
         if (st[i] == id && st[i + 1] == 0x01)
@@ -9611,7 +9804,10 @@ static int icc_chan_off(const uint8_t *st, uint8_t id) {
 }
 
 // Read-modify-write the LED state. Levels are 0-255, -1 = leave channel.
-// All-zero is rejected by the ICC — callers wanting "off" use icc_flag(0).
+// Each touched channel is rewritten as a clean one-step program, which is the
+// only encoding the ICC reliably accepts — including all-zero ("off"), which
+// is just a program holding level 0 (the old icc_flag() "enable" calls were
+// actually toggling the console's beep setting — see issue #12).
 static int icc_set_levels(int blue, int white, int amber) {
     pthread_mutex_lock(&g_led_mtx);
     uint8_t st[ICC_LED_STATE_SIZE];
@@ -9622,8 +9818,17 @@ static int icc_set_levels(int blue, int white, int amber) {
         int patched = 0;
         for (int i = 0; i < 3; i++) {
             if (lv[i] < 0) continue;
-            int o = icc_chan_off(st, ids[i]);
-            if (o >= 0) { st[o + 3] = (uint8_t)lv[i]; patched = 1; }
+            int at = icc_block(st, ids[i]);
+            if (at >= 0) {
+                // Rewrite the whole block as one step holding the level.
+                memset(st + at, 0, ICC_BLOCK_SIZE);
+                const uint8_t prog[7] = { ids[i], 1, 0x02, (uint8_t)lv[i], 0x05, 0x02, 0x00 };
+                memcpy(st + at, prog, sizeof(prog));
+                patched = 1;
+            } else {
+                int o = icc_chan_off(st, ids[i]);
+                if (o >= 0) { st[o + 3] = (uint8_t)lv[i]; patched = 1; }
+            }
         }
         rc = patched ? icc_dyn_set(st) : -95;
     }
@@ -9856,34 +10061,33 @@ static int icc_work(icc_work_t *w) {
         if (g_iccSetBuzzerOff) w->rc = g_iccSetBuzzerOff(v);
     } else if (!strcmp(w->sub, "ledcolor")) {
         // ledcolor|b,w,o — live channel levels (0x01 blue / 0x11 white /
-        // 0x21 amber). All-zero means "off" -> drop the enable flag.
+        // 0x21 amber). All-zero means "off" -> hold every channel at level 0
+        // (a valid one-step program; no enable flag exists — ioctl 0x8001950e
+        // was the beeper's off setting, see issue #12).
         if (v <= 0 && v2 <= 0 && v3 <= 0) {
             led_fx_stop();
-            w->rc = icc_flag(0);
+            w->rc = icc_set_levels(0, 0, 0);
         } else {
             led_fx_t fx = { "custom", 0, 0,
                             { (uint8_t)(v>0?v:0), (uint8_t)(v2>0?v2:0),
                               (uint8_t)(v3>0?v3:0) }, {0,0,0} };
-            w->rc = icc_flag(1);
-            if (w->rc == 0) w->rc = led_fx_start(&fx);
+            w->rc = led_fx_start(&fx);
         }
     } else if (!strcmp(w->sub, "ledeffect")) {
         if (!strcmp(w->opt, "off")) {
             led_fx_stop();
-            w->rc = icc_flag(0);
+            w->rc = icc_set_levels(0, 0, 0);
         } else if (!strcmp(w->opt, "auto")) {
-            // hand the indicator back to ShellUI
+            // hand the indicator back to ShellUI: just stop overwriting —
+            // the system's own programs take over on the next LED event
             led_fx_stop();
-            w->rc = icc_flag(1);
+            w->rc = 0;
         } else {
             const led_fx_t *fx = NULL;
             for (size_t i = 0; i < sizeof(g_led_fx)/sizeof(g_led_fx[0]); i++)
                 if (!strcmp(g_led_fx[i].name, w->opt)) { fx = &g_led_fx[i]; break; }
             if (!fx) w->rc = -98;
-            else {
-                w->rc = icc_flag(1);
-                if (w->rc == 0) w->rc = led_fx_start(fx);
-            }
+            else w->rc = led_fx_start(fx);
         }
     }
     return 0;
@@ -9929,8 +10133,19 @@ void handle_save_delete(client_session_t *session, const char *path) {
         send_error(session->sock, "Delete failed (file missing or protected)");
         return;
     }
+    // Companion sealed key drops the `sdimg_` prefix: sdimg_X pairs with
+    // X.bin beside it.
+    const char *base = strrchr(path, '/');
+    const char *sname = base ? base + 1 : path;
+    if (!strncmp(sname, "sdimg_", 6)) sname += 6;
     char binp[PATH_MAX];
-    snprintf(binp, sizeof(binp), "%s.bin", path);
+    int dlen = base ? (int)(base + 1 - path) : 0;
+    if (dlen > 0 && dlen < (int)sizeof(binp) - 1) {
+        memcpy(binp, path, dlen);
+        snprintf(binp + dlen, sizeof(binp) - dlen, "%s.bin", sname);
+    } else {
+        snprintf(binp, sizeof(binp), "%s.bin", sname);
+    }
     unlink(binp);   // companion sealed key — fine if absent
     send_response(session->sock, RESP_DATA, "DELETED", 7);
     send_notification("Save image deleted");
@@ -12227,7 +12442,7 @@ static int read_whole_file(const char *path, uint8_t **out, size_t *out_sz) {
 // Response body layout (all integers little-endian, network order of our
 // protocol):
 //   u16 count
-//   per set: u8 npwrLen|npwr, u8 tidLen|tid, u8 uidLen|uid,
+//   per set: u8 npwrLen|npwr, u8 tidLen|tid, u8 uidLen|uid, u8 nameLen|uname,
 //            u32 confLen|tropconf.json, u32 metaLen|tropmeta.json,
 //            u32 trpLen|TRPTITLE.DAT (0 if the user never registered it)
 void handle_trophy_list(client_session_t *session) {
@@ -12301,13 +12516,35 @@ void handle_trophy_list(client_session_t *session) {
                 uint8_t *trp = NULL; size_t trp_sz = 0;
                 if (read_whole_file(tp, &trp, &trp_sz) != 0) continue;
 
+                // Resolve the hex uid to the profile display name — the
+                // client shows this instead of the opaque hex string.
+                // UserService is daemon IPC → watchdog-wrapped; a wedged
+                // call leaks one worker instead of hanging the list reply.
+                char uname[32] = {0};
+                {
+                    static int usvc_init_tried = 0;
+                    if (!usvc_init_tried) {
+                        usvc_init_tried = 1;
+                        wdg_fn_call((void*)sceUserServiceInitialize, NULL, NULL,
+                                    NULL, NULL, 10000);
+                    }
+                    unsigned long uid_n = strtoul(he->d_name, NULL, 16);
+                    if (uid_n)
+                        wdg_fn_call((void*)sceUserServiceGetUserName,
+                                    (void*)(intptr_t)uid_n, uname,
+                                    (void*)(uintptr_t)sizeof(uname), NULL, 5000);
+                    uname[sizeof(uname) - 1] = 0;
+                }
+
                 size_t need = 1 + strlen(npwr) + 1 + strlen(tid) + 1 + strlen(he->d_name)
+                            + 1 + strlen(uname)
                             + 4 + cfs + 4 + mts + 4 + trp_sz;
                 if (off + need >= cap) { free(trp); break; }
 
                 buf[off++] = (uint8_t)strlen(npwr); memcpy(buf + off, npwr, strlen(npwr)); off += strlen(npwr);
                 buf[off++] = (uint8_t)strlen(tid);  memcpy(buf + off, tid, strlen(tid));   off += strlen(tid);
                 buf[off++] = (uint8_t)strlen(he->d_name); memcpy(buf + off, he->d_name, strlen(he->d_name)); off += strlen(he->d_name);
+                buf[off++] = (uint8_t)strlen(uname); memcpy(buf + off, uname, strlen(uname)); off += strlen(uname);
                 uint32_t l;
                 l = (uint32_t)cfs;    memcpy(buf + off, &l, 4); off += 4; memcpy(buf + off, cf, cfs);  off += cfs;
                 l = (uint32_t)mts;    memcpy(buf + off, &l, 4); off += 4; if (mt) { memcpy(buf + off, mt, mts); off += mts; }
@@ -12319,11 +12556,12 @@ void handle_trophy_list(client_session_t *session) {
             closedir(home);
         }
         if (emitted == 0 && count < 64) {
-            size_t need = 1 + strlen(npwr) + 1 + strlen(tid) + 1
+            size_t need = 1 + strlen(npwr) + 1 + strlen(tid) + 1 + 1
                         + 4 + cfs + 4 + mts + 4;
             if (off + need < cap) {
                 buf[off++] = (uint8_t)strlen(npwr); memcpy(buf + off, npwr, strlen(npwr)); off += strlen(npwr);
                 buf[off++] = (uint8_t)strlen(tid);  memcpy(buf + off, tid, strlen(tid));   off += strlen(tid);
+                buf[off++] = 0;
                 buf[off++] = 0;
                 uint32_t l;
                 l = (uint32_t)cfs; memcpy(buf + off, &l, 4); off += 4; memcpy(buf + off, cf, cfs); off += cfs;
@@ -12389,16 +12627,36 @@ void handle_trophy_icon(client_session_t *session, const char *arg) {
 // target game must be RUNNING: we borrow its address space with the same
 // PT_ATTACH/register-hijack remote-call machinery as the ShellCore pad borrow.
 // ============================================================================
+// Marker libs that flag a trophy-capable game process. Newer-SDK titles
+// (Onimusha WotS, Pragmata) never map libSceNpTrophy2 — their trophy flow runs
+// purely through libSceNpUniversalDataSystem — so UDS must qualify too.
+static const char *g_trp_marker_libs[] = {
+    "libSceNpTrophy2.sprx", "libSceNpTrophy.sprx",
+    "libSceNpUniversalDataSystem.sprx", NULL
+};
+static pid_t trp_proc_marker(pid_t p, uint32_t *tr2h_out, const char **mark) {
+    for (int i = 0; g_trp_marker_libs[i]; i++) {
+        uint32_t h = 0;
+        if (krpc_dynlib_handle(p, g_trp_marker_libs[i], &h) == 0 && h) {
+            if (i == 0) *tr2h_out = h;    // keep the NpTrophy2 handle semantics
+            if (mark) *mark = g_trp_marker_libs[i];
+            return 1;
+        }
+    }
+    return 0;
+}
 static int trp_find_trophy_proc(uint32_t *tr2h_out, char *diag, size_t dsz) {
     if (diag) diag[0] = 0;
+    *tr2h_out = 0;
     // Prefer the game executable names.
     static const char *names[] = { "eboot.bin", "eboot", NULL };
     for (int i = 0; names[i]; i++) {
         pid_t p = proc_find_name(names[i]);
         if (p > 0) {
-            uint32_t h = 0;
-            if (krpc_dynlib_handle(p, "libSceNpTrophy2.sprx", &h) == 0 && h) {
-                *tr2h_out = h;
+            const char *mark = NULL;
+            if (trp_proc_marker(p, tr2h_out, &mark)) {
+                if (diag) snprintf(diag + strlen(diag), dsz - strlen(diag),
+                                   " via:%s", mark);
                 return p;
             }
             if (diag) snprintf(diag + strlen(diag), dsz - strlen(diag),
@@ -12416,14 +12674,16 @@ static int trp_find_trophy_proc(uint32_t *tr2h_out, char *diag, size_t dsz) {
         for (uint8_t *p = buf; p < buf + len && sz; p += sz) {
             struct kinfo_proc *ki = (struct kinfo_proc *)p;
             if (ki->ki_pid == getpid() || ki->ki_pid <= 0) continue;
-            uint32_t h = 0;
-            if (krpc_dynlib_handle(ki->ki_pid, "libSceNpTrophy2.sprx", &h) == 0 && h) {
+            const char *mark = NULL;
+            if (trp_proc_marker(ki->ki_pid, tr2h_out, &mark)) {
                 if (diag && strlen(diag) < dsz - 48)
                     snprintf(diag + strlen(diag), dsz - strlen(diag),
-                             " %d:%s", (int)ki->ki_pid, ki->ki_comm);
-                if (found < 0) { found = ki->ki_pid; *tr2h_out = h; }
+                             " %d:%s(%s)", (int)ki->ki_pid, ki->ki_comm, mark);
+                if (found < 0) found = ki->ki_pid;
                 if (ki->ki_comm[0] && strstr(ki->ki_comm, "eboot")) {
-                    found = ki->ki_pid; *tr2h_out = h; break;
+                    found = ki->ki_pid;
+                    trp_proc_marker(ki->ki_pid, tr2h_out, NULL);
+                    break;
                 }
             }
         }
@@ -12713,7 +12973,7 @@ static const char *memfind(const char *h, const char *hend, const char *nd) {
 // evkind: 0=_UnlockTrophy, 1=_UpdateTrophyProgress, 2=custom event, -1 unknown
 typedef struct {
     int id, prog, target, statid, gid;
-    int evkind, evwide;
+    int evkind, evwide, evval;   // evval: rule's required condition value (-1=none)
     char evname[64], evprop[64];
 } trop_ent_t;
 
@@ -12740,7 +13000,7 @@ static int tropconf_parse(const uint8_t *j, size_t n, trop_ent_t *out, int cap) 
         out[cnt].gid = 0;
         const char *gi = memfind(q, lim, "\"groupId\":\"");
         if (gi) out[cnt].gid = atoi(gi + 11);
-        out[cnt].evkind = -1; out[cnt].evwide = 0;
+        out[cnt].evkind = -1; out[cnt].evwide = 0; out[cnt].evval = -1;
         out[cnt].evname[0] = 0; out[cnt].evprop[0] = 0;
         cnt++;
         s = q;
@@ -12754,11 +13014,13 @@ static int tropconf_parse(const uint8_t *j, size_t n, trop_ent_t *out, int cap) 
 // standard trophy events over custom ones, skips reset/clear rules.
 // Returns 1 on hit.
 static int udsrule_for_stat(const uint8_t *j, size_t n, int sid,
-                            char *evname, size_t esz, char *prop, size_t psz) {
+                            char *evname, size_t esz, char *prop, size_t psz,
+                            int *cval) {
     const char *end = (const char *)j + n;
     const char *s = (const char *)j;
     int kind = -1;
     char best_ev[64] = "", best_prop[64] = "";
+    int best_val = -1;
     while ((s = memfind(s, end, "\"statId\"")) != NULL) {
         const char *q = s + 8;
         while (q < end && (*q == ' ' || *q == ':')) q++;
@@ -12781,6 +13043,28 @@ static int udsrule_for_stat(const uint8_t *j, size_t n, int sid,
         if (!ne || ne - ev >= 64) { s = q; continue; }
         char en[64]; memcpy(en, ev, ne - ev); en[ne - ev] = 0;
         if (strstr(en, "eset") || strstr(en, "lear")) { s = q; continue; }
+        // Condition property: "path":"$.X" + "value":N — rules like Onimusha's
+        // UnlockTrophy fire only when the property equals a specific value
+        // (per-trophy id), and they carry no action.input at all. The path is
+        // the property to set and the value is what we must post.
+        const char *cp = NULL;
+        for (const char *m = memfind(rs, s, "\"path\""); m;
+             m = memfind(m + 1, s, "\"path\"")) {
+            const char *v = m + 6;
+            while (v < end && (*v == ' ' || *v == ':')) v++;
+            if (v + 2 < end && v[0] == '"' && v[1] == '$' && v[2] == '.')
+                cp = v + 3;
+        }
+        int cv = -1;
+        for (const char *m = memfind(rs, s, "\"value\""); m;
+             m = memfind(m + 1, s, "\"value\"")) {
+            const char *v = m + 7;
+            while (v < end && (*v == ' ' || *v == ':')) v++;
+            if (v < end && (*v == '"' || (*v >= '0' && *v <= '9') || *v == '-')) {
+                if (*v == '"') v++;
+                cv = atoi(v);
+            }
+        }
         // input prop: the last "input": "$.X" within [rs, s)
         const char *ip = NULL;
         for (const char *m = memfind(rs, s, "\"input\""); m;
@@ -12791,9 +13075,10 @@ static int udsrule_for_stat(const uint8_t *j, size_t n, int sid,
                 ip = v + 3;
         }
         char pp[64] = "";
-        if (ip) {
-            const char *pe = strchr(ip, '"');
-            if (pe && pe - ip < 64) { memcpy(pp, ip, pe - ip); pp[pe - ip] = 0; }
+        const char *sel = ip ? ip : cp;
+        if (sel) {
+            const char *pe = strchr(sel, '"');
+            if (pe && pe - sel < 64) { memcpy(pp, sel, pe - sel); pp[pe - sel] = 0; }
         }
         int k = !strcmp(en, "_UnlockTrophy") ? 0
               : !strcmp(en, "_UpdateTrophyProgress") ? 1 : 2;
@@ -12801,12 +13086,14 @@ static int udsrule_for_stat(const uint8_t *j, size_t n, int sid,
             kind = k;
             snprintf(best_ev, sizeof(best_ev), "%s", en);
             snprintf(best_prop, sizeof(best_prop), "%s", pp);
+            best_val = cv;
         }
         s = q;
     }
     if (kind < 0) return 0;
     snprintf(evname, esz, "%s", best_ev);
     snprintf(prop, psz, "%s", best_prop);
+    if (cval) *cval = best_val;
     return 1;
 }
 
@@ -13020,7 +13307,8 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
     else {
         work[0].id = want_id; work[0].prog = -1; work[0].target = 1;
         work[0].statid = -1; work[0].gid = 0; work[0].evkind = -1;
-        work[0].evwide = 0; work[0].evname[0] = 0; work[0].evprop[0] = 0;
+        work[0].evwide = 0; work[0].evval = -1;
+        work[0].evname[0] = 0; work[0].evprop[0] = 0;
         if (np > 0)
             for (int i = 0; i < np; i++)
                 if (plan[i].id == want_id) { work[0] = plan[i]; break; }
@@ -13041,7 +13329,7 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
         if (work[i].statid >= 0 && xj) {
             char ev[64] = "", pr[64] = "";
             if (udsrule_for_stat(xj, xn, work[i].statid,
-                                 ev, sizeof(ev), pr, sizeof(pr))) {
+                                 ev, sizeof(ev), pr, sizeof(pr), &work[i].evval)) {
                 snprintf(work[i].evname, sizeof(work[i].evname), "%s", ev);
                 snprintf(work[i].evprop, sizeof(work[i].evprop), "%s", pr);
                 work[i].evkind = !strcmp(ev, "_UnlockTrophy") ? 0
@@ -13111,8 +13399,9 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
                 rpc_write(pid, st_dpp, work[i].evprop,
                           strlen(work[i].evprop) + 1);
                 intptr_t fset = work[i].evwide && f_si64 > 0 ? f_si64 : f_si3;
-                rpc_call(&s, fset, (long)pobj, st_dpp,
-                         target > 0 ? target : 1, 0, 0, 0);
+                long pv = work[i].evval >= 0 ? work[i].evval
+                                             : (target > 0 ? target : 1);
+                rpc_call(&s, fset, (long)pobj, st_dpp, pv, 0, 0, 0);
             } else {
                 rpc_call(&s, f_si3, (long)pobj, st_tid, id, 0, 0, 0);
                 if (k == 1)
@@ -13133,7 +13422,11 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
         // (verified live: counter + _UpdateTrophyProgress + _UnlockTrophy
         // all returned 0, flag stayed 0x10). Pin the earned state at file
         // level — a no-op when the daemon already wrote the earn itself.
-        if (posted && npwr[0]) {
+        // EXCEPTION: evkind==2 custom events (Onimusha-style UnlockTrophy)
+        // DO get extracted+awarded by the daemon itself — it rewrites
+        // TRPTITLE.DAT from its own state, so a forged flag gets wiped and
+        // can even clobber a real award. Let the daemon own the file.
+        if (posted && npwr[0] && work[i].evkind != 2) {
             char fdiag[80] = "";
             trophy_force_unlock_file(npwr, id, work[i].gid,
                                      fdiag, sizeof(fdiag));
@@ -13214,10 +13507,14 @@ static int trp_lock_file(const char *path, int tid, char *diag, size_t dsz) {
     }
     if (group_recs == 0) { free(union_mask); free(d); return -1; }
 
-    // "already locked" is decided by the UNION mask — the popcount-scan for a
-    // separate "global" mask is unreliable (ASCII strings like "P2M\x08" can
-    // match popcount+trailing-zero criteria and shadow the real mask).
-    if (!((union_mask[tbyte] >> tbit) & 1)) { free(union_mask); free(d); return 1; }
+    // Newer titles (e.g. Onimusha NPWR49248_00) store hash/random bytes in the
+    // 0x700 mask field — any set bit above max_id proves it is not a bitmask.
+    int mask_valid = 1;
+    for (int i = 0; i < nb * 8; i++) {
+        if (((union_mask[i >> 3] >> (i & 7)) & 1) && i >= nbits) {
+            mask_valid = 0; break;
+        }
+    }
 
     // 3) 0x800 state row for this trophy: flag at rec+0x14, ts at rec+0x20
     size_t row_flag_off = 0, row_ts_off = 0; int have_row = 0;
@@ -13229,19 +13526,32 @@ static int trp_lock_file(const char *path, int tid, char *diag, size_t dsz) {
         }
     }
 
+    // "already locked": the 0x800 row flag is authoritative when present;
+    // otherwise the union mask (only when it actually looks like a bitmask —
+    // the popcount-scan for a separate "global" mask is unreliable, ASCII
+    // strings like "P2M\x08" can match popcount+trailing-zero criteria).
+    int already;
+    if (have_row)      already = !(trp_u32be(d + row_flag_off) & 1);
+    else if (mask_valid) already = !((union_mask[tbyte] >> tbit) & 1);
+    else               already = 0;
+    if (already) { free(union_mask); free(d); return 1; }
+
     // 4) edits:
     //   a) every 0x700 group-mask record where the bit is set
     //   b) ANY other byte window identical to the union mask — catches a
     //      separate global/copy mask without the fragile popcount signature
     //   c) the 0x800 row flag + timestamp
+    // (a)+(b) only apply to real bitmask fields — never write into hash bytes.
     int cleared_groups = 0, cleared_copies = 0;
-    for (int g = 0; g < group_recs; g++) {
-        uint8_t *m = d + group_mask_off[g];
-        if ((m[tbyte] >> tbit) & 1) { m[tbyte] &= (uint8_t)~(1 << tbit); cleared_groups++; }
-    }
-    for (size_t o = 0x200; o + (size_t)nb <= (size_t)flen; o += 4) {
-        if (memcmp(d + o, union_mask, nb) != 0) continue;
-        if ((d[o + tbyte] >> tbit) & 1) { d[o + tbyte] &= (uint8_t)~(1 << tbit); cleared_copies++; }
+    if (mask_valid) {
+        for (int g = 0; g < group_recs; g++) {
+            uint8_t *m = d + group_mask_off[g];
+            if ((m[tbyte] >> tbit) & 1) { m[tbyte] &= (uint8_t)~(1 << tbit); cleared_groups++; }
+        }
+        for (size_t o = 0x200; o + (size_t)nb <= (size_t)flen; o += 4) {
+            if (memcmp(d + o, union_mask, nb) != 0) continue;
+            if ((d[o + tbyte] >> tbit) & 1) { d[o + tbyte] &= (uint8_t)~(1 << tbit); cleared_copies++; }
+        }
     }
     free(union_mask);
     if (have_row) {
@@ -13330,38 +13640,59 @@ static int trp_unlock_file(const char *path, int tid, int gid,
         for (int j = 0; j < nb; j++) union_mask[j] |= d[o + 0x40 + j];
     }
     if (ngrp == 0) { free(union_mask); free(d); return -1; }
-    if ((union_mask[tbyte] >> tbit) & 1) { free(union_mask); free(d); return 1; }
 
-    int set_groups = 0, set_copies = 0;
-    for (int g = 0; g < ngrp; g++) {
-        uint8_t *m = d + goff[g];
-        if (ggid[g] == gid && !((m[tbyte] >> tbit) & 1)) {
-            m[tbyte] |= (uint8_t)(1 << tbit); set_groups++;
+    // Newer titles (e.g. Onimusha NPWR49248_00) store hash/random bytes in the
+    // 0x700 mask field — any set bit above max_id proves it is not a bitmask.
+    int mask_valid = 1;
+    for (int i = 0; i < nb * 8; i++) {
+        if (((union_mask[i >> 3] >> (i & 7)) & 1) && i >= nbits) {
+            mask_valid = 0; break;
         }
     }
-    // Unknown/unsupported group id → fall back to the first (base) record.
-    if (!set_groups && !((d[goff[0] + tbyte] >> tbit) & 1)) {
-        d[goff[0] + tbyte] |= (uint8_t)(1 << tbit); set_groups++;
+
+    // Locate the 0x800 row first — its flag is the authoritative "already
+    // unlocked" check when the mask field can't be trusted.
+    size_t row_off = 0; int have_row = 0;
+    for (size_t o = 0x800; o + 0x10 + 0x18 <= (size_t)flen; o += 4) {
+        if (!trp_is_rec(d, flen, o, 8, 0x50)) continue;
+        if ((int)trp_u32be(d + o + 0x10) == tid) { row_off = o; have_row = 1; break; }
     }
-    for (size_t o = 0x200; o + (size_t)nb <= (size_t)flen; o += 4) {
-        if (memcmp(d + o, union_mask, nb) != 0) continue;
-        if (!((d[o + tbyte] >> tbit) & 1)) {
-            d[o + tbyte] |= (uint8_t)(1 << tbit); set_copies++;
+
+    int already;
+    if (have_row)        already = (int)(trp_u32be(d + row_off + 0x14) & 1);
+    else if (mask_valid) already = (union_mask[tbyte] >> tbit) & 1;
+    else                 already = 0;
+    if (already) { free(union_mask); free(d); return 1; }
+
+    // Mask writes only when the field is a real bitmask — on hash-format
+    // records a stray bit flip would corrupt the record.
+    int set_groups = 0, set_copies = 0;
+    if (mask_valid) {
+        for (int g = 0; g < ngrp; g++) {
+            uint8_t *m = d + goff[g];
+            if (ggid[g] == gid && !((m[tbyte] >> tbit) & 1)) {
+                m[tbyte] |= (uint8_t)(1 << tbit); set_groups++;
+            }
+        }
+        // Unknown/unsupported group id → fall back to the first (base) record.
+        if (!set_groups && !((d[goff[0] + tbyte] >> tbit) & 1)) {
+            d[goff[0] + tbyte] |= (uint8_t)(1 << tbit); set_groups++;
+        }
+        for (size_t o = 0x200; o + (size_t)nb <= (size_t)flen; o += 4) {
+            if (memcmp(d + o, union_mask, nb) != 0) continue;
+            if (!((d[o + tbyte] >> tbit) & 1)) {
+                d[o + tbyte] |= (uint8_t)(1 << tbit); set_copies++;
+            }
         }
     }
     free(union_mask);
 
-    int have_row = 0;
-    for (size_t o = 0x800; o + 0x10 + 0x18 <= (size_t)flen; o += 4) {
-        if (!trp_is_rec(d, flen, o, 8, 0x50)) continue;
-        if ((int)trp_u32be(d + o + 0x10) != tid) continue;
-        d[o + 0x14] = 0; d[o + 0x15] = 0; d[o + 0x16] = 0; d[o + 0x17] = 0x11;
-        d[o + 0x18] = 0; d[o + 0x19] = 0; d[o + 0x1a] = 0x20; d[o + 0x1b] = 0;
+    if (have_row) {
+        d[row_off + 0x14] = 0; d[row_off + 0x15] = 0; d[row_off + 0x16] = 0; d[row_off + 0x17] = 0x11;
+        d[row_off + 0x18] = 0; d[row_off + 0x19] = 0; d[row_off + 0x1a] = 0x20; d[row_off + 0x1b] = 0;
         uint64_t ts = 62135596800000000ULL + (uint64_t)time(NULL) * 1000000ULL;
         for (int b = 0; b < 8; b++)
-            d[o + 0x20 + b] = (uint8_t)(ts >> (56 - 8 * b));
-        have_row = 1;
-        break;
+            d[row_off + 0x20 + b] = (uint8_t)(ts >> (56 - 8 * b));
     }
 
     // Same safety net as lock: pre-edit .bak, then tmp + rename.
@@ -13503,6 +13834,14 @@ void handle_trophy_unlock(client_session_t *session, const char *arg) {
         uint32_t th = 0;
         char c2[256];
         pid_t gp = trp_find_trophy_proc(&th, c2, sizeof(c2));
+        if (gp <= 0) {
+            // Games that lazy-load (or never link) libSceNpTrophy2 still expose
+            // the UDS path. Probe the eboot process directly so the report
+            // shows which NP libs are actually mapped.
+            pid_t eb = proc_find_name("eboot.bin");
+            if (eb <= 0) eb = proc_find_name("eboot");
+            if (eb > 0) gp = eb;
+        }
         char r2[2048]; int o2 = snprintf(r2, sizeof(r2), "pid=%d%s", (int)gp, c2);
         if (gp > 0 && p[5] == ':') {
             // custom: probe:libname|sym1,sym2,...
@@ -14343,6 +14682,189 @@ void handle_trophy_unlock(client_session_t *session, const char *arg) {
         return;
     }
 
+    // "udst:<id>[:g][:s]" — post the trophy's REAL extraction event (resolved
+    // from the game's stats_extraction.json — e.g. Onimusha's custom
+    // "UnlockTrophy" with $.trophyId == "<n>") WITHOUT the file fallback, so
+    // we can tell whether daemon-side extraction actually awards the trophy.
+    //   :g — borrow the game's own registered ctx from the UDS singleton and
+    //        bind a fresh handle to it (posts under the game's session)
+    //   :s — set the property as STRING instead of int32 (type-mismatch test)
+    if (!strncmp(p, "udst:", 5)) {
+        int want_id = atoi(p + 5);
+        int borrow = strstr(p, ":g") != NULL;
+        int as_str = strstr(p, ":s") != NULL;
+        pid_t me = getpid();
+        uint64_t oa = kernel_get_ucred_authid(me);
+        kernel_set_ucred_authid(me, 0x4800000000010003ULL);
+        char cand[256]; uint32_t th = 0;
+        pid_t pid = trp_find_trophy_proc(&th, cand, sizeof(cand));
+        if (pid <= 0) {
+            kernel_set_ucred_authid(me, oa);
+            send_error(session->sock, "no trophy game running"); return;
+        }
+        uint32_t uh = 0;
+        krpc_dynlib_handle(pid, "libSceNpUniversalDataSystem.sprx", &uh);
+        intptr_t f_cev  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemCreateEvent") : 0;
+        intptr_t f_si3  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemEventPropertyObjectSetInt32") : 0;
+        intptr_t f_si64 = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemEventPropertyObjectSetInt64") : 0;
+        intptr_t f_ss   = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemEventPropertyObjectSetString") : 0;
+        intptr_t f_post = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemPostEvent") : 0;
+        intptr_t f_dev  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemDestroyEvent") : 0;
+        intptr_t f_chnd = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemCreateHandle") : 0;
+        intptr_t f_cctx = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemCreateContext") : 0;
+        intptr_t f_reg  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemRegisterContext") : 0;
+        intptr_t f_dh   = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemDestroyHandle") : 0;
+        intptr_t f_dc   = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemDestroyContext") : 0;
+        char rr[3000];
+        int o = snprintf(rr, sizeof(rr), "pid=%d uh=%x cev=%lx si3=%lx si64=%lx ss=%lx post=%lx",
+                         (int)pid, uh, (long)f_cev, (long)f_si3, (long)f_si64,
+                         (long)f_ss, (long)f_post);
+        if (!uh || !f_cev || !f_post || !f_chnd) {
+            kernel_set_ucred_authid(me, oa); send_error(session->sock, rr); return;
+        }
+        // resolve the plan entry for want_id (statid → event/prop/cond value)
+        trop_ent_t ent; memset(&ent, 0, sizeof(ent));
+        ent.id = want_id; ent.prog = -1; ent.target = 1; ent.statid = -1;
+        ent.gid = 0; ent.evkind = -1; ent.evwide = 0; ent.evval = -1;
+        trop_ent_t *plan = (trop_ent_t *)malloc(256 * sizeof(trop_ent_t));
+        if (plan) {
+            uint8_t *cf = NULL; size_t cfs = 0; char cd[128] = "";
+            if (running_game_tropconf(pid, &cf, &cfs, cd, sizeof(cd)) == 0) {
+                int np = tropconf_parse(cf, cfs, plan, 256);
+                for (int i = 0; i < np; i++)
+                    if (plan[i].id == want_id) { ent = plan[i]; break; }
+            }
+            if (cf) free(cf);
+            free(plan);
+        }
+        uint8_t *xj = NULL, *ej = NULL; size_t xn = 0, ejn = 0;
+        running_game_uds_member(pid, "stats_extraction.json", &xj, &xn);
+        running_game_uds_member(pid, "events_definition.json", &ej, &ejn);
+        if (ent.statid >= 0 && xj) {
+            char ev[64] = "", pr[64] = "";
+            if (udsrule_for_stat(xj, xn, ent.statid, ev, sizeof(ev),
+                                 pr, sizeof(pr), &ent.evval)) {
+                snprintf(ent.evname, sizeof(ent.evname), "%s", ev);
+                snprintf(ent.evprop, sizeof(ent.evprop), "%s", pr);
+                ent.evkind = !strcmp(ev, "_UnlockTrophy") ? 0
+                           : !strcmp(ev, "_UpdateTrophyProgress") ? 1 : 2;
+                ent.evwide = (ej && ent.evprop[0])
+                    ? udsprop_is_wide(ej, ejn, ev, pr) : 0;
+            }
+        }
+        if (xj) free(xj); if (ej) free(ej);
+        o += snprintf(rr + o, sizeof(rr) - o,
+                      " ent{id=%d statid=%d ev='%s' prop='%s' val=%d wide=%d}",
+                      ent.id, ent.statid, ent.evname, ent.evprop,
+                      ent.evval, ent.evwide);
+        rpc_sess_t s;
+        if (rpc_attach(&s, pid, f_cev) != 0 || s.dead) {
+            kernel_set_ucred_authid(me, oa);
+            send_error(session->sock, "attach fail"); return;
+        }
+        int32_t ctx = 0, hnd = 0;
+        if (borrow) {
+            intptr_t ubase = f_post - 0x9c90;   // same derivation as udsb
+            intptr_t singleton = 0;
+            rpc_read(pid, ubase + 0x24088, &singleton, 8);
+            o += snprintf(rr + o, sizeof(rr) - o, " single=%lx", (long)singleton);
+            for (intptr_t sl = singleton + 0x28;
+                 sl <= singleton + 0x160; sl += 8) {
+                intptr_t node = 0;
+                rpc_read(pid, sl, &node, 8);
+                if (!node) continue;
+                int32_t cid = 0; uint8_t act = 0;
+                rpc_read(pid, node + 8, &cid, 4);
+                rpc_read(pid, node + 0x14, &act, 1);
+                if (cid > 0 && act) { ctx = cid; break; }
+            }
+            if (ctx > 0 && !s.dead) {
+                rpc_call(&s, f_chnd, s.scratch + 8, 0, 0, 0, 0, 0);
+                rpc_read(pid, s.scratch + 8, &hnd, 4);
+                if (hnd > 0 && f_reg > 0 && !s.dead)
+                    rpc_call(&s, f_reg, ctx, hnd, 0, 0, 0, 0);
+            }
+        } else {
+            uint32_t uid = 0, ush = 0;
+            if (krpc_dynlib_handle(pid, "libSceUserService.sprx", &ush) == 0 && ush) {
+                intptr_t f_fg = (intptr_t)krpc_dlsym_checked(pid, ush, "sceUserServiceGetForegroundUser");
+                if (f_fg && !s.dead) {
+                    rpc_call(&s, f_fg, s.scratch + 0x40, 0, 0, 0, 0, 0);
+                    rpc_read(pid, s.scratch + 0x40, &uid, 4);
+                }
+            }
+            if (!uid) {
+                DIR *home = opendir("/user/home");
+                if (home) {
+                    struct dirent *he;
+                    while ((he = readdir(home))) {
+                        if (he->d_name[0] == '.') continue;
+                        uid = (uint32_t)strtoul(he->d_name, NULL, 16);
+                        if (uid) break;
+                    }
+                    closedir(home);
+                }
+            }
+            if (f_cctx && !s.dead) {
+                rpc_call(&s, f_cctx, s.scratch, uid, 0, 0, 0, 0);
+                rpc_read(pid, s.scratch, &ctx, 4);
+            }
+            if (!s.dead) {
+                rpc_call(&s, f_chnd, s.scratch + 8, 0, 0, 0, 0, 0);
+                rpc_read(pid, s.scratch + 8, &hnd, 4);
+            }
+            if (ctx > 0 && hnd > 0 && f_reg && !s.dead)
+                rpc_call(&s, f_reg, ctx, hnd, 0, 0, 0, 0);
+        }
+        o += snprintf(rr + o, sizeof(rr) - o, " ctx=%d hnd=%d", ctx, hnd);
+        if (ctx <= 0 || hnd <= 0 || s.dead) {
+            rpc_detach(&s); kernel_set_ucred_authid(me, oa);
+            send_error(session->sock, rr); return;
+        }
+        intptr_t s_ev = s.scratch + 0x100;
+        intptr_t s_pp = s.scratch + 0x180;
+        intptr_t s_vv = s.scratch + 0x1c0;
+        const char *evn = ent.evname[0] ? ent.evname : "_UnlockTrophy";
+        const char *evp = ent.evprop[0] ? ent.evprop : "_trophy_id";
+        rpc_write(pid, s_ev, evn, strlen(evn) + 1);
+        rpc_write(pid, s_pp, evp, strlen(evp) + 1);
+        uint64_t ev = 0, pobj = 0;
+        rpc_call(&s, f_cev, s_ev, 0, s.scratch + 0x10, s.scratch + 0x60, 0, 0);
+        rpc_read(pid, s.scratch + 0x10, &ev, 8);
+        rpc_read(pid, s.scratch + 0x60, &pobj, 8);
+        if (!pobj) pobj = ev;
+        o += snprintf(rr + o, sizeof(rr) - o, " ev=%lx pobj=%lx",
+                      (long)ev, (long)pobj);
+        long r_set = -1;
+        if (ev && !s.dead) {
+            long pv = ent.evval >= 0 ? ent.evval : want_id;
+            if (as_str && f_ss > 0) {
+                char vs[16];
+                snprintf(vs, sizeof(vs), "%03d", (int)pv);
+                rpc_write(pid, s_vv, vs, strlen(vs) + 1);
+                r_set = rpc_call(&s, f_ss, (long)pobj, s_pp, s_vv, 0, 0, 0);
+            } else {
+                intptr_t fset = ent.evwide && f_si64 > 0 ? f_si64 : f_si3;
+                r_set = rpc_call(&s, fset, (long)pobj, s_pp, pv, 0, 0, 0);
+            }
+        }
+        long rp = (ev && !s.dead)
+            ? rpc_call(&s, f_post, ctx, hnd, (long)ev, 0, 0, 0) : -1;
+        if (!s.dead) usleep(400000);
+        if (ev && f_dev > 0 && !s.dead)
+            rpc_call(&s, f_dev, (long)ev, 0, 0, 0, 0, 0);
+        if (hnd > 0 && f_dh > 0 && !s.dead)
+            rpc_call(&s, f_dh, hnd, 0, 0, 0, 0, 0);
+        if (!borrow && ctx > 0 && f_dc > 0 && !s.dead)
+            rpc_call(&s, f_dc, ctx, 0, 0, 0, 0, 0);
+        rpc_detach(&s);
+        kernel_set_ucred_authid(me, oa);
+        o += snprintf(rr + o, sizeof(rr) - o,
+                      " set=%lx post=%lx dead=%d", r_set, rp, s.dead);
+        send_response(session->sock, RESP_DATA, rr, (uint32_t)o);
+        return;
+    }
+
     // "uds:<id|all>[:gid]" — post a real _UnlockTrophy UDS event from inside
     // the game process (the path games use: libSceNpUniversalDataSystem
     // CreateContext/CreateHandle/RegisterContext → CreateEvent("_UnlockTrophy")
@@ -15020,6 +15542,11 @@ void *client_thread(void *arg) {
                     handle_move_file(session, data, data_len);
                 }
                 break;
+            case CMD_CHMOD:
+                if (data) {
+                    handle_chmod(session, data, data_len);
+                }
+                break;
             case CMD_START_UPLOAD:
                 if (data) {
                     handle_start_upload(session, data, data_len);
@@ -15121,7 +15648,7 @@ void *client_thread(void *arg) {
                 }
                 break;
             case CMD_SAVE_UNMOUNT:
-                handle_save_unmount(session);
+                handle_save_unmount(session, (const char *)data);
                 break;
             case CMD_SAVE_MOUNT_STATUS:
                 handle_save_mount_status(session);
@@ -15129,6 +15656,13 @@ void *client_thread(void *arg) {
             case CMD_SAVE_DELETE:
                 if (data) {
                     handle_save_delete(session, (const char *)data);
+                } else {
+                    send_error(session->sock, "No save path provided");
+                }
+                break;
+            case CMD_SAVE_ICON:
+                if (data) {
+                    handle_save_icon(session, (const char *)data);
                 } else {
                     send_error(session->sock, "No save path provided");
                 }

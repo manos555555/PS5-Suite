@@ -1,12 +1,7 @@
-<Window xmlns="https://github.com/avaloniaui"
-        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        x:Class="PS5Upload.GameDetailsWindow"
-        Title="Game Details"
-        Height="720" Width="860"
-        Icon="/ps5_logo.ico"
-        Background="#1E1E1E"
-        WindowStartupLocation="CenterOwner"
-        CanResize="True">
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="PS5Upload.GameDetailsWindow"
+             Background="#1E1E1E">
     <Grid>
         <!-- Cover Art Background -->
         <Image x:Name="BackgroundCoverImage"
@@ -164,4 +159,4 @@
             </StackPanel>
         </Grid>
     </Grid>
-</Window>
+</UserControl>

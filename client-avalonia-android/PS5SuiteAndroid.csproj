@@ -1,0 +1,62 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-android</TargetFramework>
+    <SupportedOSPlatformVersion>23</SupportedOSPlatformVersion>
+    <Nullable>enable</Nullable>
+    <LangVersion>14</LangVersion>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AvaloniaUseCompiledBindingsByDefault>false</AvaloniaUseCompiledBindingsByDefault>
+    <ApplicationId>com.manos.ps5suite</ApplicationId>
+    <ApplicationVersion>14</ApplicationVersion>
+    <ApplicationDisplayVersion>7.6.0</ApplicationDisplayVersion>
+    <ApplicationTitle>PS5 Suite</ApplicationTitle>
+    <AssemblyName>PS5Suite</AssemblyName>
+    <RootNamespace>PS5Upload</RootNamespace>
+    <AndroidPackageFormat>apk</AndroidPackageFormat>
+    <AndroidEnableProfiledAot>false</AndroidEnableProfiledAot>
+    <!-- The UI relies on runtime reflection bindings ({Binding ...} without x:DataType);
+         trimming would strip bound properties and blank out the lists. -->
+    <PublishTrimmed>false</PublishTrimmed>
+    <RunAOTCompilation>false</RunAOTCompilation>
+    <Authors>Manos</Authors>
+    <Description>PS5 Suite - Complete PS5 Management Platform</Description>
+  </PropertyGroup>
+
+  <!-- Reuse the full desktop UI/codebase so the Android app has feature parity -->
+  <ItemGroup>
+    <Compile Include="..\client-avalonia\**\*.cs" Exclude="..\client-avalonia\Program.cs;..\client-avalonia\bin\**;..\client-avalonia\obj\**" />
+    <AvaloniaXaml Include="..\client-avalonia\**\*.axaml" Exclude="..\client-avalonia\bin\**;..\client-avalonia\obj\**" />
+    <AvaloniaResource Include="..\client-avalonia\ps5_logo.png" Link="ps5_logo.png" />
+    <AvaloniaResource Include="..\client-avalonia\ps5_logo.ico" Link="ps5_logo.ico" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Avalonia" Version="12.1.3" />
+    <PackageReference Include="Avalonia.Android" Version="12.1.3" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="12.1.3" />
+    <PackageReference Include="Avalonia.Fonts.Inter" Version="12.1.3" />
+    <PackageReference Include="Avalonia.Controls.DataGrid" Version="12.1.2" />
+    <PackageReference Include="SMBLibrary" Version="1.5.8.1" />
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="10.0.12" />
+    <Reference Include="LibProsperoPkg">
+      <HintPath>..\client-avalonia\libs\LibProsperoPkg.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <AndroidResource Include="Resources\**\*.xml" />
+    <AndroidResource Include="Resources\**\*.png" />
+  </ItemGroup>
+
+  <!-- The signed APK file name derives from ApplicationId (com.manos.ps5suite)
+       but the release asset is PS5Suite.apk — stage a renamed copy in OutDir
+       right before _CalculateAndroidFilesToPublish globs $(OutputPath)*.apk,
+       so it flows into publish\ automatically. -->
+  <Target Name="EmitNamedApk" BeforeTargets="_CalculateAndroidFilesToPublish">
+    <ItemGroup>
+      <_ApkToRename Include="$(OutputPath)*-Signed.apk" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_ApkToRename)" DestinationFiles="$(OutputPath)PS5Suite.apk" />
+  </Target>
+</Project>

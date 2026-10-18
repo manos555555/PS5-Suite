@@ -40,7 +40,7 @@ namespace PS5Upload
             IEnumerable<PS5TrophySet> view = _trophySets;
 
             if (filterUser != null)
-                view = view.Where(s => s.UserId == filterUser);
+                view = view.Where(s => s.UserId == filterUser || s.UserName == filterUser);
 
             if (!string.IsNullOrEmpty(q))
                 view = view.Where(s =>
@@ -113,9 +113,9 @@ namespace PS5Upload
 
                 _trophySets = sets;
 
-                var users = sets.Select(s => s.UserId)
-                    .Where(u => !string.IsNullOrEmpty(u))
-                    .Distinct()
+                var users = sets.Where(s => !string.IsNullOrEmpty(s.UserId))
+                    .GroupBy(s => s.UserId)
+                    .Select(g => g.First().UserName.Length > 0 ? g.First().UserName : g.Key)
                     .OrderBy(u => u)
                     .ToList();
                 await Dispatcher.UIThread.InvokeAsync(() =>
@@ -301,15 +301,28 @@ namespace PS5Upload
             }
 
             int unionPop = 0;
+            bool strayBits = false;
             for (int i = 0; i < nb * 8; i++)
             {
                 if (((unionMask[i >> 3] >> (i & 7)) & 1) == 0) continue;
-                if (i >= nbits) return;          // stray bits → not a mask field here
+                if (i >= nbits) { strayBits = true; break; }
                 unionPop++;
             }
 
             byte[] mask;
-            if (unionPop == 0)
+            if (strayBits)
+            {
+                // Newer titles (e.g. Onimusha NPWR49248_00) keep hash/random
+                // bytes in the group record's mask field — it is NOT an unlock
+                // bitmask there. Fall back to the per-trophy state rows, which
+                // carry the real earned flag at body+0x04.
+                if (rowState.Count == 0) return;
+                mask = new byte[nb];
+                foreach (var kv in rowState)
+                    if (kv.Value.unlocked)
+                        mask[kv.Key >> 3] |= (byte)(1 << (kv.Key & 7));
+            }
+            else if (unionPop == 0)
             {
                 mask = new byte[nb];             // state records exist → truly all locked
             }
@@ -403,10 +416,16 @@ namespace PS5Upload
             if (ok)
             {
                 Log($"🏆 {msg} ({sw.ElapsedMilliseconds} ms)");
-                // The daemon writes TRPTITLE.DAT asynchronously — give it a moment
-                // then refresh so the new state/timestamp is re-read from disk.
-                await Task.Delay(1200);
-                await RefreshTrophiesAsync();
+                // The daemon holds trophy state in memory and flushes
+                // TRPTITLE.DAT lazily (observed ~20-30s after the award). One
+                // early refresh reads the pre-flush file, so re-poll a few
+                // times and let the real state land in the list.
+                foreach (var ms in new[] { 1500, 6000, 15000, 30000 })
+                {
+                    await Task.Delay(ms);
+                    if (!_protocol.IsConnected) break;
+                    await RefreshTrophiesAsync();
+                }
             }
             else
                 Log($"❌ Trophy unlock failed: {msg}");

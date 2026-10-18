@@ -13,8 +13,11 @@ namespace PS5Upload
     /// Lets the user navigate the console filesystem and pick one or more
     /// .pkg files without leaving the Tools tab.
     /// </summary>
-    public partial class PkgPickerWindow : Window
+    public partial class PkgPickerWindow : UserControl, OverlayDialogs.IOverlayClosable
     {
+        /// <summary>Raised when the view wants its host overlay to close.</summary>
+        public event Action? RequestClose;
+
         private readonly PS5Protocol? _protocol;
         private string _currentPath = "/user/data";
         private List<FileEntry> _entries = new();
@@ -44,7 +47,7 @@ namespace PS5Upload
             _protocol = protocol;
             if (!string.IsNullOrWhiteSpace(startPath))
                 _currentPath = startPath.TrimEnd('/');
-            Opened += async (_, _) => await LoadDir(_currentPath);
+            AttachedToVisualTree += async (_, _) => await LoadDir(_currentPath);
         }
 
         private async Task LoadDir(string path)
@@ -124,13 +127,13 @@ namespace PS5Upload
                 return;
             }
             SelectedPaths = sel;
-            Close();
+            RequestClose?.Invoke();
         }
 
         private void Cancel_Click(object? sender, RoutedEventArgs e)
         {
             SelectedPaths = null;
-            Close();
+            RequestClose?.Invoke();
         }
     }
 }

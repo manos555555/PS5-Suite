@@ -291,12 +291,33 @@ namespace PS5Upload
                         Name = entry.Name,
                         IsDirectory = entry.IsDirectory,
                         Size = entry.Size,
+                        Timestamp = entry.Timestamp,
+                        Permissions = entry.Permissions,
                         FullPath = $"{path}/{entry.Name}".Replace("//", "/"),
                         Icon = entry.IsDirectory ? "📁" : "📄"
                     });
                 }
 
-                var sortedItems = items.OrderBy(i => i.IsDirectory ? 0 : 1).ThenBy(i => i.Name, StringComparer.OrdinalIgnoreCase).ToList();
+                // Sort: directories first, then by selected sort mode
+                IOrderedEnumerable<PS5FileItem> sortedItems;
+                switch (_currentSortMode)
+                {
+                    case SortMode.Size:
+                        sortedItems = items.OrderBy(i => i.Name == ".." ? -1 : 0)
+                            .ThenBy(i => i.IsDirectory ? 0 : 1)
+                            .ThenByDescending(i => i.Size);
+                        break;
+                    case SortMode.Date:
+                        sortedItems = items.OrderBy(i => i.Name == ".." ? -1 : 0)
+                            .ThenBy(i => i.IsDirectory ? 0 : 1)
+                            .ThenByDescending(i => i.Timestamp);
+                        break;
+                    default:
+                        sortedItems = items.OrderBy(i => i.Name == ".." ? -1 : 0)
+                            .ThenBy(i => i.IsDirectory ? 0 : 1)
+                            .ThenBy(i => i.Name, StringComparer.OrdinalIgnoreCase);
+                        break;
+                }
 
                 _ps5Files.Clear();
                 foreach (var item in sortedItems) _ps5Files.Add(item);
@@ -879,6 +900,186 @@ namespace PS5Upload
             }
             finally { _isDeleting = false; }
         }
+
+        // ==================== NEW FEATURES ====================
+
+        // Create Folder
+        private async void CreateFolderMenuItem_Click(object? sender, RoutedEventArgs e)
+        {
+            string? folderName = await ShowInputDialogAsync("Create Folder", "Folder name:", "New Folder");
+            if (!string.IsNullOrWhiteSpace(folderName))
+            {
+                string newDirPath = $"{_currentPS5Path}/{folderName.Trim()}".Replace("//", "/");
+                try
+                {
+                    Log($"📁 Creating folder: {newDirPath}");
+                    bool success = await _protocol.CreateDirAsync(newDirPath);
+                    if (success) { Log($"✅ Folder created: {folderName.Trim()}"); await LoadPS5DirectoryAsync(_currentPS5Path); }
+                    else { Log($"❌ Failed to create folder"); await ShowMessageAsync("Failed to create folder", "Error"); }
+                }
+                catch (Exception ex) { Log($"❌ Create folder error: {ex.Message}"); await ShowMessageAsync($"Create folder failed: {ex.Message}", "Error"); }
+            }
+        }
+
+        // Change Permissions (chmod)
+        private async void ChmodMenuItem_Click(object? sender, RoutedEventArgs e)
+        {
+            if (PS5FilesListBox.SelectedItem is PS5FileItem item && item.Name != "..")
+            {
+                int currentMode = 0x1FF; // 0777
+                try
+                {
+                    var info = await _protocol.GetFileInfoAsync(item.FullPath);
+                    if (info != null) currentMode = info.Permissions & 0x1FF;
+                }
+                catch { }
+
+                uint? newMode = await ShowChmodDialogAsync(item.Name, currentMode);
+                if (newMode.HasValue)
+                {
+                    try
+                    {
+                        string octal = Convert.ToString(newMode.Value, 8).PadLeft(4, '0');
+                        Log($"🔐 Changing permissions of {item.Name} to {octal}");
+                        bool success = await _protocol.ChmodAsync(item.FullPath, newMode.Value);
+                        if (success) Log($"✅ Permissions changed: {item.Name} -> {octal} ({ModeToRwx((int)newMode.Value)})");
+                        else { Log($"❌ Failed to change permissions"); await ShowMessageAsync("Failed to change permissions", "Error"); }
+                    }
+                    catch (Exception ex) { Log($"❌ Chmod error: {ex.Message}"); await ShowMessageAsync($"Change permissions failed: {ex.Message}", "Error"); }
+                }
+            }
+        }
+
+        // Properties / Get Info
+        private async void PropertiesMenuItem_Click(object? sender, RoutedEventArgs e)
+        {
+            if (PS5FilesListBox.SelectedItem is PS5FileItem item && item.Name != "..")
+            {
+                try
+                {
+                    Log($"ℹ️ Getting properties of {item.Name}...");
+                    var info = await _protocol.GetFileInfoAsync(item.FullPath);
+                    if (info != null)
+                    {
+                        string props = $"Name: {item.Name}\n" +
+                                       $"Path: {item.FullPath}\n" +
+                                       $"Type: {info.TypeName}\n" +
+                                       $"Size: {info.SizeFormatted} ({info.Size:N0} bytes)\n" +
+                                       $"Permissions: {info.ModeOctal} ({info.ModeString})\n" +
+                                       $"Modified: {info.ModifiedTime:yyyy-MM-dd HH:mm:ss}\n" +
+                                       $"Accessed: {info.AccessTime:yyyy-MM-dd HH:mm:ss}";
+                        await ShowMessageAsync(props, $"Properties - {item.Name}");
+                        Log($"ℹ️ {item.Name}: {info.TypeName}, {info.SizeFormatted}, {info.ModeOctal} ({info.ModeString})");
+                    }
+                    else await ShowMessageAsync("Could not retrieve file properties", "Error");
+                }
+                catch (Exception ex) { Log($"❌ Properties error: {ex.Message}"); await ShowMessageAsync($"Failed to get properties: {ex.Message}", "Error"); }
+            }
+        }
+
+        // Copy Path to Clipboard
+        private async void CopyPathMenuItem_Click(object? sender, RoutedEventArgs e)
+        {
+            string pathToCopy = PS5FilesListBox.SelectedItem is PS5FileItem item ? item.FullPath : _currentPS5Path;
+            try
+            {
+                var cb = TopLevel.GetTopLevel(this)?.Clipboard;
+                if (cb != null)
+                {
+                    var dataItem = new Avalonia.Input.DataTransferItem();
+                    dataItem.Set(Avalonia.Input.DataFormat.Text, pathToCopy);
+                    var data = new Avalonia.Input.DataTransfer();
+                    data.Add(dataItem);
+                    await cb.SetDataAsync(data);
+                    Log($"📋 Copied path: {pathToCopy}");
+                }
+            }
+            catch (Exception ex) { Log($"❌ Clipboard: {ex.Message}"); }
+        }
+
+        // Open Terminal Here
+        private async void OpenTerminalHereMenuItem_Click(object? sender, RoutedEventArgs e)
+        {
+            string targetPath = _currentPS5Path;
+            if (PS5FilesListBox.SelectedItem is PS5FileItem item && item.IsDirectory && item.Name != "..")
+                targetPath = item.FullPath;
+
+            try
+            {
+                if (!_shellActive)
+                {
+                    bool success = await _protocol.OpenShellAsync();
+                    if (success) { _shellActive = true; _shellCurrentDir = "/data"; }
+                    else { await ShowMessageAsync("Failed to open shell session", "Error"); return; }
+                }
+
+                await _protocol.ExecuteShellCommandAsync($"cd {targetPath}");
+                _shellCurrentDir = targetPath;
+                Log($"💻 Terminal opened at: {targetPath}");
+
+                // Navigate to Tools page where Shell tab lives
+                PageTools.IsVisible = true;
+                PageFiles.IsVisible = false;
+                NavTools.IsChecked = true;
+            }
+            catch (Exception ex) { Log($"❌ Open terminal error: {ex.Message}"); await ShowMessageAsync($"Failed to open terminal: {ex.Message}", "Error"); }
+        }
+
+        // Refresh
+        private async void RefreshMenuItem_Click(object? sender, RoutedEventArgs e)
+        {
+            Log($"🔄 Refreshing {_currentPS5Path}...");
+            await LoadPS5DirectoryAsync(_currentPS5Path);
+        }
+
+        // Sort options
+        private async void SortByNameMenuItem_Click(object? sender, RoutedEventArgs e)
+        { _currentSortMode = SortMode.Name; Log("📝 Sort by: Name"); await LoadPS5DirectoryAsync(_currentPS5Path); }
+
+        private async void SortBySizeMenuItem_Click(object? sender, RoutedEventArgs e)
+        { _currentSortMode = SortMode.Size; Log("📏 Sort by: Size"); await LoadPS5DirectoryAsync(_currentPS5Path); }
+
+        private async void SortByDateMenuItem_Click(object? sender, RoutedEventArgs e)
+        { _currentSortMode = SortMode.Date; Log("📅 Sort by: Date"); await LoadPS5DirectoryAsync(_currentPS5Path); }
+
+        // Multi-select Download
+        private async void DownloadSelectedMenuItem_Click(object? sender, RoutedEventArgs e)
+        {
+            var selectedItems = (PS5FilesListBox.SelectedItems ?? Array.Empty<object>()).Cast<PS5FileItem>()
+                .Where(i => !i.IsDirectory && i.Name != "..").ToList();
+
+            if (selectedItems.Count == 0) { await ShowMessageAsync("No files selected (folders are skipped)."); return; }
+
+            var topLevel = TopLevel.GetTopLevel(this);
+            if (topLevel == null) return;
+
+            var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(
+                new FolderPickerOpenOptions { Title = $"Select folder to download {selectedItems.Count} file(s)" });
+            if (folders.Count == 0) return;
+            var destFolder = folders[0].TryGetLocalPath();
+            if (destFolder == null) return;
+
+            Log($"⬇️ Downloading {selectedItems.Count} files to {destFolder}...");
+            int successCount = 0, failCount = 0;
+
+            foreach (var item in selectedItems)
+            {
+                try
+                {
+                    string destPath = Path.Combine(destFolder, item.Name);
+                    Log($"⬇️ Downloading: {item.Name} ({FormatFileSize(item.Size)})");
+                    bool success = await _protocol.DownloadFileAsync(item.FullPath, destPath);
+                    if (success) { Log($"✅ Downloaded: {item.Name}"); successCount++; }
+                    else { Log($"❌ Download failed: {item.Name}"); failCount++; }
+                }
+                catch (Exception ex) { Log($"❌ Download error {item.Name}: {ex.Message}"); failCount++; }
+            }
+
+            Log($"⬇️ Batch download complete: {successCount} succeeded, {failCount} failed");
+            await ShowMessageAsync($"Download complete!\n\n✅ {successCount} downloaded\n❌ {failCount} failed\n\nSaved to: {destFolder}");
+        }
+
+        // ==================== END NEW FEATURES ====================
 
         private async void DownloadMenuItem_Click(object? sender, RoutedEventArgs e)
         {

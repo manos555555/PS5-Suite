@@ -25,23 +25,13 @@ namespace PS5Upload
         {
             if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
             {
-                desktop.MainWindow = new MainWindow();
+                desktop.MainWindow = new DesktopWindow();
             }
             else if (ApplicationLifetime is ISingleViewApplicationLifetime singleView)
             {
-#if ANDROID
-                // On Android there is no real Window host — the single view embeds controls.
-                // Build the MainWindow (for its code-behind + dialog ownership) but host its
-                // content directly in the single view; a TopLevel can't be a child control.
-                var window = new MainWindow();
-                if (window.Content is Avalonia.Controls.Control content)
-                {
-                    window.Content = null;
-                    singleView.MainView = content;
-                }
-#else
+                // Android/iOS single-view lifetime: the shared MainWindow is a
+                // plain UserControl, so it hosts directly without any Window.
                 singleView.MainView = new MainWindow();
-#endif
             }
 
             base.OnFrameworkInitializationCompleted();

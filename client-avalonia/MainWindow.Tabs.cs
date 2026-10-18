@@ -32,18 +32,23 @@ namespace PS5Upload
                 var mounted = await _protocol.GetGameListAsync();
                 var nameByTitle = mounted.ToDictionary(g => g.TitleId, g => g.Name, StringComparer.OrdinalIgnoreCase);
 
+                // sdimg_sce_bu_* are the system's automatic backup twins of
+                // each PS4 save — hidden from the list (the same thing the
+                // console's own save UI does). They stay in _currentSaves.
+                var visible = saves.Where(s => !s.SaveName.StartsWith("sdimg_sce_bu_", StringComparison.Ordinal)).ToList();
+
                 foreach (var save in saves)
                 {
                     save.GameName = nameByTitle.TryGetValue(save.TitleId, out var gn) ? gn : save.TitleId;
-                    if (_iconCache.TryGetValue(save.TitleId, out var cached)) save.Icon = cached;
+                    if (_iconCache.TryGetValue(save.Path, out var cached)) save.Icon = cached;
                 }
 
                 await Dispatcher.UIThread.InvokeAsync(() =>
                 {
-                    SavesListBox.ItemsSource = saves;
-                    SaveCountText.Text = $" ({saves.Count} saves)";
+                    SavesListBox.ItemsSource = visible;
+                    SaveCountText.Text = $" ({visible.Count} saves)";
                 });
-                Log($"💾 Found {saves.Count} save images");
+                Log($"💾 Found {saves.Count} save images ({visible.Count} shown)");
 
                 // Fetch icons in background on a dedicated connection so bulk
                 // icon downloads never serialize behind the main command lock.
@@ -53,12 +58,17 @@ namespace PS5Upload
                     {
                         using var iconProto = new PS5Protocol();
                         if (!await iconProto.ConnectAsync(_ps5IpAddress)) return;
-                        foreach (var s2 in saves)
+                        foreach (var s2 in visible)
                         {
                             if (s2.Icon != null) continue;
                             try
                             {
-                                var bytes = await iconProto.GetGameIconAsync(s2.TitleId);
+                                // Per-save icon first (savedata_meta), then
+                                // the game's title icon as fallback. Older
+                                // payloads don't know SAVE_ICON — it just
+                                // returns null and the fallback kicks in.
+                                var bytes = await iconProto.GetSaveIconAsync(s2.Path)
+                                         ?? await iconProto.GetGameIconAsync(s2.TitleId);
                                 if (bytes != null && bytes.Length > 0)
                                 {
                                     await Dispatcher.UIThread.InvokeAsync(() =>
@@ -67,7 +77,7 @@ namespace PS5Upload
                                         {
                                             using var ms = new MemoryStream(bytes);
                                             var bmp = new Bitmap(ms);
-                                            _iconCache[s2.TitleId] = bmp;
+                                            _iconCache[s2.Path] = bmp;
                                             s2.Icon = bmp;
                                         }
                                         catch { }
@@ -119,6 +129,8 @@ namespace PS5Upload
         private async Task MountSaveAsync(PS5SaveFile save)
         {
             if (!_protocol.IsConnected) { await ShowMessageAsync("Not connected to PS5.", "Error"); return; }
+            if (!await ShowConfirmAsync($"Mount {save.SaveName} ({save.TitleId}) decrypted?\n\nMake sure the game is fully closed — mounting a save while its game has it open can corrupt it.", "Save Manager"))
+                return;
             Log($"🔓 Mounting {save.SaveName} ({save.TitleId}, {(save.IsPs4 ? "PS4" : "PS5")})...");
             var (ok, msg) = await _protocol.SaveMountAsync(save.Path, m => Log($"   {m}"));
             if (ok)
@@ -143,18 +155,20 @@ namespace PS5Upload
                 return;
             }
             var win = new SaveBrowserWindow(_protocol, PS5Protocol.SaveMountPoint, _ps5IpAddress);
-            bool unmount = await win.ShowDialog<bool>(this);
-            if (unmount) await UnmountSaveAsync();
+            await OverlayDialogs.ShowAsync(win, stretch: true);
+            if (win.UnmountRequested) await UnmountSaveAsync();
             else await UpdateSaveMountStatusAsync();
         }
 
         private async void UnmountSaveButton_Click(object? sender, RoutedEventArgs e) => await UnmountSaveAsync();
 
-        private async Task UnmountSaveAsync()
+        private async Task UnmountSaveAsync(bool discard = false)
         {
             if (!_protocol.IsConnected) return;
-            Log("🔒 Unmounting save (writing changes back to the image)...");
-            var (ok, msg) = await _protocol.SaveUnmountAsync(m => Log($"   {m}"));
+            Log(discard
+                ? "🔒 Unmounting save (discarding staged copy — original untouched)..."
+                : "🔒 Unmounting save (writing changes back to the image)...");
+            var (ok, msg) = await _protocol.SaveUnmountAsync(m => Log($"   {m}"), discard);
             if (ok) Log($"✅ Save unmounted. {msg}");
             else
             {
@@ -167,7 +181,7 @@ namespace PS5Upload
         // ---------- Backup / Restore (decrypted via mount) ----------
 
         // Ensures the given save image is mounted. Returns (ok, weMountedIt).
-        private async Task<(bool ok, bool weMounted)> EnsureSaveMountedAsync(PS5SaveFile save)
+        private async Task<(bool ok, bool weMounted)> EnsureSaveMountedAsync(PS5SaveFile save, bool skipWarn = false)
         {
             var (mounted, src, _, _) = await _protocol.SaveMountStatusAsync();
             if (mounted && src == save.Path) return (true, false);
@@ -176,6 +190,8 @@ namespace PS5Upload
                 await ShowMessageAsync($"A different save is mounted:\n{src}\n\nUnmount it first.", "Save Manager");
                 return (false, false);
             }
+            if (!skipWarn && !await ShowConfirmAsync($"Mount {save.SaveName} ({save.TitleId}) for transfer?\n\nMake sure the game is fully closed — mounting a save while its game has it open can corrupt it.", "Save Manager"))
+                return (false, false);
             Log($"🔓 Mounting {save.SaveName} for transfer...");
             var (ok, msg) = await _protocol.SaveMountAsync(save.Path, m => Log($"   {m}"));
             if (!ok)
@@ -229,7 +245,9 @@ namespace PS5Upload
             }
             catch (Exception ex) { Log($"❌ Backup failed: {ex.Message}"); await ShowMessageAsync($"Backup failed:\n{ex.Message}", "Error"); }
 
-            if (weMounted) await UnmountSaveAsync();
+            // Read-only session — discard the staged image instead of writing
+            // it back over the sealed original.
+            if (weMounted) await UnmountSaveAsync(discard: true);
         }
 
         // Raw backup: copy the encrypted image file (+ .bin companion) as-is.
@@ -255,7 +273,12 @@ namespace PS5Upload
                 bool ok = await _protocol.DownloadFileAsync(save.Path, local);
                 if (save.HasBinKey)
                 {
-                    try { await _protocol.DownloadFileAsync(save.Path + ".bin", local + ".bin"); } catch { }
+                    // The sealed-key companion drops the `sdimg_` prefix:
+                    // sdimg_X pairs with X.bin beside it.
+                    int slash = save.Path.LastIndexOf('/');
+                    string dir = slash >= 0 ? save.Path.Substring(0, slash + 1) : "";
+                    string name = save.SaveName.StartsWith("sdimg_") ? save.SaveName.Substring(6) : save.SaveName;
+                    try { await _protocol.DownloadFileAsync(dir + name + ".bin", local + ".bin"); } catch { }
                 }
                 Log(ok ? $"✅ Raw image saved: {local}" : "❌ Raw download failed");
                 if (ok) await ShowMessageAsync($"Raw save image saved:\n{local}\n\n(encrypted - usable for same-console restore)", "Backup Complete");
@@ -290,10 +313,10 @@ namespace PS5Upload
             var backupFolder = folders[0].TryGetLocalPath();
             if (backupFolder == null || !Directory.Exists(backupFolder)) { await ShowMessageAsync("Invalid folder.", "Error"); return; }
 
-            if (!await ShowConfirmAsync($"Restore decrypted files into save {save.SaveName} ({save.TitleId})?\n\nFrom: {backupFolder}\n\nThe save will be mounted, files overwritten, then written back."))
+            if (!await ShowConfirmAsync($"Restore decrypted files into save {save.SaveName} ({save.TitleId})?\n\nFrom: {backupFolder}\n\nThe save will be mounted, files overwritten, then written back.\nMake sure the game is fully closed."))
                 return;
 
-            var (mountedOk, weMounted) = await EnsureSaveMountedAsync(save);
+            var (mountedOk, weMounted) = await EnsureSaveMountedAsync(save, skipWarn: true);
             if (!mountedOk) return;
 
             string mnt = PS5Protocol.SaveMountPoint;
@@ -480,7 +503,7 @@ namespace PS5Upload
             var details = await _protocol.GetGameDetailsAsync(game.TitleId);
             if (details == null) { await ShowMessageAsync("Failed to fetch game details.", "Error"); return; }
             var dlg = new GameDetailsWindow(game, details, _protocol);
-            await dlg.ShowDialog(this);
+            await OverlayDialogs.ShowAsync(dlg, stretch: true);
         }
 
         private async void UnmountGameMenuItem_Click(object? sender, RoutedEventArgs e)

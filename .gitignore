@@ -4,6 +4,7 @@ obj/
 dist/
 publish/
 publish_*/
+publish*/
 out/
 *.user
 *.suo
@@ -43,7 +44,7 @@ lib-prospero-pkg/test-stream/realbuild-out/
 # legacy clients (WPF v5/v6, old MAUI app, empty stub template, old Android WIP)
 client/
 mobile/
-client-avalonia-android/
+client-android/
 
 # dev scratch: homebrew pkg builds, extracted binaries — not for the repo
 homebrew/

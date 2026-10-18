@@ -1,11 +1,7 @@
-<Window xmlns="https://github.com/avaloniaui"
-        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        x:Class="PS5Upload.PkgPickerWindow"
-        Title="Select PKG on PS5"
-        Width="640" Height="480"
-        Icon="/ps5_logo.ico"
-        WindowStartupLocation="CenterOwner"
-        Background="#1E1E1E">
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="PS5Upload.PkgPickerWindow"
+             Background="#1E1E1E">
     <Grid Margin="15">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
@@ -61,4 +57,4 @@
                     Background="#3E3E42"/>
         </StackPanel>
     </Grid>
-</Window>
+</UserControl>

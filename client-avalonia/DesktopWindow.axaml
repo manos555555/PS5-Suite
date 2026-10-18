@@ -1,0 +1,11 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:PS5Upload"
+        x:Class="PS5Upload.DesktopWindow"
+        Title="PS5 Suite - By Manos" Height="900" Width="1600"
+        WindowStartupLocation="CenterScreen"
+        WindowState="Maximized"
+        Icon="/ps5_logo.ico"
+        Background="#1E1E1E">
+    <local:MainWindow/>
+</Window>

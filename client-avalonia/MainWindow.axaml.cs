@@ -18,7 +18,7 @@ using System.Text;
 
 namespace PS5Upload
 {
-    public partial class MainWindow : Window
+    public partial class MainWindow : UserControl
     {
         private PS5Protocol _protocol = new PS5Protocol();
         private ObservableCollection<LocalFileItem> _localFiles = new();
@@ -122,6 +122,10 @@ namespace PS5Upload
         private DuplicateAction _duplicateAction = DuplicateAction.Ask;
 
         // Shell Terminal
+        // Sort mode for PS5 file list
+        private enum SortMode { Name, Size, Date }
+        private SortMode _currentSortMode = SortMode.Name;
+
         private bool _shellActive = false;
         private ObservableCollection<string> _shellOutput = new();
         private string _shellCurrentDir = "/data";
@@ -186,84 +190,319 @@ namespace PS5Upload
             if (_autoSendPayload && !string.IsNullOrEmpty(_payloadPath) && !string.IsNullOrEmpty(_ps5IpAddress))
                 _ = AutoSendPayloadOnStartup();
 
-            Opened += (_, _) => _ = CheckForAppUpdateAsync();
+            // The shared overlay layer hosts every modal dialog (real windows
+            // don't exist on Android's single-view lifetime).
+            OverlayDialogs.LayerHost = DialogLayerHost;
+            OverlayDialogs.OverlayRoot = DialogOverlay;
+
+            AttachedToVisualTree += (_, _) => _ = CheckForAppUpdateAsync();
+
+            // Responsive layout: collapse the sidebar into a hamburger drawer
+            // and stack the file panes when the view is too narrow (phones).
+            EffectiveViewportChanged += (_, e) => ApplyResponsiveLayout(e.EffectiveViewport.Width < 700);
         }
+
+        // ============================================================
+        // RESPONSIVE LAYOUT (mobile drawer + single-pane file view)
+        // ============================================================
+        private bool _isMobileLayout;
+        private bool _mobileDrawerOpen;
+        private bool _mobileShowingPs5;
+
+        private void ApplyResponsiveLayout(bool mobile)
+        {
+            if (mobile == _isMobileLayout) return;
+            _isMobileLayout = mobile;
+            CloseMobileDrawer();
+            SidebarPane.IsVisible = !mobile;
+            RootLayoutGrid.ColumnDefinitions[0].Width = mobile ? new GridLength(0) : new GridLength(220);
+            MobileTopBar.IsVisible = mobile;
+            MobileFilesTabBar.IsVisible = mobile;
+            ContentArea.Margin = new Thickness(mobile ? 4 : 15);
+
+            if (mobile)
+            {
+                // Single-pane file browser — tab bar switches Local/PS5
+                Grid.SetColumn(Ps5FilesPane, 0);
+                Grid.SetColumnSpan(LocalFilesPane, 3);
+                Grid.SetColumnSpan(Ps5FilesPane, 3);
+                ShowMobileFilePane(_mobileShowingPs5);
+
+                // Storage info: 3 columns -> vertical stack
+                StorageInfoGrid.ColumnDefinitions.Clear();
+                StorageInfoGrid.RowDefinitions.Clear();
+                StorageInfoGrid.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Star));
+                for (int i = 0; i < StorageInfoGrid.Children.Count; i++)
+                {
+                    StorageInfoGrid.RowDefinitions.Add(new RowDefinition(GridLength.Auto));
+                    Grid.SetRow(StorageInfoGrid.Children[i], i);
+                    Grid.SetColumn(StorageInfoGrid.Children[i], 0);
+                }
+            }
+            else
+            {
+                Grid.SetColumn(Ps5FilesPane, 2);
+                Grid.SetColumnSpan(LocalFilesPane, 1);
+                Grid.SetColumnSpan(Ps5FilesPane, 1);
+                LocalFilesPane.IsVisible = true;
+                Ps5FilesPane.IsVisible = true;
+
+                StorageInfoGrid.RowDefinitions.Clear();
+                StorageInfoGrid.ColumnDefinitions.Clear();
+                for (int i = 0; i < StorageInfoGrid.Children.Count; i++)
+                {
+                    StorageInfoGrid.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Star));
+                    Grid.SetColumn(StorageInfoGrid.Children[i], i);
+                    Grid.SetRow(StorageInfoGrid.Children[i], 0);
+                }
+            }
+        }
+
+        private void OpenMobileDrawer()
+        {
+            if (!_isMobileLayout) return;
+            _mobileDrawerOpen = true;
+            SidebarPane.Width = 280;
+            SidebarPane.HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Left;
+            SidebarPane.ZIndex = 900;
+            SidebarPane.IsVisible = true;
+            MobileNavDimmer.IsVisible = true;
+        }
+
+        private void CloseMobileDrawer()
+        {
+            _mobileDrawerOpen = false;
+            MobileNavDimmer.IsVisible = false;
+            SidebarPane.ZIndex = 0;
+            SidebarPane.Width = double.NaN;
+            SidebarPane.HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Stretch;
+            if (_isMobileLayout) SidebarPane.IsVisible = false;
+        }
+
+        private void ShowMobileFilePane(bool ps5)
+        {
+            _mobileShowingPs5 = ps5;
+            LocalFilesPane.IsVisible = !ps5;
+            Ps5FilesPane.IsVisible = ps5;
+            MobileLocalTab.Background = ps5
+                ? new SolidColorBrush(Color.FromRgb(0x3E, 0x3E, 0x42))
+                : new SolidColorBrush(Color.FromRgb(0x00, 0x7A, 0xCC));
+            MobilePs5Tab.Background = ps5
+                ? new SolidColorBrush(Color.FromRgb(0x00, 0x7A, 0xCC))
+                : new SolidColorBrush(Color.FromRgb(0x3E, 0x3E, 0x42));
+        }
+
+        private void MobileMenuButton_Click(object? sender, RoutedEventArgs e)
+        {
+            if (_mobileDrawerOpen) CloseMobileDrawer(); else OpenMobileDrawer();
+        }
+
+        private void MobileNavDimmer_Tapped(object? sender, RoutedEventArgs e) => CloseMobileDrawer();
+
+        private void MobileLocalTab_Click(object? sender, RoutedEventArgs e) => ShowMobileFilePane(false);
+        private void MobilePs5Tab_Click(object? sender, RoutedEventArgs e) => ShowMobileFilePane(true);
 
         // ============================================================
         // HELPER DIALOGS
         // ============================================================
         private async Task ShowMessageAsync(string message, string title = "Info")
         {
-            var dlg = new Window
+            await OverlayDialogs.ShowAsync(close =>
             {
-                Title = title, Width = 450, Height = 200,
-                WindowStartupLocation = WindowStartupLocation.CenterOwner,
-                Background = new SolidColorBrush(Color.FromRgb(30, 30, 30))
-            };
-            var panel = new StackPanel { Margin = new Thickness(20) };
-            panel.Children.Add(new TextBlock { Text = message, Foreground = Brushes.White, TextWrapping = Avalonia.Media.TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 20) });
-            var btn = new Button { Content = "OK", HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Center, Width = 80 };
-            btn.Click += (s, ev) => dlg.Close();
-            panel.Children.Add(btn);
-            dlg.Content = panel;
-            await dlg.ShowDialog(this);
+                var panel = new StackPanel();
+                panel.Children.Add(new TextBlock { Text = title, FontSize = 17, FontWeight = FontWeight.SemiBold, Foreground = Brushes.White, Margin = new Thickness(0, 0, 0, 15) });
+                panel.Children.Add(new TextBlock { Text = message, Foreground = Brushes.White, TextWrapping = Avalonia.Media.TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 20) });
+                var btn = new Button { Content = "OK", HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Center, Width = 80 };
+                btn.Click += (s, ev) => close();
+                panel.Children.Add(btn);
+                return panel;
+            }, maxWidth: 450);
         }
 
         private async Task<bool> ShowConfirmAsync(string message, string title = "Confirm")
         {
             bool result = false;
-            var dlg = new Window
+            await OverlayDialogs.ShowAsync(close =>
             {
-                Title = title, Width = 450, Height = 200,
-                WindowStartupLocation = WindowStartupLocation.CenterOwner,
-                Background = new SolidColorBrush(Color.FromRgb(30, 30, 30))
-            };
-            var panel = new StackPanel { Margin = new Thickness(20) };
-            panel.Children.Add(new TextBlock { Text = message, Foreground = Brushes.White, TextWrapping = Avalonia.Media.TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 20) });
-            var btnPanel = new StackPanel { Orientation = Avalonia.Layout.Orientation.Horizontal, HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Center, Spacing = 10 };
-            var yesBtn = new Button { Content = "Yes", Width = 80 };
-            var noBtn = new Button { Content = "No", Width = 80 };
-            yesBtn.Click += (s, ev) => { result = true; dlg.Close(); };
-            noBtn.Click += (s, ev) => { result = false; dlg.Close(); };
-            btnPanel.Children.Add(yesBtn);
-            btnPanel.Children.Add(noBtn);
-            panel.Children.Add(btnPanel);
-            dlg.Content = panel;
-            await dlg.ShowDialog(this);
+                var panel = new StackPanel();
+                panel.Children.Add(new TextBlock { Text = title, FontSize = 17, FontWeight = FontWeight.SemiBold, Foreground = Brushes.White, Margin = new Thickness(0, 0, 0, 15) });
+                panel.Children.Add(new TextBlock { Text = message, Foreground = Brushes.White, TextWrapping = Avalonia.Media.TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 20) });
+                var btnPanel = new StackPanel { Orientation = Avalonia.Layout.Orientation.Horizontal, HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Center, Spacing = 10 };
+                var yesBtn = new Button { Content = "Yes", Width = 80 };
+                var noBtn = new Button { Content = "No", Width = 80 };
+                yesBtn.Click += (s, ev) => { result = true; close(); };
+                noBtn.Click += (s, ev) => { result = false; close(); };
+                btnPanel.Children.Add(yesBtn);
+                btnPanel.Children.Add(noBtn);
+                panel.Children.Add(btnPanel);
+                return panel;
+            }, maxWidth: 450);
             return result;
         }
 
         private async Task<string?> ShowInputDialogAsync(string title, string label, string defaultValue = "")
         {
             string? result = null;
-            var dlg = new Window
+            await OverlayDialogs.ShowAsync(close =>
             {
-                Title = title, Width = 400, Height = 180,
-                WindowStartupLocation = WindowStartupLocation.CenterOwner,
-                Background = new SolidColorBrush(Color.FromRgb(30, 30, 30))
-            };
-            var grid = new Grid { Margin = new Thickness(20) };
-            grid.RowDefinitions.Add(new RowDefinition(GridLength.Auto));
-            grid.RowDefinitions.Add(new RowDefinition(GridLength.Auto));
-            grid.RowDefinitions.Add(new RowDefinition(GridLength.Auto));
-            var lbl = new TextBlock { Text = label, Foreground = Brushes.White, Margin = new Thickness(0, 0, 0, 10) };
-            Grid.SetRow(lbl, 0);
-            var textBox = new TextBox { Text = defaultValue, Margin = new Thickness(0, 0, 0, 15) };
-            Grid.SetRow(textBox, 1);
-            var buttonPanel = new StackPanel { Orientation = Avalonia.Layout.Orientation.Horizontal, HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Right, Spacing = 10 };
-            Grid.SetRow(buttonPanel, 2);
-            var okButton = new Button { Content = "OK", Width = 80 };
-            okButton.Click += (s, args) => { result = textBox.Text; dlg.Close(); };
-            var cancelButton = new Button { Content = "Cancel", Width = 80 };
-            cancelButton.Click += (s, args) => { dlg.Close(); };
-            buttonPanel.Children.Add(okButton);
-            buttonPanel.Children.Add(cancelButton);
-            grid.Children.Add(lbl);
-            grid.Children.Add(textBox);
-            grid.Children.Add(buttonPanel);
-            dlg.Content = grid;
-            await dlg.ShowDialog(this);
+                var grid = new Grid();
+                grid.RowDefinitions.Add(new RowDefinition(GridLength.Auto));
+                grid.RowDefinitions.Add(new RowDefinition(GridLength.Auto));
+                grid.RowDefinitions.Add(new RowDefinition(GridLength.Auto));
+                grid.RowDefinitions.Add(new RowDefinition(GridLength.Auto));
+                var header = new TextBlock { Text = title, FontSize = 17, FontWeight = FontWeight.SemiBold, Foreground = Brushes.White, Margin = new Thickness(0, 0, 0, 15) };
+                Grid.SetRow(header, 0);
+                var lbl = new TextBlock { Text = label, Foreground = Brushes.White, Margin = new Thickness(0, 0, 0, 10) };
+                Grid.SetRow(lbl, 1);
+                var textBox = new TextBox { Text = defaultValue, Margin = new Thickness(0, 0, 0, 15) };
+                Grid.SetRow(textBox, 2);
+                var buttonPanel = new StackPanel { Orientation = Avalonia.Layout.Orientation.Horizontal, HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Right, Spacing = 10 };
+                Grid.SetRow(buttonPanel, 3);
+                var okButton = new Button { Content = "OK", Width = 80 };
+                okButton.Click += (s, args) => { result = textBox.Text; close(); };
+                var cancelButton = new Button { Content = "Cancel", Width = 80 };
+                cancelButton.Click += (s, args) => { close(); };
+                buttonPanel.Children.Add(okButton);
+                buttonPanel.Children.Add(cancelButton);
+                grid.Children.Add(header);
+                grid.Children.Add(lbl);
+                grid.Children.Add(textBox);
+                grid.Children.Add(buttonPanel);
+                return grid;
+            }, maxWidth: 400);
             return result;
+        }
+
+        /// Chmod dialog: r/w/x checkboxes for Owner/Group/Others synced with
+        /// an octal input. Returns the chosen mode, or null when cancelled.
+        private async Task<uint?> ShowChmodDialogAsync(string fileName, int currentMode)
+        {
+            uint? result = null;
+            bool syncing = false;
+            Action? close = null;
+
+            var ownerR = new CheckBox { IsChecked = (currentMode & 0x100) != 0 };
+            var ownerW = new CheckBox { IsChecked = (currentMode & 0x80) != 0 };
+            var ownerX = new CheckBox { IsChecked = (currentMode & 0x40) != 0 };
+            var groupR = new CheckBox { IsChecked = (currentMode & 0x20) != 0 };
+            var groupW = new CheckBox { IsChecked = (currentMode & 0x10) != 0 };
+            var groupX = new CheckBox { IsChecked = (currentMode & 0x08) != 0 };
+            var otherR = new CheckBox { IsChecked = (currentMode & 0x04) != 0 };
+            var otherW = new CheckBox { IsChecked = (currentMode & 0x02) != 0 };
+            var otherX = new CheckBox { IsChecked = (currentMode & 0x01) != 0 };
+
+            var boxes = new[] { ownerR, ownerW, ownerX, groupR, groupW, groupX, otherR, otherW, otherX };
+            int[] bits = { 0x100, 0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01 };
+
+            var octalBox = new TextBox { Width = 100, Text = Convert.ToString(currentMode & 0x1FF, 8).PadLeft(4, '0'), Margin = new Thickness(10, 0, 0, 0) };
+
+            void SyncFromBoxes()
+            {
+                if (syncing) return;
+                syncing = true;
+                int mode = 0;
+                for (int i = 0; i < boxes.Length; i++)
+                    if (boxes[i].IsChecked == true) mode |= bits[i];
+                octalBox.Text = Convert.ToString(mode, 8).PadLeft(4, '0');
+                syncing = false;
+            }
+
+            void SyncFromOctal()
+            {
+                if (syncing) return;
+                try
+                {
+                    int mode = Convert.ToInt32(octalBox.Text?.Trim() ?? "", 8) & 0x1FF;
+                    syncing = true;
+                    for (int i = 0; i < boxes.Length; i++)
+                        boxes[i].IsChecked = (mode & bits[i]) != 0;
+                    syncing = false;
+                }
+                catch { }
+            }
+
+            foreach (var b in boxes)
+                b.IsCheckedChanged += (s, ev) => SyncFromBoxes();
+            octalBox.PropertyChanged += (s, ev) =>
+            {
+                if (ev.Property == TextBox.TextProperty) SyncFromOctal();
+            };
+
+            var root = new StackPanel { Margin = new Thickness(10), Spacing = 12 };
+            root.Children.Add(new TextBlock
+            {
+                Text = $"Change Permissions - {fileName}",
+                FontSize = 17, FontWeight = FontWeight.SemiBold,
+                Foreground = Brushes.White
+            });
+            root.Children.Add(new TextBlock
+            {
+                Text = $"Current: {Convert.ToString(currentMode & 0x1FF, 8).PadLeft(4, '0')}  ({ModeToRwx(currentMode)})",
+                Foreground = new SolidColorBrush(Color.FromRgb(153, 153, 153)),
+                Margin = new Thickness(0, 0, 0, 5)
+            });
+
+            var permGrid = new Grid { ColumnSpacing = 15, RowSpacing = 8 };
+            permGrid.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Auto));
+            permGrid.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Auto));
+            permGrid.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Auto));
+            permGrid.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Auto));
+            permGrid.RowDefinitions.Add(new RowDefinition(GridLength.Auto));
+            permGrid.RowDefinitions.Add(new RowDefinition(GridLength.Auto));
+            permGrid.RowDefinitions.Add(new RowDefinition(GridLength.Auto));
+            permGrid.RowDefinitions.Add(new RowDefinition(GridLength.Auto));
+
+            string[] headers = { "", "Read", "Write", "Execute" };
+            for (int c = 0; c < 4; c++)
+            {
+                var h = new TextBlock { Text = headers[c], Foreground = Brushes.White, FontWeight = FontWeight.SemiBold };
+                Grid.SetRow(h, 0); Grid.SetColumn(h, c);
+                permGrid.Children.Add(h);
+            }
+
+            string[] rowLabels = { "Owner", "Group", "Others" };
+            CheckBox[][] rows = { new[] { ownerR, ownerW, ownerX }, new[] { groupR, groupW, groupX }, new[] { otherR, otherW, otherX } };
+            for (int r = 0; r < 3; r++)
+            {
+                var lbl = new TextBlock { Text = rowLabels[r], Foreground = Brushes.White, VerticalAlignment = Avalonia.Layout.VerticalAlignment.Center };
+                Grid.SetRow(lbl, r + 1); Grid.SetColumn(lbl, 0);
+                permGrid.Children.Add(lbl);
+                for (int c = 0; c < 3; c++)
+                {
+                    rows[r][c].VerticalAlignment = Avalonia.Layout.VerticalAlignment.Center;
+                    Grid.SetRow(rows[r][c], r + 1); Grid.SetColumn(rows[r][c], c + 1);
+                    permGrid.Children.Add(rows[r][c]);
+                }
+            }
+            root.Children.Add(permGrid);
+
+            var octalPanel = new StackPanel { Orientation = Avalonia.Layout.Orientation.Horizontal, Margin = new Thickness(0, 10, 0, 0) };
+            octalPanel.Children.Add(new TextBlock { Text = "Octal:", Foreground = Brushes.White, VerticalAlignment = Avalonia.Layout.VerticalAlignment.Center });
+            octalPanel.Children.Add(octalBox);
+            root.Children.Add(octalPanel);
+
+            var btnPanel = new StackPanel { Orientation = Avalonia.Layout.Orientation.Horizontal, HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Right, Spacing = 10, Margin = new Thickness(0, 15, 0, 0) };
+            var applyBtn = new Button { Content = "Apply", Width = 90 };
+            var cancelBtn = new Button { Content = "Cancel", Width = 90 };
+            applyBtn.Click += (s, ev) =>
+            {
+                try { result = (uint)Convert.ToInt32(octalBox.Text?.Trim() ?? "0", 8) & 0x1FFu; }
+                catch { result = null; }
+                close?.Invoke();
+            };
+            cancelBtn.Click += (s, ev) => close?.Invoke();
+            btnPanel.Children.Add(applyBtn);
+            btnPanel.Children.Add(cancelBtn);
+            root.Children.Add(btnPanel);
+
+            await OverlayDialogs.ShowAsync(c => { close = c; return root; }, maxWidth: 460);
+            return result;
+        }
+
+        private static string ModeToRwx(int mode)
+        {
+            string[] perms = { "---", "--x", "-w-", "-wx", "r--", "r-x", "rw-", "rwx" };
+            return perms[(mode >> 6) & 7] + perms[(mode >> 3) & 7] + perms[mode & 7];
         }
 
         /// NAS connect dialog: UNC path + optional credentials + LAN discovery
@@ -272,13 +511,8 @@ namespace PS5Upload
         private async Task<(string path, string user, string pass, bool remember)?> ShowNasDialogAsync()
         {
             (string, string, string, bool)? result = null;
-            var dlg = new Window
-            {
-                Title = "Add NAS / Network Share", Width = 440, Height = 510,
-                WindowStartupLocation = WindowStartupLocation.CenterOwner,
-                Background = new SolidColorBrush(Color.FromRgb(30, 30, 30))
-            };
-            var panel = new StackPanel { Margin = new Thickness(20), Spacing = 6 };
+            Action? close = null;
+            var panel = new StackPanel { Margin = new Thickness(5), Spacing = 6 };
             var pathBox = new TextBox { Text = "\\\\NAS\\share\\folder", Margin = new Thickness(0, 0, 0, 8) };
 
             // --- Discovery row ---
@@ -345,16 +579,22 @@ namespace PS5Upload
             });
 
             var btnPanel = new StackPanel { Orientation = Avalonia.Layout.Orientation.Horizontal, HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Right, Spacing = 10 };
-            var okBtn = new Button { Content = "Connect", Width = 90, IsDefault = true };
-            okBtn.Click += (s, ev) => { result = (pathBox.Text ?? "", userBox.Text ?? "", passBox.Text ?? "", rememberBox.IsChecked == true); dlg.Close(); };
-            var cancelBtn = new Button { Content = "Cancel", Width = 90, IsCancel = true };
-            cancelBtn.Click += (s, ev) => dlg.Close();
+            var okBtn = new Button { Content = "Connect", Width = 90 };
+            okBtn.Click += (s, ev) => { result = (pathBox.Text ?? "", userBox.Text ?? "", passBox.Text ?? "", rememberBox.IsChecked == true); close?.Invoke(); };
+            var cancelBtn = new Button { Content = "Cancel", Width = 90 };
+            cancelBtn.Click += (s, ev) => close?.Invoke();
             btnPanel.Children.Add(okBtn);
             btnPanel.Children.Add(cancelBtn);
             panel.Children.Add(btnPanel);
 
-            dlg.Content = panel;
-            await dlg.ShowDialog(this);
+            await OverlayDialogs.ShowAsync(c =>
+            {
+                close = c;
+                var wrap = new StackPanel();
+                wrap.Children.Add(new TextBlock { Text = "Add NAS / Network Share", FontSize = 17, FontWeight = FontWeight.SemiBold, Foreground = Brushes.White, Margin = new Thickness(0, 0, 0, 12) });
+                wrap.Children.Add(panel);
+                return wrap;
+            }, maxWidth: 440);
             return result;
         }
 
@@ -364,14 +604,10 @@ namespace PS5Upload
         private async Task<NasManager.SavedConnection?> ShowNasPickerAsync()
         {
             NasManager.SavedConnection? result = null;
-            var dlg = new Window
-            {
-                Title = "NAS Connections", Width = 460, Height = 330,
-                WindowStartupLocation = WindowStartupLocation.CenterOwner,
-                Background = new SolidColorBrush(Color.FromRgb(30, 30, 30))
-            };
-            var panel = new StackPanel { Margin = new Thickness(15), Spacing = 8 };
+            Action? close = null;
+            var panel = new StackPanel { Margin = new Thickness(5), Spacing = 8 };
 
+            panel.Children.Add(new TextBlock { Text = "NAS Connections", FontSize = 17, FontWeight = FontWeight.SemiBold, Foreground = Brushes.White, Margin = new Thickness(0, 0, 0, 10) });
             panel.Children.Add(new TextBlock { Text = "Saved connections:", Foreground = Brushes.White, Margin = new Thickness(0, 0, 0, 4) });
             var list = new ListBox
             {
@@ -383,13 +619,13 @@ namespace PS5Upload
             panel.Children.Add(list);
 
             var btnPanel = new StackPanel { Orientation = Avalonia.Layout.Orientation.Horizontal, HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Center, Spacing = 10 };
-            var connBtn = new Button { Content = "🔌 Connect", Width = 100, IsDefault = true };
+            var connBtn = new Button { Content = "🔌 Connect", Width = 100 };
             var newBtn = new Button { Content = "➕ New…", Width = 90 };
             var delBtn = new Button { Content = "🗑️ Delete", Width = 90 };
-            var cancelBtn = new Button { Content = "Cancel", Width = 90, IsCancel = true };
+            var cancelBtn = new Button { Content = "Cancel", Width = 90 };
 
-            connBtn.Click += (s, ev) => { if (list.SelectedIndex >= 0 && list.SelectedIndex < _nasSaved.Count) result = _nasSaved[list.SelectedIndex]; dlg.Close(); };
-            newBtn.Click += (s, ev) => { result = _nasNewSentinel; dlg.Close(); };
+            connBtn.Click += (s, ev) => { if (list.SelectedIndex >= 0 && list.SelectedIndex < _nasSaved.Count) result = _nasSaved[list.SelectedIndex]; close?.Invoke(); };
+            newBtn.Click += (s, ev) => { result = _nasNewSentinel; close?.Invoke(); };
             delBtn.Click += (s, ev) =>
             {
                 if (list.SelectedIndex >= 0 && list.SelectedIndex < _nasSaved.Count)
@@ -397,21 +633,21 @@ namespace PS5Upload
                     _nasSaved.RemoveAt(list.SelectedIndex);
                     SaveNasConnections();
                     list.ItemsSource = new ObservableCollection<string>(_nasSaved.Select(c => c.Display));
-                    if (_nasSaved.Count == 0) { result = _nasNewSentinel; dlg.Close(); }
+                    if (_nasSaved.Count == 0) { result = _nasNewSentinel; close?.Invoke(); }
                 }
             };
-            cancelBtn.Click += (s, ev) => dlg.Close();
+            cancelBtn.Click += (s, ev) => close?.Invoke();
 
             // Double-click a saved entry = Connect
-            list.DoubleTapped += (s, ev) => { if (list.SelectedIndex >= 0 && list.SelectedIndex < _nasSaved.Count) { result = _nasSaved[list.SelectedIndex]; dlg.Close(); } };
+            list.DoubleTapped += (s, ev) => { if (list.SelectedIndex >= 0 && list.SelectedIndex < _nasSaved.Count) { result = _nasSaved[list.SelectedIndex]; close?.Invoke(); } };
 
             btnPanel.Children.Add(connBtn);
             btnPanel.Children.Add(newBtn);
             btnPanel.Children.Add(delBtn);
             btnPanel.Children.Add(cancelBtn);
             panel.Children.Add(btnPanel);
-            dlg.Content = panel;
-            await dlg.ShowDialog(this);
+
+            await OverlayDialogs.ShowAsync(c => { close = c; return panel; }, maxWidth: 460);
             return result;
         }
 
@@ -420,6 +656,8 @@ namespace PS5Upload
         // ============================================================
         private void NavButton_Click(object? sender, RoutedEventArgs e)
         {
+            CloseMobileDrawer();
+
             // Hide all pages
             PageFiles.IsVisible = false;
             PageGames.IsVisible = false;
@@ -565,7 +803,10 @@ namespace PS5Upload
         public string Icon { get; set; } = "";
         public bool IsDirectory { get; set; }
         public long Size { get; set; }
-        public string SizeFormatted => IsDirectory ? "" : FileUtils.FormatFileSize(Size);
+        public DateTime Timestamp { get; set; }
+        public int Permissions { get; set; } = -1;
+        public string SizeFormatted => IsDirectory ? "Folder" : FileUtils.FormatFileSize(Size);
+        public string PermissionsText => Permissions < 0 ? "" : Convert.ToString(Permissions, 8).PadLeft(4, '0');
     }
 
     public static class FileUtils

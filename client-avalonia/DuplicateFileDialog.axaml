@@ -1,12 +1,7 @@
-<Window xmlns="https://github.com/avaloniaui"
-        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        x:Class="PS5Upload.DuplicateFileDialog"
-        Title="Duplicate File Found"
-        Width="500" Height="280"
-        Icon="/ps5_logo.ico"
-        WindowStartupLocation="CenterOwner"
-        Background="#1E1E1E"
-        CanResize="False">
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="PS5Upload.DuplicateFileDialog"
+             Background="#1E1E1E">
     <Grid Margin="20">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
@@ -37,4 +32,4 @@
             <Button Content="Skip All" Width="90" Click="SkipAllButton_Click"/>
         </StackPanel>
     </Grid>
-</Window>
+</UserControl>

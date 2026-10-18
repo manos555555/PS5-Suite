@@ -1163,7 +1163,7 @@ namespace PS5Upload
 
             // Modal PS5 file picker inside the Tools tab — no navigation away.
             var picker = new PkgPickerWindow(_protocol, "/user/data");
-            await picker.ShowDialog(this);
+            await OverlayDialogs.ShowAsync(picker, stretch: true);
             if (picker.SelectedPaths is { Count: > 0 } paths)
             {
                 PkgPathTextBox.Text = string.Join(";", paths);

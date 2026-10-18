@@ -1,10 +1,7 @@
-<Window xmlns="https://github.com/avaloniaui"
-        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        x:Class="PS5Upload.SaveBrowserWindow"
-        Title="Mounted Save — Decrypted Contents"
-        Width="780" Height="560"
-        Background="#1E1E1E"
-        WindowStartupLocation="CenterOwner">
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="PS5Upload.SaveBrowserWindow"
+             Background="#1E1E1E">
 
     <Grid Margin="12">
         <Grid.RowDefinitions>
@@ -61,4 +58,4 @@
             </StackPanel>
         </Grid>
     </Grid>
-</Window>
+</UserControl>

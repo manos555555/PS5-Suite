@@ -1,10 +1,14 @@
+using System;
 using Avalonia.Controls;
 using Avalonia.Interactivity;
 
 namespace PS5Upload
 {
-    public partial class DuplicateFileDialog : Window
+    public partial class DuplicateFileDialog : UserControl, OverlayDialogs.IOverlayClosable
     {
+        /// <summary>Raised when the view wants its host overlay to close.</summary>
+        public event Action? RequestClose;
+
         public enum FileAction { Replace, Skip, ReplaceAll, SkipAll }
         public FileAction UserAction { get; private set; } = FileAction.Skip;
 
@@ -23,25 +27,25 @@ namespace PS5Upload
         private void ReplaceButton_Click(object? sender, RoutedEventArgs e)
         {
             UserAction = FileAction.Replace;
-            Close();
+            RequestClose?.Invoke();
         }
 
         private void SkipButton_Click(object? sender, RoutedEventArgs e)
         {
             UserAction = FileAction.Skip;
-            Close();
+            RequestClose?.Invoke();
         }
 
         private void ReplaceAllButton_Click(object? sender, RoutedEventArgs e)
         {
             UserAction = FileAction.ReplaceAll;
-            Close();
+            RequestClose?.Invoke();
         }
 
         private void SkipAllButton_Click(object? sender, RoutedEventArgs e)
         {
             UserAction = FileAction.SkipAll;
-            Close();
+            RequestClose?.Invoke();
         }
     }
 }

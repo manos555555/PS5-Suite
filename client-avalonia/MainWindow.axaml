@@ -1,13 +1,9 @@
-<Window xmlns="https://github.com/avaloniaui"
-        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        x:Class="PS5Upload.MainWindow"
-        Title="PS5 Suite - By Manos" Height="900" Width="1600"
-        WindowStartupLocation="CenterScreen"
-        WindowState="Maximized"
-        Icon="/ps5_logo.ico"
-        Background="#1E1E1E">
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="PS5Upload.MainWindow"
+             Background="#1E1E1E">
 
-    <Window.Styles>
+    <UserControl.Styles>
         <Style Selector="Button">
             <Setter Property="Background" Value="#007ACC"/>
             <Setter Property="Foreground" Value="White"/>
@@ -72,16 +68,16 @@
             <Setter Property="Background" Value="#007ACC"/>
             <Setter Property="Foreground" Value="White"/>
         </Style>
-    </Window.Styles>
+    </UserControl.Styles>
 
-    <Grid>
+    <Grid x:Name="RootLayoutGrid">
         <Grid.ColumnDefinitions>
             <ColumnDefinition Width="220"/>
             <ColumnDefinition Width="*"/>
         </Grid.ColumnDefinitions>
 
         <!-- Left Sidebar -->
-        <Border Grid.Column="0" Background="#252526" BorderBrush="#3E3E42" BorderThickness="0,0,1,0">
+        <Border Grid.Column="0" x:Name="SidebarPane" Background="#252526" BorderBrush="#3E3E42" BorderThickness="0,0,1,0">
             <Grid>
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto"/>
@@ -196,12 +192,21 @@
         <!-- Main Content Area -->
         <Grid Grid.Column="1">
             <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
                 <RowDefinition Height="*"/>
                 <RowDefinition Height="Auto"/>
             </Grid.RowDefinitions>
 
+            <!-- Mobile top bar (hamburger) — only in narrow layout -->
+            <Border Grid.Row="0" x:Name="MobileTopBar" IsVisible="False" Background="#252526" Padding="10,6">
+                <StackPanel Orientation="Horizontal">
+                    <Button Content="☰" Click="MobileMenuButton_Click" Padding="12,4" Margin="0,12,0,0" FontSize="16"/>
+                    <TextBlock Text="PS5 Suite" FontSize="18" FontWeight="Bold" Foreground="#007ACC" VerticalAlignment="Center"/>
+                </StackPanel>
+            </Border>
+
             <!-- Content Pages -->
-            <Grid Grid.Row="0" x:Name="ContentArea" Margin="15">
+            <Grid Grid.Row="1" x:Name="ContentArea" Margin="15">
                 
                 <!-- PAGE 1: File Transfer -->
                 <Grid x:Name="PageFiles" IsVisible="True">
@@ -214,7 +219,7 @@
 
                     <!-- Storage Info Bar -->
                     <Border Grid.Row="0" Background="#252526" BorderBrush="#3E3E42" BorderThickness="1" CornerRadius="4" Padding="15" Margin="0,0,0,15" x:Name="StorageInfoPanel" IsVisible="False">
-                        <Grid>
+                        <Grid x:Name="StorageInfoGrid">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*"/>
                                 <ColumnDefinition Width="*"/>
@@ -266,6 +271,18 @@
 
                     <!-- File Browser -->
                     <Grid Grid.Row="2">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="*"/>
+                        </Grid.RowDefinitions>
+
+                        <!-- Local/PS5 tab switcher — narrow layout only -->
+                        <WrapPanel x:Name="MobileFilesTabBar" Grid.Row="0" IsVisible="False" HorizontalAlignment="Center" Margin="0,0,0,8">
+                            <Button x:Name="MobileLocalTab" Content="📁 Local Files" Click="MobileLocalTab_Click" Padding="12,6" Margin="0,0,8,0" Background="#007ACC"/>
+                            <Button x:Name="MobilePs5Tab" Content="🎮 PS5 Files" Click="MobilePs5Tab_Click" Padding="12,6"/>
+                        </WrapPanel>
+
+                        <Grid Grid.Row="1">
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="*"/>
                             <ColumnDefinition Width="15"/>
@@ -273,7 +290,7 @@
                         </Grid.ColumnDefinitions>
 
                         <!-- Local Files -->
-                        <Border Grid.Column="0" Background="#252526" BorderBrush="#3E3E42" BorderThickness="1" CornerRadius="4">
+                        <Border x:Name="LocalFilesPane" Grid.Column="0" Background="#252526" BorderBrush="#3E3E42" BorderThickness="1" CornerRadius="4">
                             <Grid>
                                 <Grid.RowDefinitions>
                                     <RowDefinition Height="Auto"/>
@@ -312,7 +329,7 @@
                         </Border>
 
                         <!-- PS5 Files -->
-                        <Border Grid.Column="2" Background="#252526" BorderBrush="#3E3E42" BorderThickness="1" CornerRadius="4">
+                        <Border x:Name="Ps5FilesPane" Grid.Column="2" Background="#252526" BorderBrush="#3E3E42" BorderThickness="1" CornerRadius="4">
                             <Grid>
                                 <Grid.RowDefinitions>
                                     <RowDefinition Height="Auto"/>
@@ -341,13 +358,30 @@
                                     <ListBox.ContextMenu>
                                         <ContextMenu>
                                             <MenuItem Header="⬇️ Download" Click="DownloadMenuItem_Click"/>
+                                            <MenuItem Header="⬇️ Download Selected" Click="DownloadSelectedMenuItem_Click"/>
+                                            <Separator/>
+                                            <MenuItem Header="📁 Create Folder" Click="CreateFolderMenuItem_Click"/>
                                             <Separator/>
                                             <MenuItem Header="📝 Rename" Click="RenameMenuItem_Click"/>
                                             <MenuItem Header="📋 Copy" Click="CopyMenuItem_Click"/>
                                             <MenuItem Header="✂️ Move" Click="MoveMenuItem_Click"/>
                                             <Separator/>
+                                            <MenuItem Header="🔐 Change Permissions" Click="ChmodMenuItem_Click"/>
+                                            <MenuItem Header="ℹ️ Properties" Click="PropertiesMenuItem_Click"/>
+                                            <Separator/>
+                                            <MenuItem Header="📋 Copy Path" Click="CopyPathMenuItem_Click"/>
+                                            <MenuItem Header="💻 Open Terminal Here" Click="OpenTerminalHereMenuItem_Click"/>
+                                            <Separator/>
                                             <MenuItem Header="🗑️ Delete" Click="DeleteMenuItem_Click"/>
                                             <MenuItem Header="🗑️ Delete Selected" Click="DeleteSelectedMenuItem_Click"/>
+                                            <Separator/>
+                                            <MenuItem Header="🔄 Refresh" Click="RefreshMenuItem_Click"/>
+                                            <Separator/>
+                                            <MenuItem Header="Sort By">
+                                                <MenuItem Header="📝 Name" Click="SortByNameMenuItem_Click"/>
+                                                <MenuItem Header="📏 Size" Click="SortBySizeMenuItem_Click"/>
+                                                <MenuItem Header="📅 Date" Click="SortByDateMenuItem_Click"/>
+                                            </MenuItem>
                                         </ContextMenu>
                                     </ListBox.ContextMenu>
                                     <ListBox.ItemTemplate>
@@ -356,7 +390,10 @@
                                                 <TextBlock Text="{Binding Icon}" FontSize="16" Margin="0,0,10,0"/>
                                                 <StackPanel>
                                                     <TextBlock Text="{Binding Name}" FontWeight="SemiBold"/>
-                                                    <TextBlock Text="{Binding SizeFormatted}" FontSize="11" Foreground="#999999"/>
+                                                    <StackPanel Orientation="Horizontal">
+                                                        <TextBlock Text="{Binding SizeFormatted}" FontSize="11" Foreground="#999999"/>
+                                                        <TextBlock Text="{Binding PermissionsText}" FontSize="11" Foreground="#6A9955" Margin="8,0,0,0"/>
+                                                    </StackPanel>
                                                 </StackPanel>
                                             </StackPanel>
                                         </DataTemplate>
@@ -364,13 +401,14 @@
                                 </ListBox>
                             </Grid>
                         </Border>
+                        </Grid>
                     </Grid>
 
                     <!-- Action Buttons (anchored bottom-right of the file page) -->
-                    <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
+                    <WrapPanel Grid.Row="3" HorizontalAlignment="Right" Margin="0,12,0,0">
                         <Button x:Name="UploadButton" Content="📤 Upload" Click="UploadButton_Click" Height="45" Width="140" FontSize="14" FontWeight="SemiBold" Background="#007ACC" IsEnabled="False" Margin="0,0,10,0"/>
                         <Button x:Name="MountGamesButton" Content="🎮 Mount Games" Click="MountGamesButton_Click" Height="45" Width="160" FontSize="14" FontWeight="SemiBold" Background="#28A745" IsEnabled="False"/>
-                    </StackPanel>
+                    </WrapPanel>
                 </Grid>
 
                 <!-- PAGE 2: Games -->
@@ -1614,7 +1652,7 @@
             </Grid>
 
             <!-- Bottom Progress Bar (visible during uploads) -->
-            <Border Grid.Row="1" Background="#252526" BorderBrush="#3E3E42" BorderThickness="1" CornerRadius="4" Padding="15" Margin="15,0,15,15" x:Name="ProgressPanel" IsVisible="False">
+            <Border Grid.Row="2" Background="#252526" BorderBrush="#3E3E42" BorderThickness="1" CornerRadius="4" Padding="15" Margin="15,0,15,15" x:Name="ProgressPanel" IsVisible="False">
                 <Grid>
                     <Grid.RowDefinitions>
                         <RowDefinition Height="Auto"/>
@@ -1649,5 +1687,15 @@
             </Border>
         </Grid>
 
+        <!-- Tap-to-close dimmer behind the mobile nav drawer -->
+        <Panel x:Name="MobileNavDimmer" Grid.ColumnSpan="2" Background="#80000000" IsVisible="False" ZIndex="800" Tapped="MobileNavDimmer_Tapped"/>
+
+        <!-- Cross-platform modal overlay (dialogs render as cards here; the
+             single-view Android host has no real windows to ShowDialog on) -->
+        <Grid x:Name="DialogOverlay" Grid.ColumnSpan="2" IsVisible="False" ZIndex="1000">
+            <Panel Background="#80000000"/>
+            <Panel x:Name="DialogLayerHost"/>
+        </Grid>
+
     </Grid>
-</Window>
+</UserControl>

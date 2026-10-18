@@ -11,8 +11,11 @@ using Avalonia.Threading;
 
 namespace PS5Upload
 {
-    public partial class GameDetailsWindow : Window
+    public partial class GameDetailsWindow : UserControl, OverlayDialogs.IOverlayClosable
     {
+        /// <summary>Raised when the view wants its host overlay to close.</summary>
+        public event Action? RequestClose;
+
         private readonly PS5MountedGame _game;
         private readonly PS5Protocol? _protocol;
         private readonly string _paramJsonRaw;
@@ -313,6 +316,6 @@ namespace PS5Upload
             return sb.ToString();
         }
 
-        private void CloseButton_Click(object? sender, RoutedEventArgs e) => Close();
+        private void CloseButton_Click(object? sender, RoutedEventArgs e) => RequestClose?.Invoke();
     }
 }
