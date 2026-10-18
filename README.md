@@ -54,6 +54,7 @@ All-in-one management suite for jailbroken PS5 consoles. One app — on **Window
 - **Save mount/unmount hardening** — correct save-manager authid, atomic staged-image write-back (temp file + size check + rename), and a discard-unmount mode for read-only backups so a backup can never modify the original.
 - **Post-unlock refresh** — the trophy list re-polls until the daemon flushes the new state to disk, so the count updates by itself.
 - **Android packaging** — the APK ships directly as `PS5Suite.apk`, and `publish.ps1` auto-detects a Java 17+ JDK (Android Studio JBR first), so builds no longer break on machines whose `JAVA_HOME` points at an old JDK.
+- **Power-sensor buffer overflow fixed** — `sceKernelGetSocPowerConsumption` fills a 0x70-byte block (8 power rails of `{mW, mV, mA}` + aux words) but was being handed a shared 4-byte slot, overflowing ~108 bytes into adjacent statics on every sensor poll. It now gets a dedicated 128-byte buffer, and **SoC power reports the sum of all 8 rails** (the total other tools show) instead of the GPU rail only. Reported by [@Marice](https://github.com/Marice) in [#13](https://github.com/manos555555/PS5-Suite/issues/13) — thank you!
 - Payload + client bumped together — the v7.6.0 client requires the v7.6.0 `ps5_suite_server.elf`.
 
 ### ✨ New in v7.5.0
