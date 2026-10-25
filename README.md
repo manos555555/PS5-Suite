@@ -1,4 +1,4 @@
-# 🎮 PS5 Suite v7.6.0 — Complete PS5 Management Platform
+# 🎮 PS5 Suite v7.7.0 — Complete PS5 Management Platform
 
 **By Manos**
 
@@ -44,6 +44,16 @@ All-in-one management suite for jailbroken PS5 consoles. One app — on **Window
 | `PS5Suite-macOS-ARM64.zip` | Apple Silicon (M1/M2/M3/M4) — same steps |
 | `PS5Suite.apk` | **Android** — signed APK, full feature parity with desktop |
 | `ps5_suite_server.elf` | **Required** on-console server component |
+
+### ✨ New in v7.7.0
+
+- **Trophy unlock pipeline reworked (payload)** — NID-first symbol resolution covers NID-only exports; events now post as game-generated (`GENERATED_BY_CODEGEN`) on a fresh per-post handle; the NP callback pump (`sceNpCheckCallback`) is invoked after every post so the daemon drains the event queue; the borrowed-context path mints and binds a fresh handle via `RegisterContext` when no live game handle exists; destroying the context triggers the daemon's journal flush so the award actually lands. A new direct-award path drives `sceNpTrophy2SystemDebugUnlockTrophy`/`LockTrophy` — the daemon's own debug op on the game's registered pair.
+- **Trophy timestamps now show local time** — unlock timestamps from `TRPTITLE.DAT` are stored in UTC; the client now converts them to local time before display, so you see the actual time you earned the trophy, not the UTC offset.
+- **Download: per-session buffer (data corruption fix)** — the static shared 16 MB download buffer was replaced with a per-session `dl_buf` in the payload, eliminating a race condition that could corrupt file data when multiple clients download in parallel.
+- **Download: 8-connection parallel folder downloads** — folder downloads now use 8 parallel connections with `SemaphoreSlim` throttling instead of sequential one-file-at-a-time.
+- **Download: double-buffered I/O with ArrayPool** — file downloads overlap network reads with disk writes using two alternating buffers rented from `ArrayPool<byte>`, cutting allocation waste and improving throughput on fast LANs.
+- **Removed dead `ParallelUploader` class** — unreachable upload code that always fell back to single-connection was removed.
+- **Known limitation:** a small number of games drive their trophies through a **custom protocol** instead of the standard pipelines — trophy unlocking for those titles is not supported yet and will be addressed in a future release.
 
 ### ✨ New in v7.6.0
 
@@ -109,6 +119,7 @@ Two side-by-side panes: your PC on the left, the PS5 on the right.
 
 **Transfer engine**
 - **📤 Upload** — parallel chunked transfers; ~**280 MB/s over Ethernet** on fast LANs (2.5GbE), saturates gigabit wired links easily. Wi-Fi will be significantly slower — use a wired connection on both PC and PS5 for full speed.
+- **⬇️ Download** — folder downloads run on **8 parallel connections** and file transfers use double-buffered I/O (network read overlaps disk write) for maximum throughput.
 - Duplicate files on the PS5 trigger a dialog: skip / overwrite / rename.
 - Live progress bar with per-file %, overall speed (MB/s) and ETA. **⏹ STOP** cancels cleanly.
 - **🎮 Mount Games** — mounts uploaded game dumps so they appear in the PS5's game list.
@@ -144,11 +155,13 @@ Two side-by-side panes: your PC on the left, the PS5 on the right.
 ### 🏆 TROPHIES
 
 - Lists every trophy set on the console (per game) with real data parsed from TRPTITLE.DAT — names, descriptions, grades (bronze/silver/gold/platinum), icons, hidden status and earned timestamps.
-- **🔓 Unlock** — awards a trophy live through the running game's own trophy pipeline (the matching title must be running — the app tells you if it isn't). Works on both legacy `libSceNpTrophy2` titles and newer UDS-driven games: each trophy's real unlock event is resolved dynamically from the game's `stats_extraction.json`, and the console's daemon performs the award — real notification, real state file.
+- **🔓 Unlock** — awards a trophy live through the running game's own trophy pipeline (the matching title must be running — the app tells you if it isn't). Works on both legacy `libSceNpTrophy2` titles and newer UDS-driven games: each trophy's real unlock event is resolved dynamically from the game's `stats_extraction.json`, and the console's daemon performs the award — real notification, real state file. A direct-award path through the daemon's own debug op (`sceNpTrophy2SystemDebugUnlockTrophy`) is also available.
 - **🔒 Lock** — re-locks a trophy by rewriting the set's unlock bitmasks in place (group masks, row flags and timestamps cleared) — as if it was never earned.
 - Search/filter across sets, live refresh after every change.
 
 > ⚠️ **Warning:** unlocking many trophies with unrealistically short/identical timestamps can look suspicious if the console ever syncs to PSN. **I take no responsibility for any ban on your account or console** — use this feature offline and at your own risk.
+>
+> ⚠️ **Known limitation:** a small number of games drive their trophies through a **custom protocol** rather than the standard pipelines — trophy unlocking for those titles is not supported yet and will be addressed in a future release.
 
 ---
 

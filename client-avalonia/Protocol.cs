@@ -2327,45 +2327,72 @@ namespace PS5Upload
                 await ReadExactAsync(sizeBytes, 8);
                 long fileSize = BitConverter.ToInt64(sizeBytes, 0);
                 
-                // Now read raw file data directly from socket
+                // Double-buffered download: overlap network reads with disk writes
                 using var fs = new FileStream(localPath, FileMode.Create, FileAccess.Write, FileShare.None, BufferSize);
-                
-                byte[] buffer = new byte[BufferSize];
-                long totalReceived = 0;
-                var startTime = DateTime.Now;
-                
-                while (totalReceived < fileSize)
+
+                byte[] bufA = ArrayPool<byte>.Shared.Rent(BufferSize);
+                byte[] bufB = ArrayPool<byte>.Shared.Rent(BufferSize);
+                try
                 {
-                    if (cancellationToken.IsCancellationRequested) return false;
-                    
+                    long totalReceived = 0;
+                    var startTime = DateTime.Now;
+                    int activeBuffer = 0;
+
                     int toRead = (int)Math.Min(BufferSize, fileSize - totalReceived);
-                    int received = await _stream!.ReadAsync(buffer, 0, toRead, cancellationToken);
-                    
-                    if (received == 0) break;
-                    
-                    await fs.WriteAsync(buffer, 0, received, cancellationToken);
-                    totalReceived += received;
-                    
-                    // Report progress every 5MB or at completion
-                    if (totalReceived % (5 * 1024 * 1024) < BufferSize || totalReceived == fileSize)
+                    int received = await _stream!.ReadAsync(bufA, 0, toRead, cancellationToken);
+
+                    while (received > 0 && totalReceived < fileSize)
                     {
-                        var elapsed = DateTime.Now - startTime;
-                        double speed = elapsed.TotalSeconds > 0 ? totalReceived / elapsed.TotalSeconds : 0;
-                        
-                        progress?.Report(new UploadProgress
+                        if (cancellationToken.IsCancellationRequested) return false;
+
+                        byte[] writeBuf = activeBuffer == 0 ? bufA : bufB;
+                        byte[] readBuf = activeBuffer == 0 ? bufB : bufA;
+                        int writeLen = received;
+
+                        long afterWrite = totalReceived + writeLen;
+                        long remaining = fileSize - afterWrite;
+
+                        Task writeTask = fs.WriteAsync(writeBuf, 0, writeLen, cancellationToken);
+                        Task<int>? readTask = null;
+                        if (remaining > 0)
                         {
-                            BytesSent = totalReceived,
-                            TotalBytes = fileSize,
-                            SpeedBytesPerSecond = speed,
-                            AverageSpeedBytesPerSecond = speed,
-                            ElapsedTime = elapsed,
-                            EstimatedTimeRemaining = speed > 0 ? TimeSpan.FromSeconds((fileSize - totalReceived) / speed) : TimeSpan.Zero,
-                            CurrentFileName = Path.GetFileName(localPath)
-                        });
+                            int nextRead = (int)Math.Min(BufferSize, remaining);
+                            readTask = _stream.ReadAsync(readBuf, 0, nextRead, cancellationToken);
+                        }
+
+                        await writeTask;
+                        totalReceived = afterWrite;
+
+                        if (totalReceived % (5 * 1024 * 1024) < BufferSize || totalReceived == fileSize)
+                        {
+                            var elapsed = DateTime.Now - startTime;
+                            double speed = elapsed.TotalSeconds > 0 ? totalReceived / elapsed.TotalSeconds : 0;
+
+                            progress?.Report(new UploadProgress
+                            {
+                                BytesSent = totalReceived,
+                                TotalBytes = fileSize,
+                                SpeedBytesPerSecond = speed,
+                                AverageSpeedBytesPerSecond = speed,
+                                ElapsedTime = elapsed,
+                                EstimatedTimeRemaining = speed > 0 ? TimeSpan.FromSeconds((fileSize - totalReceived) / speed) : TimeSpan.Zero,
+                                CurrentFileName = Path.GetFileName(localPath)
+                            });
+                        }
+
+                        if (readTask == null) break;
+                        received = await readTask;
+                        if (received == 0) break;
+                        activeBuffer = 1 - activeBuffer;
                     }
+
+                    return totalReceived == fileSize;
                 }
-                
-                return totalReceived == fileSize;
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(bufA);
+                    ArrayPool<byte>.Shared.Return(bufB);
+                }
             }
             catch (Exception ex)
             {
@@ -2594,16 +2621,18 @@ namespace PS5Upload
         // by a RESP_OK with the summary text.
         public async Task<string?> MountGamesAsync(CancellationToken cancellationToken = default, Action<string>? onProgress = null)
         {
-            await _commandLock.WaitAsync();
+            await _commandLock.WaitAsync(cancellationToken);
             try
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 await SendCommandAsync(Command.MountGames);
-                
+
                 // Read the streamed progress lines, then the final OK/ERROR.
                 while (true)
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
                     var (response, data) = await ReceiveResponseAsync();
-                    
+
                     if (response == Response.Progress)
                     {
                         string msg = Encoding.UTF8.GetString(data).TrimEnd('\0');
@@ -2624,6 +2653,7 @@ namespace PS5Upload
                     }
                 }
             }
+            catch (OperationCanceledException) { return null; }
             catch (Exception ex)
             {
                 Console.WriteLine($"[ERROR] MountGamesAsync: {ex.Message}");
@@ -2974,54 +3004,68 @@ namespace PS5Upload
                 TotalBytes = totalBytes
             });
 
-            // Phase 3: Download each file using a dedicated connection per file
+            // Phase 3: Download files in parallel using multiple connections
+            const int MaxParallelDownloads = 8;
             int filesDownloaded = 0;
             int filesFailed = 0;
             long bytesDownloaded = 0;
 
-            for (int i = 0; i < filesToDownload.Count; i++)
+            var semaphore = new SemaphoreSlim(MaxParallelDownloads);
+            var fileQueue = new Queue<(string remotePath, string localPath, long size)>(filesToDownload);
+            var tasks = new System.Collections.Generic.List<Task>();
+
+            while (fileQueue.Count > 0)
             {
                 if (cancellationToken.IsCancellationRequested) break;
 
-                var (rPath, lPath, fSize) = filesToDownload[i];
-                string fileName = Path.GetFileName(lPath);
+                await semaphore.WaitAsync(cancellationToken);
+                if (fileQueue.Count == 0) { semaphore.Release(); break; }
+                var (rPath, lPath, fSize) = fileQueue.Dequeue();
 
-                progress?.Report(new DownloadFolderProgress
+                tasks.Add(Task.Run(async () =>
                 {
-                    Phase = "Downloading",
-                    CurrentFile = fileName,
-                    FilesCompleted = filesDownloaded,
-                    TotalFiles = filesToDownload.Count,
-                    BytesDownloaded = bytesDownloaded,
-                    TotalBytes = totalBytes
-                });
-
-                // Use a fresh connection for each file to avoid protocol desync
-                using var dlProto = new PS5Protocol();
-                if (!await dlProto.ConnectAsync(ps5IpAddress))
-                {
-                    filesFailed++;
-                    continue;
-                }
-
-                try
-                {
-                    bool ok = await dlProto.DownloadFileAsync(rPath, lPath, null, cancellationToken);
-                    if (ok)
+                    try
                     {
-                        filesDownloaded++;
-                        bytesDownloaded += fSize;
+                        using var dlProto = new PS5Protocol();
+                        if (!await dlProto.ConnectAsync(ps5IpAddress))
+                        {
+                            Interlocked.Increment(ref filesFailed);
+                            return;
+                        }
+
+                        bool ok = await dlProto.DownloadFileAsync(rPath, lPath, null, cancellationToken);
+                        if (ok)
+                        {
+                            Interlocked.Increment(ref filesDownloaded);
+                            Interlocked.Add(ref bytesDownloaded, fSize);
+                        }
+                        else
+                        {
+                            Interlocked.Increment(ref filesFailed);
+                        }
                     }
-                    else
+                    catch
                     {
-                        filesFailed++;
+                        Interlocked.Increment(ref filesFailed);
                     }
-                }
-                catch
-                {
-                    filesFailed++;
-                }
+                    finally
+                    {
+                        semaphore.Release();
+                        progress?.Report(new DownloadFolderProgress
+                        {
+                            Phase = "Downloading",
+                            CurrentFile = Path.GetFileName(lPath),
+                            FilesCompleted = filesDownloaded,
+                            TotalFiles = filesToDownload.Count,
+                            BytesDownloaded = Interlocked.Read(ref bytesDownloaded),
+                            TotalBytes = totalBytes
+                        });
+                    }
+                }, cancellationToken));
             }
+
+            await Task.WhenAll(tasks);
+            semaphore.Dispose();
 
             progress?.Report(new DownloadFolderProgress
             {
@@ -3449,45 +3493,6 @@ namespace PS5Upload
         public int TotalFiles { get; set; }
         public long TotalFolderBytes { get; set; }
         public long TotalFolderBytesSent { get; set; }
-    }
-    
-    // High-speed parallel uploader using multiple connections
-    public class ParallelUploader : IDisposable
-    {
-        private readonly string _ipAddress;
-        private readonly int _port;
-        private readonly int _connectionCount;
-        private const int ChunkSize = 4 * 1024 * 1024; // 4MB chunks per connection
-        
-        public ParallelUploader(string ipAddress, int port = 9113, int connectionCount = 4)
-        {
-            _ipAddress = ipAddress;
-            _port = port;
-            _connectionCount = connectionCount;
-        }
-        
-        public async Task<bool> UploadFileAsync(string localPath, string remotePath, IProgress<UploadProgress>? progress = null, CancellationToken cancellationToken = default)
-        {
-            FileInfo fileInfo = new FileInfo(localPath);
-            if (!fileInfo.Exists) return false;
-            
-            // For small files, use single connection
-            if (fileInfo.Length < ChunkSize * 2)
-            {
-                using var protocol = new PS5Protocol();
-                if (!await protocol.ConnectAsync(_ipAddress, _port)) return false;
-                return await protocol.UploadFileAsync(localPath, remotePath, progress, cancellationToken);
-            }
-            
-            // For large files, use parallel connections
-            // This requires server support for chunked/parallel uploads
-            // For now, fall back to single connection
-            using var proto = new PS5Protocol();
-            if (!await proto.ConnectAsync(_ipAddress, _port)) return false;
-            return await proto.UploadFileAsync(localPath, remotePath, progress, cancellationToken);
-        }
-        
-        public void Dispose() { }
     }
 
     // New data classes for enhanced features

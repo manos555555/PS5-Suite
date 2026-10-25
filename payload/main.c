@@ -386,6 +386,17 @@ static void *krpc_dlsym_checked(pid_t pid, uint32_t handle, const char *sym) {
         krpc_dynlib_dlsym(pid, handle, sym));
 }
 
+// Resolve a symbol by NAME in a remote process, trying NID first (covers
+// NID-only exports like libSceNpUniversalDataSystem) then falling back to
+// dlsym-by-name (covers debug/string exports like SystemDebugUnlockTrophy).
+static intptr_t krpc_resolve_by_name(pid_t pid, uint32_t handle, const char *sym) {
+    char nid[12];
+    nid_encode(sym, nid);
+    void *p = krpc_resolve_sym(pid, handle, nid);
+    if (p) return (intptr_t)p;
+    return (intptr_t)krpc_dlsym_checked(pid, handle, sym);
+}
+
 // Find the handle of the kernel module loaded in THIS process.
 // libkernel is typically handle 0x2001 (websrv pt_resolve uses 0x1/0x2001).
 // Verification: resolve sceKernelGetCpuTemperature's NID and compare with the
@@ -2179,7 +2190,7 @@ void release_file_mutex(const char *path) {
 // payload loader (elfldr raw-socket protocol — identical to what the PC
 // client does during deploy). The spawned instance sweeps every stale
 // "payload*" process and binds the port — no explicit handoff needed.
-#define SUITE_VERSION      "7.6.0"
+#define SUITE_VERSION      "7.7.0"
 #define SUITE_DIR          "/data/ps5suite"
 #define UPDATE_STAGE_PATH  "/data/ps5suite/update.elf"
 #define UPDATE_MARKER      "/data/ps5suite/update.marker"
@@ -4355,6 +4366,7 @@ typedef struct {
     bool shell_active;
     char shell_cwd[MAX_PATH];
     bool upload_aborted;  // Set when a chunk write fails - server then rejects further chunks
+    uint8_t *dl_buf;  // Per-session download buffer (lazy-allocated, 16MB)
 } client_session_t;
 
 // Cap concurrent client sessions: each thread allocates an 8MB command
@@ -5694,22 +5706,22 @@ void handle_download_file(client_session_t *session, const char *path) {
     
     // Manual read/write loop for maximum sustained throughput
     // FreeBSD sendfile has TCP congestion issues with large files
-    // Shared 16MB read buffer, allocated once (was per-call malloc before).
-    static uint8_t *g_dl_buf = NULL;
-    if (!g_dl_buf) {
-        g_dl_buf = malloc(BUFFER_SIZE);
-        if (!g_dl_buf) {
+    // Per-session 16MB buffer — the old static shared buffer caused data
+    // corruption when two clients downloaded simultaneously.
+    if (!session->dl_buf) {
+        session->dl_buf = malloc(BUFFER_SIZE);
+        if (!session->dl_buf) {
             close(fd);
             send_error(session->sock, "Out of memory");
             return;
         }
     }
-    
+
     ssize_t n;
-    while ((n = read(fd, g_dl_buf, BUFFER_SIZE)) > 0) {
+    while ((n = read(fd, session->dl_buf, BUFFER_SIZE)) > 0) {
         ssize_t sent = 0;
         while (sent < n) {
-            ssize_t s = send(session->sock, g_dl_buf + sent, n - sent, 0);
+            ssize_t s = send(session->sock, session->dl_buf + sent, n - sent, 0);
             if (s <= 0) {
                 close(fd);
                 return;
@@ -12381,7 +12393,7 @@ static int npbind_npwr(const char *path, char out[16]) {
 }
 
 // NPWR → title_id map built from npbind.dat files (appmeta + live game dirs).
-typedef struct { char npwr[16]; char tid[16]; } npwr_map_t;
+typedef struct { char npwr[24]; char tid[16]; } npwr_map_t;
 static int build_npwr_map(npwr_map_t *map, int max) {
     int count = 0;
     const char *roots[] = {
@@ -12397,7 +12409,7 @@ static int build_npwr_map(npwr_map_t *map, int max) {
             if (e->d_name[0] == '.') continue;
             char p[PATH_MAX];
             snprintf(p, sizeof(p), "%s/%s/trophy2/npbind.dat", roots[r], e->d_name);
-            char npwr[16];
+            char npwr[24];
             if (npbind_npwr(p, npwr)) {
                 snprintf(map[count].npwr, sizeof(map[count].npwr), "%s", npwr);
                 snprintf(map[count].tid, sizeof(map[count].tid), "%s", e->d_name);
@@ -12598,9 +12610,9 @@ void handle_trophy_list(client_session_t *session) {
 // "NPWR|entry.png" — raw PNG bytes from the set's UCP (icons on demand).
 void handle_trophy_icon(client_session_t *session, const char *arg) {
     if (!arg || !*arg) { send_error(session->sock, "Usage: NPWR|file.png"); return; }
-    char npwr[16] = {0};
+    char npwr[24] = {0};
     const char *bar = strchr(arg, '|');
-    if (!bar || bar - arg >= 15) { send_error(session->sock, "Usage: NPWR|file.png"); return; }
+    if (!bar || bar - arg >= 23) { send_error(session->sock, "Usage: NPWR|file.png"); return; }
     memcpy(npwr, arg, bar - arg);
     const char *entry = bar + 1;
     // Path traversal guard — entry names are flat PNG filenames only.
@@ -12719,6 +12731,7 @@ struct nplib_job {
     volatile int len;
 };
 static struct nplib_job g_nplib;
+static pthread_mutex_t g_nplib_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void nplib_log(const char *fmt, ...) {
     if (g_nplib.len >= (int)sizeof(g_nplib.buf) - 160) return;
@@ -13164,7 +13177,7 @@ static int running_game_tropconf(pid_t pid, uint8_t **out, size_t *out_sz,
     *out = NULL; *out_sz = 0;
     char tid[16];
     if (running_game_tid(pid, tid, diag, dsz) != 0) return -1;
-    char npwr[16] = {0}, pb[PATH_MAX];
+    char npwr[24] = {0}, pb[PATH_MAX];
     snprintf(pb, sizeof(pb), "/system_data/priv/appmeta/%s/trophy2/npbind.dat", tid);
     if (!npbind_npwr(pb, npwr)) {
         snprintf(pb, sizeof(pb), "/user/app/%s/sce_sys/trophy2/npbind.dat", tid);
@@ -13181,7 +13194,10 @@ static int running_game_tropconf(pid_t pid, uint8_t **out, size_t *out_sz,
 }
 
 // The running game's uds00.ucp member (stats_extraction.json etc.) —
-// /user/app/<tid>/sce_sys/uds/ or the appmeta copy.
+// /user/app/<tid>/sce_sys/uds/ or the appmeta copy. First-gen UDS titles
+// (Astro's Playroom PPSA01325) ship NO uds00.ucp on disk — the daemon keeps
+// the registered schema package at /user/np_uds/nobackup/conf/<NPWR>/uds.ucp,
+// reached via tid → npbind.dat → NPWR.
 static int running_game_uds_member(pid_t pid, const char *name,
                                    uint8_t **out, size_t *out_sz) {
     *out = NULL; *out_sz = 0;
@@ -13191,7 +13207,22 @@ static int running_game_uds_member(pid_t pid, const char *name,
     snprintf(ucp, sizeof(ucp), "/system_data/priv/appmeta/%s/uds/uds00.ucp", tid);
     if (!file_exists(ucp))
         snprintf(ucp, sizeof(ucp), "/user/app/%s/sce_sys/uds/uds00.ucp", tid);
-    if (!file_exists(ucp)) return -1;
+    if (!file_exists(ucp)) {
+        char npwr[24] = {0}, pb[PATH_MAX];
+        snprintf(pb, sizeof(pb), "/system_data/priv/appmeta/%s/trophy2/npbind.dat", tid);
+        if (!npbind_npwr(pb, npwr)) {
+            snprintf(pb, sizeof(pb), "/user/app/%s/sce_sys/trophy2/npbind.dat", tid);
+            npbind_npwr(pb, npwr);
+        }
+        if (!npwr[0]) {
+            snprintf(pb, sizeof(pb), "/system_data/priv/appmeta/%s/uds/npbind.dat", tid);
+            npbind_npwr(pb, npwr);
+        }
+        if (npwr[0])
+            snprintf(ucp, sizeof(ucp),
+                     "/user/np_uds/nobackup/conf/%s/uds.ucp", npwr);
+        if (!npwr[0] || !file_exists(ucp)) return -1;
+    }
     return ucp_extract(ucp, name, out, out_sz);
 }
 
@@ -13217,22 +13248,43 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
     }
     uint32_t uh = 0;
     krpc_dynlib_handle(pid, "libSceNpUniversalDataSystem.sprx", &uh);
-    intptr_t f_init = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemInitialize") : 0;
-    intptr_t f_cctx = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemCreateContext") : 0;
-    intptr_t f_chnd = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemCreateHandle") : 0;
-    intptr_t f_reg  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemRegisterContext") : 0;
-    intptr_t f_cev  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemCreateEvent") : 0;
-    intptr_t f_si3  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemEventPropertyObjectSetInt32") : 0;
+    // NID-based resolution (krpc_resolve_by_name) — NID-only exports like
+    // libSceNpUniversalDataSystem are invisible to dlsym-by-name.
+    intptr_t f_init = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemInitialize") : 0;
+    intptr_t f_cctx = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemCreateContext") : 0;
+    intptr_t f_chnd = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemCreateHandle") : 0;
+    intptr_t f_reg  = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemRegisterContext") : 0;
+    intptr_t f_cev  = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemCreateEvent") : 0;
+    intptr_t f_si3  = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemEventPropertyObjectSetInt32") : 0;
     if (f_si3 <= 0 && uh)
-        f_si3 = (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemEventPropertyObjectSetInt64");
-    intptr_t f_post = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemPostEvent") : 0;
-    intptr_t f_dev  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemDestroyEvent") : 0;
-    intptr_t f_dh   = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemDestroyHandle") : 0;
-    intptr_t f_dc   = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemDestroyContext") : 0;
-    intptr_t f_si64 = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemEventPropertyObjectSetInt64") : 0;
+        f_si3 = krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemEventPropertyObjectSetInt64");
+    intptr_t f_post = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemPostEvent") : 0;
+    intptr_t f_dev  = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemDestroyEvent") : 0;
+    intptr_t f_dh   = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemDestroyHandle") : 0;
+    intptr_t f_dc   = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemDestroyContext") : 0;
+    intptr_t f_si64 = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemEventPropertyObjectSetInt64") : 0;
+    // NP callback pump — the daemon only processes the posted event queue /
+    // delivers trophy notifications when the game-side NP runtime is pumped
+    // (verified against a working trophy unlocker, which pumps
+    // sceNpCheckCallback around RegisterContext and after every post).
+    intptr_t f_chk = 0;
+    {
+        const char *npmods[] = { "libSceNpManager.sprx", "libSceNpUtility.sprx",
+                                 "libSceNp.sprx", NULL };
+        for (int i = 0; npmods[i] && !f_chk; i++) {
+            uint32_t nh = 0;
+            if (krpc_dynlib_handle(pid, npmods[i], &nh) == 0 && nh)
+                f_chk = krpc_resolve_by_name(pid, nh, "sceNpCheckCallback");
+        }
+    }
     if (!uh || f_cctx <= 0 || f_chnd <= 0 || f_cev <= 0 || f_si3 <= 0 || f_post <= 0) {
         kernel_set_ucred_authid(me, oa);
-        send_error(session->sock, "running game has no usable libSceNpUniversalDataSystem");
+        char errmsg[512];
+        snprintf(errmsg, sizeof(errmsg),
+            "UDS resolve failed: uh=%u init=%lx cctx=%lx chnd=%lx reg=%lx cev=%lx si3=%lx post=%lx",
+            uh, (long)f_init, (long)f_cctx, (long)f_chnd, (long)f_reg,
+            (long)f_cev, (long)f_si3, (long)f_post);
+        send_error(session->sock, errmsg);
         return;
     }
     rpc_sess_t s;
@@ -13245,7 +13297,7 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
     uint32_t uid = 0;
     uint32_t ush = 0;
     if (krpc_dynlib_handle(pid, "libSceUserService.sprx", &ush) == 0 && ush) {
-        intptr_t f_fg = (intptr_t)krpc_dlsym_checked(pid, ush, "sceUserServiceGetForegroundUser");
+        intptr_t f_fg = krpc_resolve_by_name(pid, ush, "sceUserServiceGetForegroundUser");
         if (f_fg && !s.dead) {
             rpc_call(&s, f_fg, s.scratch + 0x40, 0, 0, 0, 0, 0);
             rpc_read(pid, s.scratch + 0x40, &uid, 4);
@@ -13263,13 +13315,19 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
             closedir(home);
         }
     }
-    if (f_init > 0 && !s.dead) rpc_call(&s, f_init, s.scratch + 0x60, 0, 0, 0, 0, 0);
+    // Create a fresh UDS context+handle in the game process, register it,
+    // post events through it, then DESTROY it. The destroy triggers a journal
+    // flush and signals the daemon to run extraction. We skip Initialize
+    // (the game already called it). The context we create is separate from
+    // the game's own — destroying it is safe and expected.
     int32_t ctx = 0, hnd = 0;
-    if (!s.dead) rpc_call(&s, f_cctx, s.scratch, uid, 0, 0, 0, 0);
+    long rc_cc = -1, rc_ch = -1, rc_reg = -1;
+    if (!s.dead) rc_cc = rpc_call(&s, f_cctx, s.scratch, uid, 0, 0, 0, 0);
     if (!s.dead) rpc_read(pid, s.scratch, &ctx, 4);
-    if (!s.dead) rpc_call(&s, f_chnd, s.scratch + 8, 0, 0, 0, 0, 0);
+    if (!s.dead) rc_ch = rpc_call(&s, f_chnd, s.scratch + 8, 0, 0, 0, 0, 0);
     if (!s.dead) rpc_read(pid, s.scratch + 8, &hnd, 4);
-    if (ctx > 0 && hnd > 0 && !s.dead) rpc_call(&s, f_reg, ctx, hnd, 0, 0, 0, 0);
+    if (ctx > 0 && hnd > 0 && f_reg > 0 && !s.dead)
+        rc_reg = rpc_call(&s, f_reg, ctx, hnd, 0, 0, 0, 0);
     if (ctx <= 0 || hnd <= 0 || s.dead) {
         if (hnd > 0 && f_dh > 0 && !s.dead) rpc_call(&s, f_dh, hnd, 0, 0, 0, 0, 0);
         if (ctx > 0 && f_dc > 0 && !s.dead) rpc_call(&s, f_dc, ctx, 0, 0, 0, 0, 0);
@@ -13360,11 +13418,11 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
     intptr_t st_dpp = s.scratch + 0x1e0;   // custom property name
 
     char r2[3000];
-    int o2 = snprintf(r2, sizeof(r2), "pid=%d ctx=%d hnd=%d plan=%d conf=%s",
-                      (int)pid, ctx, hnd, np, conf_diag);
+    int o2 = snprintf(r2, sizeof(r2), "pid=%d ctx=%d hnd=%d cc=%lx ch=%lx reg=%lx plan=%d conf=%s",
+                      (int)pid, ctx, hnd, rc_cc, rc_ch, rc_reg, np, conf_diag);
     // NPWR id of the running set — lifted from the tropconf path embedded
     // in conf_diag ("ucp=/user/trophy2/nobackup/conf/NPWR24170_00/TROPHY.UCP").
-    char npwr[16] = "";
+    char npwr[24] = "";
     {
         const char *nps = strstr(conf_diag, "NPWR");
         if (nps) {
@@ -13376,6 +13434,7 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
         }
     }
     int ok = 0, fail = 0;
+    int posted_ids[260]; int nposted = 0;
     for (int i = 0; i < nw && !s.dead; i++) {
         int id = work[i].id, target = work[i].target;
         int posted = 0;
@@ -13421,16 +13480,31 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
                     rpc_call(&s, f_si3, (long)pobj, st_tpg,
                              target > 0 ? target : 255, 0, 0, 0);
             }
-            long rp = rpc_call(&s, f_post, ctx, hnd, (long)ev, 0, 0, 0);
-            // let the daemon drain the queue before the event is destroyed
-            if (!s.dead) usleep(400000);
+            // options=1 = GENERATED_BY_CODEGEN — the daemon extracts only
+            // events posted as game-generated; option 0 gets journaled but
+            // never reaches the stat extraction pass. Posts go through a
+            // fresh per-post handle (working unlockers never reuse the
+            // registered handle for PostEvent).
+            int32_t phnd = 0;
+            if (!s.dead) rpc_call(&s, f_chnd, s.scratch + 0x18, 0, 0, 0, 0, 0);
+            if (!s.dead) rpc_read(pid, s.scratch + 0x18, &phnd, 4);
+            long rp = (phnd > 0 && !s.dead)
+                ? rpc_call(&s, f_post, ctx, phnd, (long)ev, 1, 0, 0) : -1;
+            if (phnd > 0 && f_dh > 0 && !s.dead)
+                rpc_call(&s, f_dh, phnd, 0, 0, 0, 0, 0);
             if (f_dev > 0 && !s.dead) rpc_call(&s, f_dev, (long)ev, 0, 0, 0, 0, 0);
             if ((int32_t)rp >= 0) posted = 1;
             if (o2 < (int)sizeof(r2) - 200)
                 o2 += snprintf(r2 + o2, sizeof(r2) - o2, " [id%d %.28s=%lx]",
                                id, knm, rp);
+            // Pump NP callbacks after each post — the daemon only processes
+            // the event queue when the game-side NP runtime is pumped.
+            if (posted && f_chk > 0 && !s.dead)
+                for (int cb = 0; cb < 3 && !s.dead; cb++)
+                    rpc_call(&s, f_chk, 0, 0, 0, 0, 0, 0);
         }
-        if (posted) ok++; else fail++;
+        if (posted) { ok++; if (nposted < 260) posted_ids[nposted++] = id; }
+        else fail++;
         // The daemon refuses to award progressive trophies from UDS posts
         // (verified live: counter + _UpdateTrophyProgress + _UnlockTrophy
         // all returned 0, flag stayed 0x10). Pin the earned state at file
@@ -13449,8 +13523,119 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
         }
     }
     free(work);
-    if (f_dh > 0 && !s.dead) rpc_call(&s, f_dh, hnd, 0, 0, 0, 0, 0);
-    if (f_dc > 0 && !s.dead) rpc_call(&s, f_dc, ctx, 0, 0, 0, 0, 0);
+    // Detach so the game keeps running while the daemon extracts the posted
+    // events — the game pumps sceNpCheckCallback on its own threads, and a
+    // frozen process can't receive the trophy notification. Re-attach only
+    // for the verification poll + cleanup.
+    rpc_detach(&s);
+    if (ok > 0) usleep(2500000);
+    memset(&s, 0, sizeof(s));
+    if (rpc_attach(&s, pid, f_cctx) != 0) s.dead = 1;
+    if (f_chk > 0 && !s.dead)
+        for (int i = 0; i < 4 && !s.dead; i++) {
+            if (rpc_call(&s, f_chk, 0, 0, 0, 0, 0, 0) < 0) break;
+        }
+    // Trophy2 poll: a fresh Trophy2 context + GetGameInfo/GetTrophyInfo makes
+    // the trophy daemon re-evaluate the title's UDS stat table — the moment
+    // the _autoGenTrophy stat reads as earned, the daemon itself writes the
+    // TRPTITLE flag and fires the system toast.
+    if (ok > 0 && !s.dead) {
+        uint32_t t2h = 0;
+        intptr_t f_tcc = 0, f_tch = 0, f_trg = 0, f_tgi = 0, f_tti = 0;
+        if (krpc_dynlib_handle(pid, "libSceNpTrophy2.sprx", &t2h) == 0 && t2h) {
+            f_tcc = krpc_resolve_by_name(pid, t2h, "sceNpTrophy2CreateContext");
+            f_tch = krpc_resolve_by_name(pid, t2h, "sceNpTrophy2CreateHandle");
+            f_trg = krpc_resolve_by_name(pid, t2h, "sceNpTrophy2RegisterContext");
+            f_tgi = krpc_resolve_by_name(pid, t2h, "sceNpTrophy2GetGameInfo");
+            f_tti = krpc_resolve_by_name(pid, t2h, "sceNpTrophy2GetTrophyInfo");
+        }
+        intptr_t f_tdh = t2h
+            ? krpc_resolve_by_name(pid, t2h, "sceNpTrophy2DestroyHandle") : 0;
+        intptr_t f_nst = t2h
+            ? krpc_resolve_by_name(pid, t2h, "sceNpTrophy2SystemNetSyncTitles") : 0;
+        intptr_t f_cns = t2h
+            ? krpc_resolve_by_name(pid, t2h, "sceNpTrophy2SystemCheckNetSyncTitles") : 0;
+        if (f_tcc > 0 && f_tch > 0 && f_trg > 0 && f_tgi > 0) {
+            // A foreign Trophy2 ctx can never register (the game holds the
+            // title binding — every label fails 0x8055391a). Borrow the game's
+            // own registered pair from the libSceNpTrophy2 singleton instead —
+            // verified 13.60 layout: singleton ptr at lib_base+0x18080, ctx
+            // nodes at singleton+0x158..+0x250, hnd nodes at +0x38..+0x130,
+            // node+0x08 = id, node+0x14 = active.
+            int32_t tctx = -1, thnd = -1;
+            intptr_t tbl = 0;
+            rpc_read(pid, (f_tcc - 0x150) + 0x18080, &tbl, 8);
+            for (intptr_t o = 0x158; tbl && o <= 0x250; o += 8) {
+                intptr_t node = 0;
+                rpc_read(pid, tbl + o, &node, 8);
+                if (!node) continue;
+                uint8_t active = 0; int32_t cid = 0;
+                rpc_read(pid, node + 0x14, &active, 1);
+                rpc_read(pid, node + 0x08, &cid, 4);
+                if (active && cid > 0) { tctx = cid; break; }
+            }
+            for (intptr_t o = 0x38; tbl && o <= 0x130; o += 8) {
+                intptr_t node = 0;
+                rpc_read(pid, tbl + o, &node, 8);
+                if (!node) continue;
+                uint8_t active = 0; int32_t cid = 0;
+                rpc_read(pid, node + 0x14, &active, 1);
+                rpc_read(pid, node + 0x08, &cid, 4);
+                if (active && cid > 0) { thnd = cid; break; }
+            }
+            // The ctx is the session binding; op handles are throwaway —
+            // mint one when the game's table has none.
+            int minted = 0;
+            if (tctx > 0 && thnd <= 0 && f_tch > 0 && !s.dead) {
+                rpc_call(&s, f_tch, s.scratch + 0x28, 0, 0, 0, 0, 0);
+                rpc_read(pid, s.scratch + 0x28, &thnd, 4);
+                minted = thnd > 0;
+            }
+            if (o2 < (int)sizeof(r2) - 200)
+                o2 += snprintf(r2 + o2, sizeof(r2) - o2,
+                               " t2tbl=%lx,ctx=%d,hnd=%d", (long)tbl, tctx, thnd);
+            long rg = -1;
+            if (tctx > 0 && thnd > 0 && !s.dead)
+                rg = rpc_call(&s, f_tgi, tctx, thnd,
+                              s.scratch + 0x200, s.scratch + 0x300, 0, 0);
+            if (tctx > 0 && thnd > 0 && !s.dead) {
+                uint32_t unlocked = 0;
+                rpc_read(pid, s.scratch + 0x300, &unlocked, 4);
+                if (o2 < (int)sizeof(r2) - 200)
+                    o2 += snprintf(r2 + o2, sizeof(r2) - o2,
+                                   " t2[g=%lx,unl=%u]", rg, unlocked);
+                if (f_tti > 0)
+                    for (int i = 0; i < nposted && !s.dead; i++) {
+                        long rt = rpc_call(&s, f_tti, tctx, thnd, posted_ids[i],
+                                           s.scratch + 0x400, s.scratch + 0xa00, 0);
+                        uint32_t un = 0;
+                        rpc_read(pid, s.scratch + 0xa04, &un, 4);
+                        if (o2 < (int)sizeof(r2) - 200)
+                            o2 += snprintf(r2 + o2, sizeof(r2) - o2,
+                                           " [t2:%d=%lx,%u]", posted_ids[i], rt, un);
+                    }
+                // Probe the daemon-side sync triggers on the borrowed pair.
+                if (!s.dead && o2 < (int)sizeof(r2) - 300) {
+                    if (f_cns > 0)
+                        o2 += snprintf(r2 + o2, sizeof(r2) - o2, " cns=%lx",
+                            rpc_call(&s, f_cns, tctx, thnd, 0, 0, 0, 0));
+                    if (f_nst > 0)
+                        o2 += snprintf(r2 + o2, sizeof(r2) - o2, " nst=%lx",
+                            rpc_call(&s, f_nst, tctx, thnd, 0, 0, 0, 0));
+                }
+                // Never destroy the borrowed pair — it belongs to the game.
+                if (minted && f_tdh > 0)
+                    rpc_call(&s, f_tdh, thnd, 0, 0, 0, 0, 0);
+            } else if (o2 < (int)sizeof(r2) - 200) {
+                o2 += snprintf(r2 + o2, sizeof(r2) - o2,
+                               " t2ctx-fail(%d,%d)", tctx, thnd);
+            }
+        }
+    }
+    // Destroy our context+handle — this triggers the daemon's journal flush
+    // and extraction pass, which is essential for the trophy to be awarded.
+    if (hnd > 0 && f_dh > 0 && !s.dead) rpc_call(&s, f_dh, hnd, 0, 0, 0, 0, 0);
+    if (ctx > 0 && f_dc > 0 && !s.dead) rpc_call(&s, f_dc, ctx, 0, 0, 0, 0, 0);
     rpc_detach(&s);
     kernel_set_ucred_authid(me, oa);
     o2 += snprintf(r2 + o2, sizeof(r2) - o2, " ok=%d fail=%d dead=%d",
@@ -13578,16 +13763,20 @@ static int trp_lock_file(const char *path, int tid, char *diag, size_t dsz) {
         char bak[PATH_MAX];
         snprintf(bak, sizeof(bak), "%s.bak", path);
         FILE *in = fopen(path, "rb");
+        int bak_ok = 0;
         if (in) {
             FILE *out = fopen(bak, "wb");
             if (out) {
                 uint8_t cpb[8192]; size_t r;
+                bak_ok = 1;
                 while ((r = fread(cpb, 1, sizeof(cpb), in)) > 0)
-                    if (fwrite(cpb, 1, r, out) != r) break;
+                    if (fwrite(cpb, 1, r, out) != r) { bak_ok = 0; break; }
                 fclose(out);
+                if (!bak_ok) unlink(bak);
             }
             fclose(in);
         }
+        if (!bak_ok) { free(union_mask); free(d); return -2; }
     }
 
     // 6) atomic-ish rewrite: tmp + rename so a crash mid-write can't leave a
@@ -13713,16 +13902,20 @@ static int trp_unlock_file(const char *path, int tid, int gid,
         char bak[PATH_MAX];
         snprintf(bak, sizeof(bak), "%s.bak", path);
         FILE *in = fopen(path, "rb");
+        int bak_ok = 0;
         if (in) {
             FILE *out = fopen(bak, "wb");
             if (out) {
                 uint8_t cpb[8192]; size_t r;
+                bak_ok = 1;
                 while ((r = fread(cpb, 1, sizeof(cpb), in)) > 0)
-                    if (fwrite(cpb, 1, r, out) != r) break;
+                    if (fwrite(cpb, 1, r, out) != r) { bak_ok = 0; break; }
                 fclose(out);
+                if (!bak_ok) unlink(bak);
             }
             fclose(in);
         }
+        if (!bak_ok) { free(d); return -2; }
     }
     char tmp[PATH_MAX];
     snprintf(tmp, sizeof(tmp), "%s.tmp", path);
@@ -13821,7 +14014,7 @@ void handle_trophy_unlock(client_session_t *session, const char *arg) {
             send_error(session->sock, "usage: lock:<npwr>:<id>");
             return;
         }
-        char npwr[16];
+        char npwr[24];
         size_t nl = (size_t)(colon - p);
         if (nl >= sizeof(npwr)) nl = sizeof(npwr) - 1;
         memcpy(npwr, p, nl); npwr[nl] = 0;
@@ -13830,12 +14023,38 @@ void handle_trophy_unlock(client_session_t *session, const char *arg) {
         trophy_lock(session, npwr, id);
         return;
     }
-    if (!strcmp(p, "all")) { uds_trophy_unlock(session, 1, -1); return; }
-    if (p[0] >= '0' && p[0] <= '9') {
-        int id = atoi(p);
-        if (id < 0 || id > 255) { send_error(session->sock, "bad trophy id"); return; }
-        uds_trophy_unlock(session, 0, id);
-        return;
+    // Pick the award path by the game's trophy stack. Any title with
+    // libSceNpUniversalDataSystem mapped goes through the UDS event
+    // pipeline — its real unlock event is resolved per-trophy from the
+    // game's stats_extraction.json (appmeta, sce_sys, or the daemon's
+    // /user/np_uds schema copy), and the daemon performs the award:
+    // real toast + profile + daemon-written TRPTITLE.DAT. Only titles
+    // with NO UDS lib at all fall through to the legacy sceNpTrophy2 path.
+    if (!strcmp(p, "all") || (p[0] >= '0' && p[0] <= '9')) {
+        int id = -1;
+        if (p[0] != 'a') {
+            id = atoi(p);
+            if (id < 0 || id > 255) { send_error(session->sock, "bad trophy id"); return; }
+        }
+        pid_t me0 = getpid();
+        uint64_t oa0 = kernel_get_ucred_authid(me0);
+        kernel_set_ucred_authid(me0, 0x4800000000010003ULL);
+        uint32_t tr2h0 = 0; char cd[128];
+        pid_t g0 = trp_find_trophy_proc(&tr2h0, cd, sizeof(cd));
+        uint32_t uh0 = 0;
+        if (g0 > 0)
+            krpc_dynlib_handle(g0, "libSceNpUniversalDataSystem.sprx", &uh0);
+        kernel_set_ucred_authid(me0, oa0);
+        if (g0 <= 0) {
+            send_error(session->sock, "no trophy-capable game running — launch the title first");
+            return;
+        }
+        if (uh0) {                    // UDS-capable title → event path
+            uds_trophy_unlock(session, id < 0, id);
+            return;
+        }
+        // else: no UDS — fall through to the legacy NpTrophy2 path,
+        // which parses "all"/digits itself.
     }
     // "probe": report which trophy-related libs/exports exist in the game
     // process. No remote calls — pure dynlib handle + dlsym resolution.
@@ -13857,18 +14076,27 @@ void handle_trophy_unlock(client_session_t *session, const char *arg) {
         }
         char r2[2048]; int o2 = snprintf(r2, sizeof(r2), "pid=%d%s", (int)gp, c2);
         if (gp > 0 && p[5] == ':') {
-            // custom: probe:libname|sym1,sym2,...
+            // custom: probe:libname|sym1,sym2,... or probe:<pid>:libname|syms
             char spec[1024];
             snprintf(spec, sizeof(spec), "%s", p + 6);
+            pid_t tpid = gp;
+            char *colon = strchr(spec, ':');
+            if (colon) {
+                char *sep = strchr(colon + 1, '|');
+                if (sep) {
+                    int v = atoi(spec);
+                    if (v > 0) { tpid = v; memmove(spec, colon + 1, strlen(colon)); }
+                }
+            }
             char *bar = strchr(spec, '|');
             if (bar) {
                 *bar = 0;
                 uint32_t h = 0;
-                if (krpc_dynlib_handle(gp, spec, &h) == 0 && h) {
+                if (krpc_dynlib_handle(tpid, spec, &h) == 0 && h) {
                     o2 += snprintf(r2 + o2, sizeof(r2) - o2, " %s=H%u[", spec, h);
                     char *t = strtok(bar + 1, ",");
                     while (t && o2 < (int)sizeof(r2) - 200) {
-                        intptr_t fn = (intptr_t)krpc_dlsym_checked(gp, h, t);
+                        intptr_t fn = krpc_resolve_by_name(tpid, h, t);
                         if (fn > 0)
                             o2 += snprintf(r2 + o2, sizeof(r2) - o2, "%s=%lx,", t, (long)fn);
                         t = strtok(NULL, ",");
@@ -13925,10 +14153,12 @@ void handle_trophy_unlock(client_session_t *session, const char *arg) {
             }
         } else if (p[5]) { send_error(session->sock, "usage: nplib[:id|all][:commId]"); return; }
 
+        pthread_mutex_lock(&g_nplib_lock);
         if (g_nplib.running && !g_nplib.done) {
             char rr[3400];
             int n = snprintf(rr, sizeof(rr), "STILL RUNNING step=%d:\n%s",
                              g_nplib.step, g_nplib.buf);
+            pthread_mutex_unlock(&g_nplib_lock);
             send_response(session->sock, RESP_DATA, rr, (uint32_t)n);
             return;
         }
@@ -13948,15 +14178,18 @@ void handle_trophy_unlock(client_session_t *session, const char *arg) {
         g_nplib.running = 1;
         if (pthread_create(&t, &at, nplib_worker, NULL) != 0) {
             g_nplib.running = 0;
+            pthread_mutex_unlock(&g_nplib_lock);
             send_error(session->sock, "nplib worker spawn failed");
             return;
         }
         pthread_detach(t);
+        pthread_mutex_unlock(&g_nplib_lock);
 
         // poll up to ~40s; a wedged IPC leaves the worker parked but the
         // payload stays alive and the partial log shows the blocking step.
         for (int i = 0; i < 800 && !g_nplib.done; i++) usleep(50000);
-        if (g_nplib.done) g_nplib.running = 0;   // parked worker stays "running"
+        pthread_mutex_lock(&g_nplib_lock);
+        if (g_nplib.done) g_nplib.running = 0;
         char rr[3400];
         int n = snprintf(rr, sizeof(rr), "%s%s",
                          g_nplib.done ? "" : "TIMED OUT — worker parked at step ",
@@ -13964,6 +14197,7 @@ void handle_trophy_unlock(client_session_t *session, const char *arg) {
         if (!g_nplib.done)
             n += snprintf(rr + n, sizeof(rr) - n, "%d\n", g_nplib.step);
         n += snprintf(rr + n, sizeof(rr) - n, "%s", g_nplib.buf);
+        pthread_mutex_unlock(&g_nplib_lock);
         send_response(session->sock, RESP_DATA, rr, (uint32_t)n);
         return;
     }
@@ -14461,21 +14695,21 @@ void handle_trophy_unlock(client_session_t *session, const char *arg) {
         }
         uint32_t uh = 0;
         krpc_dynlib_handle(pid, "libSceNpUniversalDataSystem.sprx", &uh);
-        intptr_t f_init = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemInitialize") : 0;
-        intptr_t f_cctx = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemCreateContext") : 0;
-        intptr_t f_chnd = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemCreateHandle") : 0;
-        intptr_t f_reg  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemRegisterContext") : 0;
-        intptr_t f_cev  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemCreateEvent") : 0;
-        intptr_t f_si3  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemEventPropertyObjectSetInt32") : 0;
-        intptr_t f_post = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemPostEvent") : 0;
-        intptr_t f_nst  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemIntNetSyncTitles") : 0;
-        intptr_t f_dev  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemDestroyEvent") : 0;
-        intptr_t f_dh   = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemDestroyHandle") : 0;
-        intptr_t f_dc   = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemDestroyContext") : 0;
+        intptr_t f_init = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemInitialize") : 0;
+        intptr_t f_cctx = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemCreateContext") : 0;
+        intptr_t f_chnd = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemCreateHandle") : 0;
+        intptr_t f_reg  = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemRegisterContext") : 0;
+        intptr_t f_cev  = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemCreateEvent") : 0;
+        intptr_t f_si3  = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemEventPropertyObjectSetInt32") : 0;
+        intptr_t f_post = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemPostEvent") : 0;
+        intptr_t f_nst  = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemIntNetSyncTitles") : 0;
+        intptr_t f_dev  = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemDestroyEvent") : 0;
+        intptr_t f_dh   = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemDestroyHandle") : 0;
+        intptr_t f_dc   = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemDestroyContext") : 0;
         intptr_t f_fg   = 0;
         uint32_t ush = 0;
         if (krpc_dynlib_handle(pid, "libSceUserService.sprx", &ush) == 0 && ush)
-            f_fg = (intptr_t)krpc_dlsym_checked(pid, ush, "sceUserServiceGetForegroundUser");
+            f_fg = krpc_resolve_by_name(pid, ush, "sceUserServiceGetForegroundUser");
         char rr[3000];
         int o = snprintf(rr, sizeof(rr), "pid=%d nst=%lx", (int)pid, (long)f_nst);
         if (!f_cctx || !f_chnd || !f_cev || !f_si3 || !f_post || !f_nst) {
@@ -14493,7 +14727,11 @@ void handle_trophy_unlock(client_session_t *session, const char *arg) {
         intptr_t sn = s.scratch + 0x100, st = s.scratch + 0x120;
         rpc_write(pid, sn, "_UnlockTrophy", 14);
         rpc_write(pid, st, "_trophy_id", 11);
-        if (f_init) rpc_call(&s, f_init, s.scratch + 0x60, 0,0,0,0,0);
+        if (f_init && !s.dead) {
+            uint64_t ip[2] = { 16, 128u * 1024 };
+            rpc_write(pid, s.scratch + 0x60, ip, sizeof(ip));
+            rpc_call(&s, f_init, s.scratch + 0x60, 0,0,0,0,0);
+        }
         int32_t ctx = 0, hnd = 0;
         rpc_call(&s, f_cctx, s.scratch, uid, 0, 0, 0, 0);
         rpc_read(pid, s.scratch, &ctx, 4);
@@ -14507,7 +14745,7 @@ void handle_trophy_unlock(client_session_t *session, const char *arg) {
         rpc_read(pid, s.scratch + 0x60, &pobj, 8);
         if (!pobj) pobj = ev;
         long r_s = ev ? rpc_call(&s, f_si3, (long)pobj, st, tid, 0, 0, 0) : -1;
-        long r_post = ev ? rpc_call(&s, f_post, ctx, hnd, (long)ev, 0, 0, 0) : -1;
+        long r_post = ev ? rpc_call(&s, f_post, ctx, hnd, (long)ev, 1, 0, 0) : -1;
         if (!s.dead) usleep(300000);
         // probe the IntNetSyncTitles arg space — IPC cmd 0x10012 takes
         // {ctx(32b), a2(32b), a3(64b)}; a2 is likely an enum, a3 a timeout/flags
@@ -14536,8 +14774,8 @@ void handle_trophy_unlock(client_session_t *session, const char *arg) {
         if (gctx > 0)
             for (int i = 0; i < 4 && !s.dead; i++)
                 nst_g[i] = rpc_call(&s, f_nst, gctx, nst_args[i].a2, nst_args[i].a3, 0, 0, 0);
-        intptr_t f_term = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemTerminate") : 0;
-        intptr_t f_abort = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemAbortHandle") : 0;
+        intptr_t f_term = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemTerminate") : 0;
+        intptr_t f_abort = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemAbortHandle") : 0;
         // Terminate is risky inside the live game (tears down its UDS client
         // state) — only run it when explicitly asked via udsn:<id>:t
         long r_term = (f_term > 0 && !s.dead && strstr(p, ":t"))
@@ -14557,6 +14795,479 @@ void handle_trophy_unlock(client_session_t *session, const char *arg) {
             if (ctx && f_dc) rpc_call(&s, f_dc, ctx, 0,0,0,0,0);
         }
         rpc_detach(&s);
+        kernel_set_ucred_authid(me, oa);
+        send_response(session->sock, RESP_DATA, rr, (uint32_t)o);
+        return;
+    }
+
+    // "t2u:<id>" — direct award via the daemon debug op. The export exists on
+    // this firmware as sceNpTrophy2SystemDebugUnlockTrophy(ctx, hnd, params*):
+    // params[0]=2 selects unlock-by-id (validated 1..49), params[1]=trophy id.
+    // The lib resolves ctx/hnd to daemon session ids and IPMIs the award to
+    // SceShellCore — the same op the trophy service itself performs. Runs on
+    // the game's borrowed registered pair.
+    if (!strncmp(p, "t2u:", 4)) {
+        int tid = atoi(p + 4);
+        pid_t me = getpid();
+        uint64_t oa = kernel_get_ucred_authid(me);
+        kernel_set_ucred_authid(me, 0x4800000000010003ULL);
+        uint32_t th = 0;
+        char cand[256];
+        pid_t pid = trp_find_trophy_proc(&th, cand, sizeof(cand));
+        if (pid <= 0) {
+            kernel_set_ucred_authid(me, oa);
+            send_error(session->sock, "no trophy game running"); return;
+        }
+        uint32_t t2h = 0;
+        krpc_dynlib_handle(pid, "libSceNpTrophy2.sprx", &t2h);
+        intptr_t f_tcc = t2h ? krpc_resolve_by_name(pid, t2h, "sceNpTrophy2CreateContext") : 0;
+        intptr_t f_tch = t2h ? krpc_resolve_by_name(pid, t2h, "sceNpTrophy2CreateHandle") : 0;
+        intptr_t f_unl = t2h ? krpc_resolve_by_name(pid, t2h, "sceNpTrophy2SystemDebugUnlockTrophy") : 0;
+        intptr_t f_lck = t2h ? krpc_resolve_by_name(pid, t2h, "sceNpTrophy2SystemDebugLockTrophy") : 0;
+        intptr_t f_tgi = t2h ? krpc_resolve_by_name(pid, t2h, "sceNpTrophy2GetGameInfo") : 0;
+        intptr_t f_tti = t2h ? krpc_resolve_by_name(pid, t2h, "sceNpTrophy2GetTrophyInfo") : 0;
+        intptr_t f_tdh = t2h ? krpc_resolve_by_name(pid, t2h, "sceNpTrophy2DestroyHandle") : 0;
+        char rr[2048];
+        int o = snprintf(rr, sizeof(rr), "pid=%d t2h=%x tcc=%lx unl=%lx lck=%lx",
+                         (int)pid, t2h, (long)f_tcc, (long)f_unl, (long)f_lck);
+        rpc_sess_t s;
+        memset(&s, 0, sizeof(s));
+        if (f_tcc > 0 && rpc_attach(&s, pid, f_tcc) == 0) {
+            int32_t tctx = -1, thnd = -1;
+            intptr_t tbl = 0;
+            rpc_read(pid, (f_tcc - 0x150) + 0x18080, &tbl, 8);
+            for (intptr_t off = 0x158; tbl && off <= 0x250; off += 8) {
+                intptr_t node = 0;
+                rpc_read(pid, tbl + off, &node, 8);
+                if (!node) continue;
+                uint8_t active = 0; int32_t cid = 0;
+                rpc_read(pid, node + 0x14, &active, 1);
+                rpc_read(pid, node + 0x08, &cid, 4);
+                if (active && cid > 0) { tctx = cid; break; }
+            }
+            for (intptr_t off = 0x38; tbl && off <= 0x130; off += 8) {
+                intptr_t node = 0;
+                rpc_read(pid, tbl + off, &node, 8);
+                if (!node) continue;
+                uint8_t active = 0; int32_t cid = 0;
+                rpc_read(pid, node + 0x14, &active, 1);
+                rpc_read(pid, node + 0x08, &cid, 4);
+                if (active && cid > 0) { thnd = cid; break; }
+            }
+            int minted = 0;
+            if (tctx > 0 && thnd <= 0 && f_tch > 0 && !s.dead) {
+                rpc_call(&s, f_tch, s.scratch + 0x28, 0, 0, 0, 0, 0);
+                rpc_read(pid, s.scratch + 0x28, &thnd, 4);
+                minted = thnd > 0;
+            }
+            o += snprintf(rr + o, sizeof(rr) - o, " tbl=%lx ctx=%d hnd=%d",
+                          (long)tbl, tctx, thnd);
+            if (tctx > 0 && thnd > 0 && f_unl > 0 && !s.dead) {
+                // params: +0=2 (unlock-by-id), +4=trophyId, rest zero
+                int32_t prm[16];
+                memset(prm, 0, sizeof(prm));
+                prm[0] = 2;
+                prm[1] = tid;
+                rpc_write(pid, s.scratch + 0x80, prm, sizeof(prm));
+                long ru = rpc_call(&s, f_unl, tctx, thnd,
+                                   s.scratch + 0x80, 0, 0, 0);
+                o += snprintf(rr + o, sizeof(rr) - o, " unlock=%lx", ru);
+                // post-state readback via GetTrophyInfo on the same pair
+                if (f_tti > 0 && !s.dead) {
+                    long rt = rpc_call(&s, f_tti, tctx, thnd, tid,
+                                       s.scratch + 0x400, s.scratch + 0xa00, 0);
+                    uint32_t un = 0;
+                    rpc_read(pid, s.scratch + 0xa04, &un, 4);
+                    o += snprintf(rr + o, sizeof(rr) - o, " info=%lx,u=%u", rt, un);
+                }
+                if (f_tgi > 0 && !s.dead) {
+                    long rg = rpc_call(&s, f_tgi, tctx, thnd,
+                                       s.scratch + 0x200, s.scratch + 0x300, 0, 0);
+                    uint32_t unl2 = 0;
+                    rpc_read(pid, s.scratch + 0x300, &unl2, 4);
+                    o += snprintf(rr + o, sizeof(rr) - o, " game=%lx,unl=%u", rg, unl2);
+                }
+            }
+            if (minted && f_tdh > 0 && !s.dead)
+                rpc_call(&s, f_tdh, thnd, 0, 0, 0, 0, 0);
+            o += snprintf(rr + o, sizeof(rr) - o, " dead=%d", s.dead);
+            rpc_detach(&s);
+        } else {
+            o += snprintf(rr + o, sizeof(rr) - o, " attach-fail");
+        }
+        kernel_set_ucred_authid(me, oa);
+        send_response(session->sock, RESP_DATA, rr, (uint32_t)o);
+        return;
+    }
+
+    // "t2ui:" — borrow the game's Trophy2 ctx and invoke
+    // sceNpTrophy2ShowTrophyList(ctx): the system trophy-list UI call is the
+    // same trigger the XMB uses to force the daemon to evaluate pending
+    // extraction before rendering the list.
+    if (!strncmp(p, "t2ui", 4)) {
+        pid_t me = getpid();
+        uint64_t oa = kernel_get_ucred_authid(me);
+        kernel_set_ucred_authid(me, 0x4800000000010003ULL);
+        uint32_t th = 0;
+        char cand[256];
+        pid_t pid = trp_find_trophy_proc(&th, cand, sizeof(cand));
+        if (pid <= 0) {
+            kernel_set_ucred_authid(me, oa);
+            send_error(session->sock, "no trophy game running"); return;
+        }
+        uint32_t t2h = 0;
+        krpc_dynlib_handle(pid, "libSceNpTrophy2.sprx", &t2h);
+        intptr_t f_tcc = t2h ? krpc_resolve_by_name(pid, t2h, "sceNpTrophy2CreateContext") : 0;
+        intptr_t f_stl = t2h ? krpc_resolve_by_name(pid, t2h, "sceNpTrophy2ShowTrophyList") : 0;
+        intptr_t f_tgi = t2h ? krpc_resolve_by_name(pid, t2h, "sceNpTrophy2GetGameInfo") : 0;
+        intptr_t f_tti = t2h ? krpc_resolve_by_name(pid, t2h, "sceNpTrophy2GetTrophyInfo") : 0;
+        intptr_t f_cb  = 0;
+        {
+            uint32_t nmh = 0;
+            static const char *np_libs[] = { "libSceNpCommon.sprx", "libSceNpManager.sprx", NULL };
+            for (int i = 0; np_libs[i] && !f_cb; i++) {
+                krpc_dynlib_handle(pid, np_libs[i], &nmh);
+                if (nmh) f_cb = krpc_resolve_by_name(pid, nmh, "sceNpCheckCallback");
+            }
+        }
+        char rr[1024];
+        int o = snprintf(rr, sizeof(rr), "pid=%d tcc=%lx stl=%lx cb=%lx",
+                         (int)pid, (long)f_tcc, (long)f_stl, (long)f_cb);
+        rpc_sess_t s;
+        memset(&s, 0, sizeof(s));
+        if (f_tcc > 0 && rpc_attach(&s, pid, f_tcc) == 0) {
+            int32_t tctx = -1;
+            intptr_t tbl = 0;
+            rpc_read(pid, (f_tcc - 0x150) + 0x18080, &tbl, 8);
+            for (intptr_t off = 0x158; tbl && off <= 0x250; off += 8) {
+                intptr_t node = 0;
+                rpc_read(pid, tbl + off, &node, 8);
+                if (!node) continue;
+                uint8_t active = 0; int32_t cid = 0;
+                rpc_read(pid, node + 0x14, &active, 1);
+                rpc_read(pid, node + 0x08, &cid, 4);
+                if (active && cid > 0) { tctx = cid; break; }
+            }
+            int32_t thnd = -1;
+            for (intptr_t off = 0x38; tbl && off <= 0x130; off += 8) {
+                intptr_t node = 0;
+                rpc_read(pid, tbl + off, &node, 8);
+                if (!node) continue;
+                uint8_t active = 0; int32_t cid = 0;
+                rpc_read(pid, node + 0x14, &active, 1);
+                rpc_read(pid, node + 0x08, &cid, 4);
+                if (active && cid > 0) { thnd = cid; break; }
+            }
+            o += snprintf(rr + o, sizeof(rr) - o, " tbl=%lx ctx=%d hnd=%d",
+                          (long)tbl, tctx, thnd);
+            if (tctx > 0 && f_stl > 0 && !s.dead) {
+                long rs = rpc_call(&s, f_stl, tctx, 0, 0, 0, 0, 0);
+                o += snprintf(rr + o, sizeof(rr) - o, " showlist=%lx", rs);
+            }
+            if (thnd > 0 && f_tgi > 0 && !s.dead) {
+                long rg = rpc_call(&s, f_tgi, tctx, thnd,
+                                   s.scratch + 0x200, s.scratch + 0x300, 0, 0);
+                uint32_t unl2 = 0;
+                rpc_read(pid, s.scratch + 0x300, &unl2, 4);
+                o += snprintf(rr + o, sizeof(rr) - o, " game=%lx,unl=%u", rg, unl2);
+            }
+            for (int i = 1; i <= 3 && thnd > 0 && f_tti > 0 && !s.dead; i++) {
+                long rt = rpc_call(&s, f_tti, tctx, thnd, i,
+                                   s.scratch + 0x400, s.scratch + 0xa00, 0);
+                uint32_t un = 0;
+                rpc_read(pid, s.scratch + 0xa04, &un, 4);
+                o += snprintf(rr + o, sizeof(rr) - o, " t%d=%lx,u=%u", i, rt, un);
+            }
+            if (f_cb > 0 && !s.dead)
+                rpc_call(&s, f_cb, 0, 0, 0, 0, 0, 0);
+            o += snprintf(rr + o, sizeof(rr) - o, " dead=%d", s.dead);
+            rpc_detach(&s);
+        } else {
+            o += snprintf(rr + o, sizeof(rr) - o, " attach-fail");
+        }
+        kernel_set_ucred_authid(me, oa);
+        send_response(session->sock, RESP_DATA, rr, (uint32_t)o);
+        return;
+    }
+
+    // "su:<id>" — call the daemon debug-unlock op from inside SceShellUI.
+    // The op is auth-gated for game callers (0x80553908); a vsh process is
+    // the intended caller class. Probes libSceNpTrophy2 in SceShellUI,
+    // creates its own ctx+handle pair and IPMIs the award.
+    if (!strncmp(p, "su:", 3)) {
+        int tid = atoi(p + 3);
+        pid_t me = getpid();
+        uint64_t oa = kernel_get_ucred_authid(me);
+        kernel_set_ucred_authid(me, 0x4800000000010003ULL);
+        pid_t pid = proc_find_name("SceShellUI");
+        char rr[1024];
+        int o = snprintf(rr, sizeof(rr), "shellpid=%d", (int)pid);
+        uint32_t t2h = 0;
+        if (pid > 0)
+            krpc_dynlib_handle(pid, "libSceNpTrophy2.sprx", &t2h);
+        intptr_t f_tcc = t2h ? krpc_resolve_by_name(pid, t2h, "sceNpTrophy2SystemCreateContext") : 0;
+        if (!f_tcc) f_tcc = t2h ? krpc_resolve_by_name(pid, t2h, "sceNpTrophy2CreateContext") : 0;
+        intptr_t f_tch = t2h ? krpc_resolve_by_name(pid, t2h, "sceNpTrophy2SystemCreateHandle") : 0;
+        if (!f_tch) f_tch = t2h ? krpc_resolve_by_name(pid, t2h, "sceNpTrophy2CreateHandle") : 0;
+        intptr_t f_reg = t2h ? krpc_resolve_by_name(pid, t2h, "sceNpTrophy2RegisterContext") : 0;
+        intptr_t f_unl = t2h ? krpc_resolve_by_name(pid, t2h, "sceNpTrophy2SystemDebugUnlockTrophy") : 0;
+        intptr_t f_tdh = t2h ? krpc_resolve_by_name(pid, t2h, "sceNpTrophy2SystemDestroyHandle") : 0;
+        if (!f_tdh) f_tdh = t2h ? krpc_resolve_by_name(pid, t2h, "sceNpTrophy2DestroyHandle") : 0;
+        intptr_t f_tdc = t2h ? krpc_resolve_by_name(pid, t2h, "sceNpTrophy2SystemDestroyContext") : 0;
+        if (!f_tdc) f_tdc = t2h ? krpc_resolve_by_name(pid, t2h, "sceNpTrophy2DestroyContext") : 0;
+        intptr_t f_fgu = 0;
+        {
+            uint32_t ush = 0;
+            krpc_dynlib_handle(pid, "libSceUserService.sprx", &ush);
+            if (ush) f_fgu = krpc_resolve_by_name(pid, ush, "sceUserServiceGetForegroundUser");
+        }
+        o += snprintf(rr + o, sizeof(rr) - o, " t2h=%x tcc=%lx unl=%lx fgu=%lx",
+                      t2h, (long)f_tcc, (long)f_unl, (long)f_fgu);
+        rpc_sess_t s;
+        memset(&s, 0, sizeof(s));
+        if (f_tcc > 0 && f_unl > 0 && rpc_attach(&s, pid, f_tcc) == 0) {
+            int32_t tctx = -1, thnd = -1;
+            intptr_t tbl = 0;
+            rpc_read(pid, (f_tcc - 0x150) + 0x18080, &tbl, 8);
+            for (intptr_t off = 0x158; tbl && off <= 0x250; off += 8) {
+                intptr_t node = 0;
+                rpc_read(pid, tbl + off, &node, 8);
+                if (!node) continue;
+                uint8_t active = 0; int32_t cid = 0;
+                rpc_read(pid, node + 0x14, &active, 1);
+                rpc_read(pid, node + 0x08, &cid, 4);
+                if (active && cid > 0) { tctx = cid; break; }
+            }
+            for (intptr_t off = 0x38; tbl && off <= 0x130; off += 8) {
+                intptr_t node = 0;
+                rpc_read(pid, tbl + off, &node, 8);
+                if (!node) continue;
+                uint8_t active = 0; int32_t cid = 0;
+                rpc_read(pid, node + 0x14, &active, 1);
+                rpc_read(pid, node + 0x08, &cid, 4);
+                if (active && cid > 0) { thnd = cid; break; }
+            }
+            int minted = 0;
+            int32_t fuid = 0;
+            if (tctx <= 0 && f_fgu > 0 && !s.dead) {
+                rpc_call(&s, f_fgu, s.scratch + 0x30, 0, 0, 0, 0, 0);
+                rpc_read(pid, s.scratch + 0x30, &fuid, 4);
+            }
+            long rreg = -999, rcc = -999;
+            if (tctx <= 0 && fuid != 0 && !s.dead) {
+                // SystemCreateContext(out, uid, params*, 0) — disasm shows
+                // a3 must be non-NULL and a4 must be zero. params carries the
+                // title binding — try the NpTitleId string first.
+                char tp[64];
+                memset(tp, 0, sizeof(tp));
+                memcpy(tp, "PPSA01325_00", 12);
+                rpc_write(pid, s.scratch + 0x100, tp, sizeof(tp));
+                rcc = rpc_call(&s, f_tcc, s.scratch + 0x20, fuid,
+                               s.scratch + 0x100, 0, 0, 0);
+                rpc_read(pid, s.scratch + 0x20, &tctx, 4);
+                minted = 2;
+            }
+            if (tctx > 0 && thnd <= 0 && f_tch > 0 && !s.dead) {
+                rpc_call(&s, f_tch, s.scratch + 0x28, 0, 0, 0, 0, 0);
+                rpc_read(pid, s.scratch + 0x28, &thnd, 4);
+                if (minted == 0) minted = thnd > 0;
+            }
+            if (minted == 2 && tctx > 0 && thnd > 0 && f_reg > 0 && !s.dead)
+                rreg = rpc_call(&s, f_reg, tctx, thnd, 0, 0, 0, 0);
+            o += snprintf(rr + o, sizeof(rr) - o,
+                          " tbl=%lx fuid=%x cc=%lx ctx=%d hnd=%d reg=%lx",
+                          (long)tbl, fuid, rcc, tctx, thnd, rreg);
+            intptr_t f_nst2 = t2h ? krpc_resolve_by_name(pid, t2h, "sceNpTrophy2SystemNetSyncTitles") : 0;
+            intptr_t f_cns2 = t2h ? krpc_resolve_by_name(pid, t2h, "sceNpTrophy2SystemCheckNetSyncTitles") : 0;
+            if (tctx > 0 && thnd > 0 && !s.dead) {
+                int32_t prm[16];
+                memset(prm, 0, sizeof(prm));
+                prm[0] = 2;
+                prm[1] = tid;
+                rpc_write(pid, s.scratch + 0x80, prm, sizeof(prm));
+                long ru = rpc_call(&s, f_unl, tctx, thnd,
+                                   s.scratch + 0x80, 0, 0, 0);
+                o += snprintf(rr + o, sizeof(rr) - o, " unlock=%lx", ru);
+                if (f_cns2 > 0 && !s.dead) {
+                    long rc2 = rpc_call(&s, f_cns2, tctx, thnd,
+                                        s.scratch + 0x100, s.scratch + 0x140,
+                                        0, 0);
+                    uint32_t ov[4] = {0};
+                    rpc_read(pid, s.scratch + 0x140, ov, 16);
+                    o += snprintf(rr + o, sizeof(rr) - o,
+                                  " cns=%lx[%x,%x]", rc2, ov[0], ov[1]);
+                }
+                if (f_nst2 > 0 && !s.dead) {
+                    long rc3 = rpc_call(&s, f_nst2, tctx, thnd,
+                                        s.scratch + 0x180, s.scratch + 0x1c0,
+                                        0, 0);
+                    uint32_t ov[4] = {0};
+                    rpc_read(pid, s.scratch + 0x1c0, ov, 16);
+                    o += snprintf(rr + o, sizeof(rr) - o,
+                                  " nst=%lx[%x,%x]", rc3, ov[0], ov[1]);
+                }
+            }
+            if (minted && f_tdh > 0 && thnd > 0 && !s.dead)
+                rpc_call(&s, f_tdh, thnd, 0, 0, 0, 0, 0);
+            (void)f_tdc;
+            o += snprintf(rr + o, sizeof(rr) - o, " dead=%d", s.dead);
+            rpc_detach(&s);
+        } else {
+            o += snprintf(rr + o, sizeof(rr) - o, " attach-fail");
+        }
+        kernel_set_ucred_authid(me, oa);
+        send_response(session->sock, RESP_DATA, rr, (uint32_t)o);
+        return;
+    }
+
+    // "usync:<tid>" — drive the UDS internal net-sync path in SceShellUI:
+    // IntCreateContext(out, uid, "<TID>_00", 0) → IntCreateHandle →
+    // IntCheckNetSyncTitles / IntNetSyncTitles — the daemon-side pipeline
+    // that drains the events journal and evaluates trophy stats.
+    if (!strncmp(p, "usync:", 6)) {
+        const char *tid = p + 6;
+        pid_t me = getpid();
+        uint64_t oa = kernel_get_ucred_authid(me);
+        kernel_set_ucred_authid(me, 0x4800000000010003ULL);
+        pid_t pid = proc_find_name("SceShellUI");
+        char rr[1024];
+        int o = snprintf(rr, sizeof(rr), "pid=%d", (int)pid);
+        uint32_t uh = 0;
+        if (pid > 0)
+            krpc_dynlib_handle(pid, "libSceNpUniversalDataSystem.sprx", &uh);
+        intptr_t f_icc = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemIntCreateContext") : 0;
+        intptr_t f_ich = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemIntCreateHandle") : 0;
+        intptr_t f_cns = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemIntCheckNetSyncTitles") : 0;
+        intptr_t f_nst = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemIntNetSyncTitles") : 0;
+        intptr_t f_fgu = 0;
+        {
+            uint32_t ush = 0;
+            krpc_dynlib_handle(pid, "libSceUserService.sprx", &ush);
+            if (ush) f_fgu = krpc_resolve_by_name(pid, ush, "sceUserServiceGetForegroundUser");
+        }
+        o += snprintf(rr + o, sizeof(rr) - o, " uh=%x icc=%lx nst=%lx fgu=%lx",
+                      uh, (long)f_icc, (long)f_nst, (long)f_fgu);
+        rpc_sess_t s;
+        memset(&s, 0, sizeof(s));
+        if (f_icc > 0 && rpc_attach(&s, pid, f_icc) == 0) {
+            int32_t fuid = 0;
+            if (f_fgu > 0) {
+                rpc_call(&s, f_fgu, s.scratch + 0x30, 0, 0, 0, 0, 0);
+                rpc_read(pid, s.scratch + 0x30, &fuid, 4);
+            }
+            char tp[32]; memset(tp, 0, sizeof(tp));
+            snprintf(tp, sizeof(tp), "%.9s_00", tid);
+            rpc_write(pid, s.scratch + 0x100, tp, sizeof(tp));
+            int32_t uctx = -1, uhnd = -1;
+            long rcc = rpc_call(&s, f_icc, s.scratch + 0x20, fuid,
+                                s.scratch + 0x100, 0, 0, 0);
+            rpc_read(pid, s.scratch + 0x20, &uctx, 4);
+            long rch = -999;
+            if (uctx > 0 && f_ich > 0 && !s.dead) {
+                rch = rpc_call(&s, f_ich, s.scratch + 0x28, uctx, 0, 0, 0, 0);
+                rpc_read(pid, s.scratch + 0x28, &uhnd, 4);
+            }
+            o += snprintf(rr + o, sizeof(rr) - o,
+                          " fuid=%x tp='%s' cc=%lx ctx=%d ch=%lx hnd=%d",
+                          fuid, tp, rcc, uctx, rch, uhnd);
+            if (uctx > 0 && f_cns > 0 && !s.dead) {
+                long rc1 = rpc_call(&s, f_cns, uctx, uhnd > 0 ? uhnd : 0,
+                                    0, s.scratch + 0x600, 0, 0);
+                uint32_t outv[4] = {0};
+                rpc_read(pid, s.scratch + 0x600, outv, 16);
+                o += snprintf(rr + o, sizeof(rr) - o,
+                              " cns=%lx out=%x,%x", rc1, outv[0], outv[1]);
+            }
+            if (uctx > 0 && f_nst > 0 && !s.dead) {
+                long rc2 = rpc_call(&s, f_nst, uctx, uhnd > 0 ? uhnd : 0,
+                                    0, s.scratch + 0x640, 0, 0);
+                uint32_t outv[4] = {0};
+                rpc_read(pid, s.scratch + 0x640, outv, 16);
+                o += snprintf(rr + o, sizeof(rr) - o,
+                              " nst=%lx out=%x,%x", rc2, outv[0], outv[1]);
+            }
+            o += snprintf(rr + o, sizeof(rr) - o, " dead=%d", s.dead);
+            rpc_detach(&s);
+        } else {
+            o += snprintf(rr + o, sizeof(rr) - o, " attach-fail");
+        }
+        kernel_set_ucred_authid(me, oa);
+        send_response(session->sock, RESP_DATA, rr, (uint32_t)o);
+        return;
+    }
+
+    // "npdat" — inspect the game's NpAsmClient cache (B2 diagnostic):
+    // call sceNpAsmClientGetNpTitleId(titleId, secret) directly; then locate
+    // the singleton through the function's [rip+X] global load and dump the
+    // cache flags (+0xa4/+0xa5/+0xa6) and subsystem_state (+0xbc).
+    if (!strncmp(p, "npdat", 5)) {
+        pid_t me = getpid();
+        uint64_t oa = kernel_get_ucred_authid(me);
+        kernel_set_ucred_authid(me, 0x4800000000010003ULL);
+        uint32_t th = 0;
+        char cand[256];
+        pid_t pid = trp_find_trophy_proc(&th, cand, sizeof(cand));
+        if (pid <= 0) {
+            kernel_set_ucred_authid(me, oa);
+            send_error(session->sock, "no trophy game running"); return;
+        }
+        uint32_t nmh = 0;
+        krpc_dynlib_handle(pid, "libSceNpManager.sprx", &nmh);
+        intptr_t f_get = nmh ? (intptr_t)krpc_dlsym_checked(pid, nmh, "sceNpAsmClientGetNpTitleId") : 0;
+        char rr[2048];
+        int o = snprintf(rr, sizeof(rr), "pid=%d nmh=%x get=%lx",
+                         (int)pid, nmh, (long)f_get);
+        rpc_sess_t s;
+        memset(&s, 0, sizeof(s));
+        if (f_get > 0 && rpc_attach(&s, pid, f_get) == 0) {
+            long rc = rpc_call(&s, f_get, s.scratch + 0x400, s.scratch + 0x500, 0, 0, 0, 0);
+            char tid16[17]; memset(tid16, 0, sizeof(tid16));
+            rpc_read(pid, s.scratch + 0x400, tid16, 16);
+            uint8_t sec4[4] = {0};
+            rpc_read(pid, s.scratch + 0x500, sec4, 4);
+            o += snprintf(rr + o, sizeof(rr) - o,
+                          " call=%lx title='%s' sec4=%02x%02x%02x%02x",
+                          rc, tid16, sec4[0], sec4[1], sec4[2], sec4[3]);
+            // find singleton: scan function prologue for mov reg,[rip+disp]
+            uint8_t code[0x400];
+            memset(code, 0, sizeof(code));
+            rpc_read(pid, f_get, code, sizeof(code));
+            intptr_t single_ptr_addr = 0;
+            for (int i = 0; i < 0x3f0; i++) {
+                if (code[i] == 0x48 && (code[i+1] & 0xc7) == 0x05 &&
+                    (code[i+1] == 0x05 || code[i+1] == 0x0d ||
+                     code[i+1] == 0x15 || code[i+1] == 0x1d ||
+                     code[i+1] == 0x25 || code[i+1] == 0x2d ||
+                     code[i+1] == 0x35 || code[i+1] == 0x3d)) {
+                    int32_t disp = *(int32_t *)(code + i + 3);
+                    intptr_t cand_addr = f_get + i + 7 + disp;
+                    intptr_t val = 0;
+                    rpc_read(pid, cand_addr, &val, 8);
+                    if (val > 0x10000) { single_ptr_addr = cand_addr;
+                        o += snprintf(rr + o, sizeof(rr) - o,
+                                      " glob[%lx]=%lx", (long)cand_addr, (long)val);
+                        break; }
+                }
+            }
+            if (single_ptr_addr) {
+                intptr_t st = 0;
+                rpc_read(pid, single_ptr_addr, &st, 8);
+                if (st) {
+                    uint8_t fl[8]; uint32_t bc = 0;
+                    rpc_read(pid, st + 0xa4, fl, 4);
+                    rpc_read(pid, st + 0xbc, &bc, 4);
+                    char t2[17]; memset(t2, 0, sizeof(t2));
+                    rpc_read(pid, st + 0x14, t2, 16);
+                    o += snprintf(rr + o, sizeof(rr) - o,
+                                  " st=%lx a4=%u a5=%u a6=%u bc=%x title2='%s'",
+                                  (long)st, fl[0], fl[1], fl[2], bc, t2);
+                }
+            }
+            o += snprintf(rr + o, sizeof(rr) - o, " dead=%d", s.dead);
+            rpc_detach(&s);
+        } else {
+            o += snprintf(rr + o, sizeof(rr) - o, " attach-fail");
+        }
         kernel_set_ucred_authid(me, oa);
         send_response(session->sock, RESP_DATA, rr, (uint32_t)o);
         return;
@@ -14582,10 +15293,22 @@ void handle_trophy_unlock(client_session_t *session, const char *arg) {
         }
         uint32_t uh = 0;
         krpc_dynlib_handle(pid, "libSceNpUniversalDataSystem.sprx", &uh);
-        intptr_t f_cev  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemCreateEvent") : 0;
-        intptr_t f_si3  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemEventPropertyObjectSetInt32") : 0;
-        intptr_t f_post = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemPostEvent") : 0;
-        intptr_t f_dev  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemDestroyEvent") : 0;
+        intptr_t f_cev  = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemCreateEvent") : 0;
+        intptr_t f_si3  = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemEventPropertyObjectSetInt32") : 0;
+        intptr_t f_post = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemPostEvent") : 0;
+        intptr_t f_dev  = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemDestroyEvent") : 0;
+        intptr_t f_chnd = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemCreateHandle") : 0;
+        intptr_t f_reg  = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemRegisterContext") : 0;
+        intptr_t f_chk = 0;
+        {
+            const char *npmods[] = { "libSceNpManager.sprx", "libSceNpUtility.sprx",
+                                     "libSceNp.sprx", NULL };
+            for (int i = 0; npmods[i] && !f_chk; i++) {
+                uint32_t nh = 0;
+                if (krpc_dynlib_handle(pid, npmods[i], &nh) == 0 && nh)
+                    f_chk = (intptr_t)krpc_dlsym_checked(pid, nh, "sceNpCheckCallback");
+            }
+        }
         // PostEvent resolved = uds_base + 0x9c90; singleton ptr at base+0x24088
         intptr_t ubase = f_post ? (f_post - 0x9c90) : 0;
         char rr[3000]; int o = snprintf(rr, sizeof(rr), "pid=%d uh=%x ubase=%lx", (int)pid, uh, (long)ubase);
@@ -14603,26 +15326,69 @@ void handle_trophy_unlock(client_session_t *session, const char *arg) {
         }
         // scan ctx slots singleton+0x28..+0x160, hnd slots singleton+0x188..+0x2c0
         int32_t ctxs[40], hnds[40]; int nc = 0, nh = 0;
+        char rr2[1200]; int o2 = 0;
         for (intptr_t sl = singleton + 0x28; sl <= singleton + 0x160 && nc < 40; sl += 8) {
             intptr_t node = 0; rpc_read(pid, sl, &node, 8);
             if (!node) continue;
             int32_t cid = 0; uint8_t act = 0;
             rpc_read(pid, node + 8, &cid, 4); rpc_read(pid, node + 0x14, &act, 1);
-            if (cid > 0 && act) ctxs[nc++] = cid;
+            if (cid > 0 && act) {
+                ctxs[nc++] = cid;
+                // dump the whole ctx node — the bound handle id (0x2xxxx range)
+                // should live inside the node or an adjacent registration rec
+                if (o2 < (int)sizeof(rr2) - 80) {
+                    uint8_t nd[80];
+                    for (int k = 0; k < 80; k += 8)
+                        rpc_read(pid, node + k, nd + k, 8);
+                    o2 += snprintf(rr2 + o2, sizeof(rr2) - o2, " n@%lx:", (long)node);
+                    for (int k = 0; k < 80; k++)
+                        o2 += snprintf(rr2 + o2, sizeof(rr2) - o2, "%02x", nd[k]);
+                }
+            }
         }
-        for (intptr_t sl = singleton + 0x188; sl <= singleton + 0x2c0 && nh < 40; sl += 8) {
+        // widened hnd scan: sweep the whole first 0x800 of the singleton for
+        // nodes whose id sits in the handle range (0x20000..0x3ffff)
+        for (intptr_t sl = singleton + 0x8; sl <= singleton + 0x800 && nh < 40; sl += 8) {
             intptr_t node = 0; rpc_read(pid, sl, &node, 8);
-            if (!node) continue;
+            if (!node || (node & 0xf) != 0 || node < 0x100000 || node > 0x800000000000) continue;
             int32_t cid = 0; uint8_t act = 0;
             rpc_read(pid, node + 8, &cid, 4); rpc_read(pid, node + 0x14, &act, 1);
-            if (cid > 0 && act) hnds[nh++] = cid;
+            if (cid >= 0x20000 && cid < 0x40000 && act) {
+                int dup = 0;
+                for (int i = 0; i < nh; i++) if (hnds[i] == cid) dup = 1;
+                if (!dup) {
+                    hnds[nh++] = cid;
+                    if (o2 < (int)sizeof(rr2) - 90) {
+                        o2 += snprintf(rr2 + o2, sizeof(rr2) - o2, " h@%lx(sl+%lx)", (long)node, (long)(sl - singleton));
+                    }
+                }
+            }
         }
         o += snprintf(rr + o, sizeof(rr) - o, " nctx=%d[", nc);
         for (int i = 0; i < nc && o < 2700; i++) o += snprintf(rr + o, sizeof(rr) - o, "%d,", ctxs[i]);
-        o += snprintf(rr + o, sizeof(rr) - o, "] nhnd=%d[", nh);
+        o += snprintf(rr + o, sizeof(rr) - o, "]%s nhnd=%d[", rr2, nh);
         for (int i = 0; i < nh && o < 2750; i++) o += snprintf(rr + o, sizeof(rr) - o, "%d,", hnds[i]);
         o += snprintf(rr + o, sizeof(rr) - o, "]");
-        if (nc <= 0 || nh <= 0) {
+        if (nc <= 0) {
+            rpc_detach(&s); kernel_set_ucred_authid(me, oa);
+            send_response(session->sock, RESP_DATA, rr, (uint32_t)o); return;
+        }
+        // No live game handle in the table — mint a fresh handle and BIND it
+        // to the game's ctx via RegisterContext: the daemon only extracts
+        // posts that arrive on the ctx's registered handle.
+        if (nh <= 0 && f_chnd > 0) {
+            int32_t fh = 0;
+            rpc_call(&s, f_chnd, s.scratch + 0x8, 0, 0, 0, 0, 0);
+            rpc_read(pid, s.scratch + 0x8, &fh, 4);
+            if (fh > 0) {
+                long rb = f_reg > 0
+                    ? rpc_call(&s, f_reg, ctxs[0], fh, 0, 0, 0, 0) : -1;
+                hnds[nh++] = fh;
+                o += snprintf(rr + o, sizeof(rr) - o,
+                              " fresh-hnd=%d,bind=%lx", fh, rb);
+            }
+        }
+        if (nh <= 0) {
             rpc_detach(&s); kernel_set_ucred_authid(me, oa);
             send_response(session->sock, RESP_DATA, rr, (uint32_t)o); return;
         }
@@ -14641,15 +15407,23 @@ void handle_trophy_unlock(client_session_t *session, const char *arg) {
         o += snprintf(rr + o, sizeof(rr) - o, " ev=%lx s=%lx", (long)ev, r_s);
         for (int i = 0; i < nc && !s.dead; i++) {
             for (int j = 0; j < nh && !s.dead; j++) {
-                long rp = rpc_call(&s, f_post, ctxs[i], hnds[j], (long)ev, 0, 0, 0);
+                long rp = rpc_call(&s, f_post, ctxs[i], hnds[j], (long)ev, 1, 0, 0);
                 o += snprintf(rr + o, sizeof(rr) - o, " p[%d,%d]=%lx", ctxs[i], hnds[j], rp);
             }
         }
+        if (f_chk > 0)
+            for (int i = 0; i < 8 && !s.dead; i++) {
+                long rc8 = rpc_call(&s, f_chk, 0,0,0,0,0,0);
+                if (i == 0 || i == 7)
+                    o += snprintf(rr + o, sizeof(rr) - o, " chk%d=%lx", i, rc8);
+                if (rc8 < 0) break;
+                usleep(50000);
+            }
         if (ev && f_dev && !s.dead) rpc_call(&s, f_dev, (long)ev, 0,0,0,0,0);
         // "udsb:<id>:a" — also post a synthetic activityEnd through the game ctx
         // to mimic the checkpoint-time event batch that kicks extraction.
         if (strstr(p, ":a") && !s.dead) {
-            intptr_t f_ss = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemEventPropertyObjectSetString") : 0;
+            intptr_t f_ss = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemEventPropertyObjectSetString") : 0;
             intptr_t s_ev   = s.scratch + 0x140;  // "activityEnd"
             intptr_t s_zone = s.scratch + 0x160;  // "zoneId"
             intptr_t s_act  = s.scratch + 0x180;  // "activityId"
@@ -14717,20 +15491,21 @@ void handle_trophy_unlock(client_session_t *session, const char *arg) {
         }
         uint32_t uh = 0;
         krpc_dynlib_handle(pid, "libSceNpUniversalDataSystem.sprx", &uh);
-        intptr_t f_cev  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemCreateEvent") : 0;
-        intptr_t f_si3  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemEventPropertyObjectSetInt32") : 0;
-        intptr_t f_si64 = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemEventPropertyObjectSetInt64") : 0;
-        intptr_t f_ss   = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemEventPropertyObjectSetString") : 0;
-        intptr_t f_post = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemPostEvent") : 0;
-        intptr_t f_dev  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemDestroyEvent") : 0;
-        intptr_t f_chnd = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemCreateHandle") : 0;
-        intptr_t f_cctx = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemCreateContext") : 0;
-        intptr_t f_reg  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemRegisterContext") : 0;
-        intptr_t f_dh   = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemDestroyHandle") : 0;
-        intptr_t f_dc   = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemDestroyContext") : 0;
+        intptr_t f_cev  = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemCreateEvent") : 0;
+        intptr_t f_si3  = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemEventPropertyObjectSetInt32") : 0;
+        intptr_t f_si64 = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemEventPropertyObjectSetInt64") : 0;
+        intptr_t f_ss   = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemEventPropertyObjectSetString") : 0;
+        intptr_t f_post = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemPostEvent") : 0;
+        intptr_t f_dev  = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemDestroyEvent") : 0;
+        intptr_t f_chnd = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemCreateHandle") : 0;
+        intptr_t f_cctx = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemCreateContext") : 0;
+        intptr_t f_reg  = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemRegisterContext") : 0;
+        intptr_t f_dh   = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemDestroyHandle") : 0;
+        intptr_t f_dc   = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemDestroyContext") : 0;
         char rr[3000];
-        int o = snprintf(rr, sizeof(rr), "pid=%d uh=%x cev=%lx si3=%lx si64=%lx ss=%lx post=%lx",
-                         (int)pid, uh, (long)f_cev, (long)f_si3, (long)f_si64,
+        int o = snprintf(rr, sizeof(rr), "pid=%d uh=%x cctx=%lx chnd=%lx reg=%lx cev=%lx si3=%lx si64=%lx ss=%lx post=%lx",
+                         (int)pid, uh, (long)f_cctx, (long)f_chnd, (long)f_reg,
+                         (long)f_cev, (long)f_si3, (long)f_si64,
                          (long)f_ss, (long)f_post);
         if (!uh || !f_cev || !f_post || !f_chnd) {
             kernel_set_ucred_authid(me, oa); send_error(session->sock, rr); return;
@@ -14800,7 +15575,7 @@ void handle_trophy_unlock(client_session_t *session, const char *arg) {
         } else {
             uint32_t uid = 0, ush = 0;
             if (krpc_dynlib_handle(pid, "libSceUserService.sprx", &ush) == 0 && ush) {
-                intptr_t f_fg = (intptr_t)krpc_dlsym_checked(pid, ush, "sceUserServiceGetForegroundUser");
+                intptr_t f_fg = krpc_resolve_by_name(pid, ush, "sceUserServiceGetForegroundUser");
                 if (f_fg && !s.dead) {
                     rpc_call(&s, f_fg, s.scratch + 0x40, 0, 0, 0, 0, 0);
                     rpc_read(pid, s.scratch + 0x40, &uid, 4);
@@ -14817,6 +15592,13 @@ void handle_trophy_unlock(client_session_t *session, const char *arg) {
                     }
                     closedir(home);
                 }
+            }
+            intptr_t f_ini = uh ? (intptr_t)krpc_dlsym_checked(
+                pid, uh, "sceNpUniversalDataSystemInitialize") : 0;
+            if (f_ini && !s.dead) {
+                uint64_t ip[2] = { 16, 128u * 1024 };
+                rpc_write(pid, s.scratch + 0x40, ip, sizeof(ip));
+                rpc_call(&s, f_ini, s.scratch + 0x40, 0, 0, 0, 0, 0);
             }
             if (f_cctx && !s.dead) {
                 rpc_call(&s, f_cctx, s.scratch, uid, 0, 0, 0, 0);
@@ -14850,7 +15632,8 @@ void handle_trophy_unlock(client_session_t *session, const char *arg) {
                       (long)ev, (long)pobj);
         long r_set = -1;
         if (ev && !s.dead) {
-            long pv = ent.evval >= 0 ? ent.evval : want_id;
+            long pv = ent.evval >= 0 ? ent.evval
+                                    : (ent.target > 0 ? ent.target : want_id);
             if (as_str && f_ss > 0) {
                 char vs[16];
                 snprintf(vs, sizeof(vs), "%03d", (int)pv);
@@ -14862,13 +15645,15 @@ void handle_trophy_unlock(client_session_t *session, const char *arg) {
             }
         }
         long rp = (ev && !s.dead)
-            ? rpc_call(&s, f_post, ctx, hnd, (long)ev, 0, 0, 0) : -1;
-        if (!s.dead) usleep(400000);
+            ? rpc_call(&s, f_post, ctx, hnd, (long)ev, 1, 0, 0) : -1;
+        if (!s.dead) usleep(50000);
         if (ev && f_dev > 0 && !s.dead)
             rpc_call(&s, f_dev, (long)ev, 0, 0, 0, 0, 0);
         if (hnd > 0 && f_dh > 0 && !s.dead)
             rpc_call(&s, f_dh, hnd, 0, 0, 0, 0, 0);
-        if (!borrow && ctx > 0 && f_dc > 0 && !s.dead)
+        // guard against a garbage ctx id (failed CreateContext leaves *out
+        // untouched — DestroyContext on it kills the game thread)
+        if (!borrow && ctx > 0 && ctx < 0x40000000 && f_dc > 0 && !s.dead)
             rpc_call(&s, f_dc, ctx, 0, 0, 0, 0, 0);
         rpc_detach(&s);
         kernel_set_ucred_authid(me, oa);
@@ -14908,19 +15693,19 @@ void handle_trophy_unlock(client_session_t *session, const char *arg) {
         }
         uint32_t uh = 0;
         krpc_dynlib_handle(pid, "libSceNpUniversalDataSystem.sprx", &uh);
-        intptr_t f_init  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemInitialize") : 0;
-        intptr_t f_cctx  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemCreateContext") : 0;
-        intptr_t f_chnd  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemCreateHandle") : 0;
-        intptr_t f_reg   = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemRegisterContext") : 0;
-        intptr_t f_cev   = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemCreateEvent") : 0;
-        intptr_t f_seti3 = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemEventPropertyObjectSetInt32") : 0;
+        intptr_t f_init  = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemInitialize") : 0;
+        intptr_t f_cctx  = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemCreateContext") : 0;
+        intptr_t f_chnd  = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemCreateHandle") : 0;
+        intptr_t f_reg   = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemRegisterContext") : 0;
+        intptr_t f_cev   = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemCreateEvent") : 0;
+        intptr_t f_seti3 = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemEventPropertyObjectSetInt32") : 0;
         if (f_seti3 <= 0 && uh)
-            f_seti3 = (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemEventPropertyObjectSetInt64");
-        intptr_t f_post  = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemPostEvent") : 0;
-        intptr_t f_dev   = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemDestroyEvent") : 0;
-        intptr_t f_tostr = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemEventToString") : 0;
-        intptr_t f_dh    = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemDestroyHandle") : 0;
-        intptr_t f_dc    = uh ? (intptr_t)krpc_dlsym_checked(pid, uh, "sceNpUniversalDataSystemDestroyContext") : 0;
+            f_seti3 = krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemEventPropertyObjectSetInt64");
+        intptr_t f_post  = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemPostEvent") : 0;
+        intptr_t f_dev   = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemDestroyEvent") : 0;
+        intptr_t f_tostr = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemEventToString") : 0;
+        intptr_t f_dh    = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemDestroyHandle") : 0;
+        intptr_t f_dc    = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemDestroyContext") : 0;
         char r2[3000];
         int o2 = snprintf(r2, sizeof(r2), "pid=%d UH=%u init=%lx cctx=%lx ch=%lx reg=%lx cev=%lx set3=%lx post=%lx%s",
                           (int)pid, uh, (long)f_init, (long)f_cctx, (long)f_chnd,
@@ -14934,7 +15719,7 @@ void handle_trophy_unlock(client_session_t *session, const char *arg) {
         intptr_t f_fg = 0;
         uint32_t ush = 0;
         if (krpc_dynlib_handle(pid, "libSceUserService.sprx", &ush) == 0 && ush)
-            f_fg = (intptr_t)krpc_dlsym_checked(pid, ush, "sceUserServiceGetForegroundUser");
+            f_fg = krpc_resolve_by_name(pid, ush, "sceUserServiceGetForegroundUser");
         rpc_sess_t s;
         int arc = rpc_attach(&s, pid, f_cctx);
         if (arc != 0 || s.dead) {
@@ -14986,8 +15771,12 @@ void handle_trophy_unlock(client_session_t *session, const char *arg) {
         o2 += snprintf(r2 + o2, sizeof(r2) - o2, " uid=%08x", uid);
 
         int32_t ctx = 0, hnd = 0;
-        long r_init = f_init > 0 && !s.dead
-            ? rpc_call(&s, f_init, s.scratch + 0x60, 0, 0, 0, 0, 0) : -999;
+        long r_init = -999;
+        if (f_init > 0 && !s.dead) {
+            uint64_t ip[2] = { 16, 128u * 1024 };
+            rpc_write(pid, s.scratch + 0x60, ip, sizeof(ip));
+            r_init = rpc_call(&s, f_init, s.scratch + 0x60, 0, 0, 0, 0, 0);
+        }
         long r_ctx = s.dead ? -1
             : rpc_call(&s, f_cctx, s.scratch, uid, 0, 0, 0, 0);
         if (!s.dead) rpc_read(pid, s.scratch, &ctx, 4);
@@ -15043,9 +15832,8 @@ void handle_trophy_unlock(client_session_t *session, const char *arg) {
                                    " evjson(%lx,n=%d)=%.240s", tr, wn, ej);
                 }
                 long r_post = rpc_call(&s, f_post, ctx, hnd, (long)ev, post_flags, 0, 0);
-                // Give the service time to drain the queue before teardown —
-                // destroying the event/context immediately can drop the post.
-                if (!s.dead) usleep(400000);
+                // Post is synchronous IPC; a short drain pause is enough.
+                if (!s.dead) usleep(50000);
                 if (f_dev > 0 && !s.dead && !keep)
                     rpc_call(&s, f_dev, (long)ev, 0, 0, 0, 0, 0);
                 o2 += snprintf(r2 + o2, sizeof(r2) - o2,
@@ -15139,7 +15927,7 @@ void handle_trophy_unlock(client_session_t *session, const char *arg) {
     intptr_t fn_fg = 0, fn_login = 0, fn_init = 0;
     uint32_t ush = 0;
     if (krpc_dynlib_handle(pid, "libSceUserService.sprx", &ush) == 0 && ush) {
-        fn_fg    = (intptr_t)krpc_dlsym_checked(pid, ush, "sceUserServiceGetForegroundUser");
+        fn_fg    = krpc_resolve_by_name(pid, ush, "sceUserServiceGetForegroundUser");
         fn_login = (intptr_t)krpc_dlsym_checked(pid, ush, "sceUserServiceGetLoginUserIdList");
         fn_init  = (intptr_t)krpc_dlsym_checked(pid, ush, "sceUserServiceGetInitialUser");
     }
@@ -15610,6 +16398,8 @@ void *client_thread(void *arg) {
             case CMD_UNMOUNT_GAME:
                 if (data) {
                     handle_unmount_game(session, (const char *)data);
+                } else {
+                    send_error(session->sock, "No title ID provided");
                 }
                 break;
             case CMD_UNMOUNT_ALL:
@@ -15884,6 +16674,7 @@ void *client_thread(void *arg) {
                         release_file_mutex(session->upload_path);
                     }
                 }
+                free(session->dl_buf);
                 free(session);
                 exit(0);
             default:
@@ -15905,6 +16696,7 @@ void *client_thread(void *arg) {
             release_file_mutex(session->upload_path);
         }
     }
+    free(session->dl_buf);
     free(session);
     __sync_fetch_and_sub(&g_active_sessions, 1);
     return NULL;

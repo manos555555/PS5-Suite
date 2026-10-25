@@ -4,6 +4,37 @@ All notable changes to **PS5 Suite** (client app + on-console payload).
 
 ---
 
+## v7.7.0 (October 2026)
+
+### Bug Fixes
+- **Trophy timestamps now show local time** — `TRPTITLE.DAT` stores unlock timestamps in UTC (microseconds since 0001-01-01); the client was displaying them as-is without `.ToLocalTime()`, so every trophy appeared unlocked hours behind the actual local time (e.g. 3 hours off in UTC+3 timezones).
+- **Download data corruption fixed** — the payload's `handle_download_file()` used a static shared `g_dl_buf` across all threads; concurrent downloads could interleave buffer contents. Each `client_session_t` now has its own lazy-allocated 16 MB `dl_buf`.
+- **Trophy unlock/lock guards** — the client no longer issues an unlock on an already-unlocked trophy or a lock on an already-locked one.
+- **Unmount All button state** — the button is now re-enabled based on actual connection state after the operation instead of unconditionally.
+- **`CMD_UNMOUNT_GAME` without a title id** now returns a proper error instead of being silently ignored.
+- **`.bak` backup integrity (payload)** — `trp_lock_file`/`trp_unlock_file` verify the backup copy completed before rewriting `TRPTITLE.DAT`; a partial/failed backup aborts the edit and cleans up.
+
+### Major Improvements
+- **Parallel folder downloads (8 connections)** — `DownloadFolderAsync()` replaced the sequential loop with 8 parallel `Task.Run` workers throttled by `SemaphoreSlim`, each opening its own `PS5Protocol` connection.
+- **Double-buffered download I/O** — `DownloadFileAsync()` now alternates two `ArrayPool<byte>` buffers: one reads from the network while the other writes to disk, maximizing throughput on gigabit LANs.
+
+### Trophies (payload)
+- **NID-first symbol resolution** — new `krpc_resolve_by_name()` resolves remote symbols by NID first (covers NID-only exports like `libSceNpUniversalDataSystem`) with a dlsym-by-name fallback (covers debug exports that have no NID).
+- **Events post as game-generated** — UDS events are now posted with `GENERATED_BY_CODEGEN` on a fresh per-post handle; posts on the registered handle or with option 0 were journaled but never reached the daemon's stat-extraction pass.
+- **NP callback pump** — `sceNpCheckCallback` is invoked after every post so the daemon drains the event queue and delivers the notification.
+- **Borrowed-context handle binding** — when the game's UDS singleton has no live registered handle, the `udsb:` path mints a fresh one and binds it via `RegisterContext`; the handle scan now sweeps the full handle-id range.
+- **New direct-award path (`t2u:`)** — awards/re-locks trophies through `sceNpTrophy2SystemDebugUnlockTrophy`/`sceNpTrophy2SystemDebugLockTrophy`, the daemon's own debug op, on the game's registered ctx/hnd pair.
+- **Context destroy = journal flush** — the fresh UDS context/handle created for posting is destroyed afterwards, triggering the daemon's extraction pass that grants the award.
+- **Richer diagnostics** — context/handle/register return codes and posted-id tracking are included in the response for easier field debugging.
+
+### Removed
+- **Dead `ParallelUploader` class** — the multi-connection upload path was unreachable (always fell back to single connection). Removed entirely.
+
+### Known limitations
+- A small number of games drive their trophies through a **custom protocol** rather than the standard `libSceNpTrophy2`/UDS pipelines — trophy unlocking for those titles is not supported yet and will be addressed in a future release.
+
+---
+
 ## v7.3.0 (October 2026)
 
 ### New Features

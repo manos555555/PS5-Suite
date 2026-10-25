@@ -538,7 +538,7 @@ namespace PS5Upload
             finally
             {
                 UnmountAllGamesButton.Content = "🗑️ Unmount All";
-                UnmountAllGamesButton.IsEnabled = true;
+                UnmountAllGamesButton.IsEnabled = _protocol.IsConnected;
             }
         }
 

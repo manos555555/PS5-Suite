@@ -295,7 +295,7 @@ namespace PS5Upload
                 DateTime when = default;
                 if (unlocked && ts > 0)
                 {
-                    try { when = epoch + TimeSpan.FromTicks(ts * 10); } catch { }
+                    try { when = (epoch + TimeSpan.FromTicks(ts * 10)).ToLocalTime(); } catch { }
                 }
                 rowState[id] = (unlocked, when);
             }
@@ -434,6 +434,7 @@ namespace PS5Upload
         private async void TrophyUnlock_Click(object? sender, RoutedEventArgs e)
         {
             if (sender is not Button { DataContext: PS5Trophy t }) return;
+            if (t.IsUnlocked) { Log("⚠️ Trophy is already unlocked"); return; }
             if (TrophySetsListBox.SelectedItem is not PS5TrophySet set) return;
             if (!await EnsureTrophyGameRunningAsync(set)) return;
             if (!await ShowConfirmAsync(
@@ -448,6 +449,7 @@ namespace PS5Upload
         private async void TrophyLock_Click(object? sender, RoutedEventArgs e)
         {
             if (sender is not Button { DataContext: PS5Trophy t }) return;
+            if (!t.IsUnlocked) { Log("⚠️ Trophy is already locked"); return; }
             if (TrophySetsListBox.SelectedItem is not PS5TrophySet set) return;
             if (!_protocol.IsConnected) { Log("❌ Not connected to PS5"); return; }
             if (!await ShowConfirmAsync(
