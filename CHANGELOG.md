@@ -1,5 +1,25 @@
 # Changelog - PS5 Suite
 
+## v7.8.0 (October 2026)
+
+### Mobile UI — responsive layout (Android)
+
+- Multi-column pages now stack vertically on narrow screens (< 700px): System Monitor cards, Live Sensors, Network/Traffic, Memory Editor panes, Trophies list + detail, search/sort toolbars, FPKG field pairs
+- Fan Control slider stretches to available width; preset buttons wrap
+- PKG install/browse buttons wrap; Convert-to-FPKG fields stack
+- Memory and PKG pages get scroll containers on phones — nothing clips off-screen
+- Long game/store names now ellipsize instead of clipping
+- Same shared layout code on desktop: window resized below 700px gets the adaptive layout too
+
+### Trophies — custom-event game support (payload)
+
+- **Borrowed game context for UDS posts** — trophy events are now posted under the game's own daemon-bound UDS context (read from the libSceNpUniversalDataSystem singleton table) instead of a fresh context. Games that use custom extraction events (e.g. Onimusha) only award trophies when the daemon extracts from the game's registered context; posts on a foreign context were accepted but silently discarded.
+- **activityEnd trigger** — after posting trophy events, a synthetic `activityEnd` event is sent on the game's context to kick the daemon's extraction pass. Custom-event games extract at activity boundaries, not on every `sceNpCheckCallback` pump.
+- **Singleton scan timing** — the UDS singleton is scanned before `CreateContext`/`CreateHandle` to avoid picking up our own freshly minted handle instead of the game's real one.
+- **Fallback chain preserved** — if the game's context is unavailable the code falls back to the original fresh-context path, so standard-event games (which worked before) are unaffected.
+
+---
+
 All notable changes to **PS5 Suite** (client app + on-console payload).
 
 ---
@@ -29,9 +49,6 @@ All notable changes to **PS5 Suite** (client app + on-console payload).
 
 ### Removed
 - **Dead `ParallelUploader` class** — the multi-connection upload path was unreachable (always fell back to single connection). Removed entirely.
-
-### Known limitations
-- A small number of games drive their trophies through a **custom protocol** rather than the standard `libSceNpTrophy2`/UDS pipelines — trophy unlocking for those titles is not supported yet and will be addressed in a future release.
 
 ---
 

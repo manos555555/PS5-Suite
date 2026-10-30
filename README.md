@@ -1,4 +1,4 @@
-# 🎮 PS5 Suite v7.7.0 — Complete PS5 Management Platform
+# 🎮 PS5 Suite v7.8.0 — Complete PS5 Management Platform
 
 **By Manos**
 
@@ -45,6 +45,15 @@ All-in-one management suite for jailbroken PS5 consoles. One app — on **Window
 | `PS5Suite.apk` | **Android** — signed APK, full feature parity with desktop |
 | `ps5_suite_server.elf` | **Required** on-console server component |
 
+### ✨ New in v7.8.0
+
+- **Responsive mobile UI (Android)** — every page stacks its cards, toolbars and editor panes vertically on narrow screens: System Monitor, Live Sensors, Trophies, Memory Editor, PKG tools, search/sort toolbars
+- Fan Control slider stretches to width; preset buttons wrap
+- Memory and PKG pages scroll on phones — nothing clips off-screen
+- Long game/store names ellipsize instead of clipping
+- Same adaptive layout on the desktop client when the window is narrower than 700px
+- **Trophy unlock: custom-event game support (payload)** — games using custom UDS extraction events (e.g. Onimusha) now unlock correctly. Events are posted under the game's own daemon-bound context (borrowed from the UDS singleton table), and a synthetic `activityEnd` triggers the daemon's extraction pass. Standard-event games are unaffected (fallback to the original fresh-context path).
+
 ### ✨ New in v7.7.0
 
 - **Trophy unlock pipeline reworked (payload)** — NID-first symbol resolution covers NID-only exports; events now post as game-generated (`GENERATED_BY_CODEGEN`) on a fresh per-post handle; the NP callback pump (`sceNpCheckCallback`) is invoked after every post so the daemon drains the event queue; the borrowed-context path mints and binds a fresh handle via `RegisterContext` when no live game handle exists; destroying the context triggers the daemon's journal flush so the award actually lands. A new direct-award path drives `sceNpTrophy2SystemDebugUnlockTrophy`/`LockTrophy` — the daemon's own debug op on the game's registered pair.
@@ -53,7 +62,6 @@ All-in-one management suite for jailbroken PS5 consoles. One app — on **Window
 - **Download: 8-connection parallel folder downloads** — folder downloads now use 8 parallel connections with `SemaphoreSlim` throttling instead of sequential one-file-at-a-time.
 - **Download: double-buffered I/O with ArrayPool** — file downloads overlap network reads with disk writes using two alternating buffers rented from `ArrayPool<byte>`, cutting allocation waste and improving throughput on fast LANs.
 - **Removed dead `ParallelUploader` class** — unreachable upload code that always fell back to single-connection was removed.
-- **Known limitation:** a small number of games drive their trophies through a **custom protocol** instead of the standard pipelines — trophy unlocking for those titles is not supported yet and will be addressed in a future release.
 
 ### ✨ New in v7.6.0
 

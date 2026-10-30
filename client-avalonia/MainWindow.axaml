@@ -433,7 +433,7 @@
                     </Border>
 
                     <Border Grid.Row="1" Background="#252526" CornerRadius="4" Padding="8" Margin="0,0,0,10">
-                        <Grid>
+                        <Grid x:Name="GameToolbarGrid">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*"/>
                                 <ColumnDefinition Width="Auto"/>
@@ -478,7 +478,7 @@
                                             </Border>
                                         </Grid>
                                         <StackPanel Grid.Column="1" VerticalAlignment="Center">
-                                            <TextBlock Text="{Binding Name}" FontSize="16" FontWeight="Bold"/>
+                                            <TextBlock Text="{Binding Name}" FontSize="16" FontWeight="Bold" TextTrimming="CharacterEllipsis"/>
                                             <StackPanel Orientation="Horizontal" Margin="0,5,0,0">
                                                 <TextBlock Text="{Binding TitleId}" FontSize="13" Foreground="#007ACC" FontWeight="SemiBold"/>
                                                 <TextBlock Text=" • " Foreground="#666666"/>
@@ -515,7 +515,7 @@
                                     </WrapPanel>
                                 </Border>
                                 <Border Grid.Row="1" Background="#252526" CornerRadius="4" Padding="8" Margin="0,0,0,10">
-                                    <Grid>
+                                    <Grid x:Name="ProsperoToolbarGrid">
                                         <Grid.ColumnDefinitions>
                                             <ColumnDefinition Width="*"/>
                                             <ColumnDefinition Width="Auto"/>
@@ -558,7 +558,7 @@
                                                         </Border>
                                                     </Grid>
                                                     <StackPanel Grid.Column="1" VerticalAlignment="Center">
-                                                        <TextBlock Text="{Binding Name}" FontSize="15" FontWeight="Bold"/>
+                                                        <TextBlock Text="{Binding Name}" FontSize="15" FontWeight="Bold" TextTrimming="CharacterEllipsis"/>
                                                         <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
                                                             <TextBlock Text="{Binding TitleId}" FontSize="12" Foreground="#007ACC" FontWeight="SemiBold"/>
                                                             <TextBlock Text=" • " Foreground="#666666"/>
@@ -596,7 +596,7 @@
                                     </WrapPanel>
                                 </Border>
                                 <Border Grid.Row="1" Background="#252526" CornerRadius="4" Padding="8" Margin="0,0,0,10">
-                                    <Grid>
+                                    <Grid x:Name="TrophyToolbarGrid">
                                         <Grid.ColumnDefinitions>
                                             <ColumnDefinition Width="*"/>
                                             <ColumnDefinition Width="Auto"/>
@@ -613,7 +613,7 @@
                                         </ComboBox>
                                     </Grid>
                                 </Border>
-                                <Grid Grid.Row="2">
+                                <Grid x:Name="TrophyMainGrid" Grid.Row="2">
                                     <Grid.ColumnDefinitions>
                                         <ColumnDefinition Width="320"/>
                                         <ColumnDefinition Width="*"/>
@@ -841,7 +841,7 @@
                         </WrapPanel>
 
                         <!-- Row 1: System Info + Extended Info -->
-                        <Grid Margin="0,0,0,15">
+                        <Grid x:Name="SysInfoRowGrid" Margin="0,0,0,15">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*"/>
                                 <ColumnDefinition Width="15"/>
@@ -919,7 +919,7 @@
                         <Border Background="#252526" BorderBrush="#3E3E42" BorderThickness="1" CornerRadius="6" Padding="15" Margin="0,0,0,15">
                             <StackPanel>
                                 <TextBlock Text="🌡️ Live Sensors" FontWeight="Bold" FontSize="14" Foreground="#0E9CFF" Margin="0,0,0,12"/>
-                                <Grid>
+                                <Grid x:Name="SysSensorsGrid">
                                     <Grid.ColumnDefinitions>
                                         <ColumnDefinition Width="*"/>
                                         <ColumnDefinition Width="*"/>
@@ -959,7 +959,7 @@
                         </Border>
 
                         <!-- Row 3: CPU Usage + Memory -->
-                        <Grid Margin="0,0,0,15">
+                        <Grid x:Name="SysCpuMemRowGrid" Margin="0,0,0,15">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*"/>
                                 <ColumnDefinition Width="15"/>
@@ -1069,7 +1069,7 @@
 
                         <!-- Row 3b: Network -->
                         <Border Background="#252526" BorderBrush="#3E3E42" BorderThickness="1" CornerRadius="6" Padding="15" Margin="0,0,0,15">
-                            <Grid>
+                            <Grid x:Name="SysNetGrid">
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="*"/>
                                     <ColumnDefinition Width="20"/>
@@ -1244,16 +1244,20 @@
                                 <Border Grid.Row="2" Background="#252526" BorderBrush="#3E3E42" BorderThickness="1" CornerRadius="6" Padding="15">
                                     <StackPanel>
                                         <TextBlock Text="Set New Threshold (30-90°C):" Foreground="#808080" Margin="0,0,0,10"/>
-                                        <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
-                                            <Slider x:Name="FanThresholdSlider" Minimum="30" Maximum="90" Value="60" Width="300" VerticalAlignment="Center"/>
-                                            <TextBlock x:Name="FanSliderValueText" Text="60°C" FontSize="18" FontWeight="Bold" Foreground="#28A745" Margin="15,0,0,0" VerticalAlignment="Center"/>
-                                        </StackPanel>
-                                        <StackPanel Orientation="Horizontal">
+                                        <Grid Margin="0,0,0,10">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                            </Grid.ColumnDefinitions>
+                                            <Slider x:Name="FanThresholdSlider" Minimum="30" Maximum="90" Value="60" VerticalAlignment="Center" MaxWidth="400"/>
+                                            <TextBlock Grid.Column="1" x:Name="FanSliderValueText" Text="60°C" FontSize="18" FontWeight="Bold" Foreground="#28A745" Margin="15,0,0,0" VerticalAlignment="Center"/>
+                                        </Grid>
+                                        <WrapPanel>
                                             <Button Content="🌡️ Set Threshold" Click="SetFanThreshold_Click" Padding="15,8" Background="#007ACC" FontWeight="SemiBold"/>
                                             <Button Content="❄️ Cool (50°C)" Click="FanCool_Click" Padding="10,8" Background="#17A2B8" Margin="10,0,0,0"/>
                                             <Button Content="⚖️ Balanced (60°C)" Click="FanBalanced_Click" Padding="10,8" Background="#28A745" Margin="10,0,0,0"/>
                                             <Button Content="🔇 Quiet (70°C)" Click="FanQuiet_Click" Padding="10,8" Background="#FFC107" Foreground="#1E1E1E" Margin="10,0,0,0"/>
-                                        </StackPanel>
+                                        </WrapPanel>
                                         <TextBlock Text="⚠️ Lower = cooler but louder fan. Higher = quieter but warmer." Foreground="#707070" FontSize="11" Margin="0,15,0,0"/>
                                     </StackPanel>
                                 </Border>
@@ -1379,7 +1383,7 @@
 
                         <!-- Memory Editor Tab -->
                         <TabItem Header="🧠 Memory">
-                            <Grid Background="#1E1E1E" Margin="15">
+                            <Grid x:Name="MemEditorRootGrid" Background="#1E1E1E" Margin="15">
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="300"/>
                                     <ColumnDefinition Width="15"/>
@@ -1518,7 +1522,7 @@
 
                         <!-- PKG Install & Convert Tab -->
                         <TabItem Header="📦 PKG">
-                            <Grid Background="#1E1E1E" Margin="15">
+                            <Grid x:Name="PkgRootGrid" Background="#1E1E1E" Margin="15">
                                 <Grid.RowDefinitions>
                                     <RowDefinition Height="Auto"/>
                                     <RowDefinition Height="Auto"/>
@@ -1532,11 +1536,11 @@
                                     <StackPanel>
                                         <TextBlock Text="PKG path(s) — PS5 path, HTTP URL, or local PC file (';' separates multiple):" Foreground="#808080" Margin="0,0,0,5"/>
                                         <TextBox x:Name="PkgPathTextBox" Background="#2D2D30" BorderBrush="#3E3E42" Padding="10" Margin="0,0,0,10" Text="/user/data/pkg/"/>
-                                        <StackPanel Orientation="Horizontal">
+                                        <WrapPanel>
                                             <Button Content="📦 Install PKG" Click="InstallPkg_Click" Padding="15,8" Background="#007ACC" FontWeight="SemiBold"/>
                                             <Button Content="📋 Browse PS5" Click="BrowsePkgPath_Click" Padding="10,8" Background="#3E3E42" Margin="10,0,0,0"/>
                                             <Button Content="💻 Browse PC" Click="BrowsePcPkg_Click" Padding="10,8" Background="#3E3E42" Margin="10,0,0,0"/>
-                                        </StackPanel>
+                                        </WrapPanel>
                                     </StackPanel>
                                 </Border>
                                 
@@ -1557,12 +1561,16 @@
                                         <TextBlock Text="🔄 Convert to FPKG" FontWeight="Bold" FontSize="14" Foreground="#0E9CFF" Margin="0,0,0,15"/>
                                         
                                         <TextBlock Text="Source folder (decrypted game):" Foreground="#808080" Margin="0,0,0,5"/>
-                                        <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
-                                            <TextBox x:Name="FpkgSourcePathTextBox" Background="#2D2D30" BorderBrush="#3E3E42" Padding="10" MinWidth="300" IsReadOnly="True"/>
-                                            <Button Content="📁 Browse" Click="BrowseFpkgSource_Click" Padding="10,5" Background="#3E3E42" Margin="10,0,0,0"/>
-                                        </StackPanel>
-                                        
                                         <Grid Margin="0,0,0,10">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                            </Grid.ColumnDefinitions>
+                                            <TextBox x:Name="FpkgSourcePathTextBox" Background="#2D2D30" BorderBrush="#3E3E42" Padding="10" MinWidth="180" IsReadOnly="True"/>
+                                            <Button Grid.Column="1" Content="📁 Browse" Click="BrowseFpkgSource_Click" Padding="10,5" Background="#3E3E42" Margin="10,0,0,0"/>
+                                        </Grid>
+                                        
+                                        <Grid x:Name="FpkgIdGrid" Margin="0,0,0,10">
                                             <Grid.ColumnDefinitions>
                                                 <ColumnDefinition Width="*"/>
                                                 <ColumnDefinition Width="*"/>
@@ -1577,7 +1585,7 @@
                                             </StackPanel>
                                         </Grid>
                                         
-                                        <Grid Margin="0,0,0,10">
+                                        <Grid x:Name="FpkgTitleGrid" Margin="0,0,0,10">
                                             <Grid.ColumnDefinitions>
                                                 <ColumnDefinition Width="*"/>
                                                 <ColumnDefinition Width="*"/>

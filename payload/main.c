@@ -2190,7 +2190,7 @@ void release_file_mutex(const char *path) {
 // payload loader (elfldr raw-socket protocol — identical to what the PC
 // client does during deploy). The spawned instance sweeps every stale
 // "payload*" process and binds the port — no explicit handoff needed.
-#define SUITE_VERSION      "7.7.0"
+#define SUITE_VERSION      "7.8.0"
 #define SUITE_DIR          "/data/ps5suite"
 #define UPDATE_STAGE_PATH  "/data/ps5suite/update.elf"
 #define UPDATE_MARKER      "/data/ps5suite/update.marker"
@@ -13315,11 +13315,41 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
             closedir(home);
         }
     }
-    // Create a fresh UDS context+handle in the game process, register it,
-    // post events through it, then DESTROY it. The destroy triggers a journal
-    // flush and signals the daemon to run extraction. We skip Initialize
-    // (the game already called it). The context we create is separate from
-    // the game's own — destroying it is safe and expected.
+    // Borrow the game's own registered UDS ctx/hnd from the singleton table
+    // BEFORE creating our fresh ctx/hnd — otherwise CreateHandle pollutes
+    // the table and the scan picks up our handle instead of the game's.
+    int32_t game_ctx = 0, game_hnd = 0;
+    int game_hnd_minted = 0;
+    intptr_t ubase = f_post - 0x9c90;
+    intptr_t singleton = 0;
+    if (ubase > 0 && !s.dead) rpc_read(pid, ubase + 0x24088, &singleton, 8);
+    if (singleton && !s.dead) {
+        for (intptr_t sl = singleton + 0x28; sl <= singleton + 0x160 && !game_ctx; sl += 8) {
+            intptr_t node = 0; rpc_read(pid, sl, &node, 8);
+            if (!node) continue;
+            int32_t cid = 0; uint8_t act = 0;
+            rpc_read(pid, node + 8, &cid, 4); rpc_read(pid, node + 0x14, &act, 1);
+            if (cid > 0 && act) game_ctx = cid;
+        }
+        for (intptr_t sl = singleton + 0x8; sl <= singleton + 0x800 && !game_hnd; sl += 8) {
+            intptr_t node = 0; rpc_read(pid, sl, &node, 8);
+            if (!node || (node & 0xf) || node < 0x100000 || (uintptr_t)node > 0x800000000000ULL) continue;
+            int32_t cid = 0; uint8_t act = 0;
+            rpc_read(pid, node + 8, &cid, 4); rpc_read(pid, node + 0x14, &act, 1);
+            if (cid >= 0x20000 && cid < 0x40000 && act) game_hnd = cid;
+        }
+        if (game_ctx > 0 && game_hnd <= 0 && !s.dead) {
+            int32_t fh = 0;
+            rpc_call(&s, f_chnd, s.scratch + 0x50, 0, 0, 0, 0, 0);
+            rpc_read(pid, s.scratch + 0x50, &fh, 4);
+            if (fh > 0 && f_reg > 0) {
+                rpc_call(&s, f_reg, game_ctx, fh, 0, 0, 0, 0);
+                game_hnd = fh;
+                game_hnd_minted = 1;
+            }
+        }
+    }
+    // Create a fresh UDS context+handle as fallback and for journal flush.
     int32_t ctx = 0, hnd = 0;
     long rc_cc = -1, rc_ch = -1, rc_reg = -1;
     if (!s.dead) rc_cc = rpc_call(&s, f_cctx, s.scratch, uid, 0, 0, 0, 0);
@@ -13331,6 +13361,8 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
     if (ctx <= 0 || hnd <= 0 || s.dead) {
         if (hnd > 0 && f_dh > 0 && !s.dead) rpc_call(&s, f_dh, hnd, 0, 0, 0, 0, 0);
         if (ctx > 0 && f_dc > 0 && !s.dead) rpc_call(&s, f_dc, ctx, 0, 0, 0, 0, 0);
+        if (game_hnd_minted && game_hnd > 0 && f_dh > 0 && !s.dead)
+            rpc_call(&s, f_dh, game_hnd, 0, 0, 0, 0, 0);
         rpc_detach(&s);
         kernel_set_ucred_authid(me, oa);
         send_error(session->sock, "UDS context/handle setup failed in game process");
@@ -13414,12 +13446,20 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
     }
     if (xj) free(xj); if (ej) free(ej);
 
+    // Onimusha-style: daemon needs activityEnd to extract custom events and
+    // award.  COUNT-based games (Astro Bot) must NOT get activityEnd — the
+    // daemon re-evaluates, can't meet the threshold, and clears our edits.
+    int need_extract = 0;
+    for (int i = 0; i < nw; i++)
+        if (work[i].evkind == 2 && strncmp(work[i].evname, "COUNT", 5) != 0)
+            need_extract = 1;
+
     intptr_t st_dev = s.scratch + 0x1a0;   // custom event name (per entry)
     intptr_t st_dpp = s.scratch + 0x1e0;   // custom property name
 
     char r2[3000];
-    int o2 = snprintf(r2, sizeof(r2), "pid=%d ctx=%d hnd=%d cc=%lx ch=%lx reg=%lx plan=%d conf=%s",
-                      (int)pid, ctx, hnd, rc_cc, rc_ch, rc_reg, np, conf_diag);
+    int o2 = snprintf(r2, sizeof(r2), "pid=%d ctx=%d hnd=%d gc=%d gh=%d cc=%lx ch=%lx reg=%lx plan=%d conf=%s",
+                      (int)pid, ctx, hnd, game_ctx, game_hnd, rc_cc, rc_ch, rc_reg, np, conf_diag);
     // NPWR id of the running set — lifted from the tropconf path embedded
     // in conf_diag ("ucp=/user/trophy2/nobackup/conf/NPWR24170_00/TROPHY.UCP").
     char npwr[24] = "";
@@ -13435,6 +13475,8 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
     }
     int ok = 0, fail = 0;
     int posted_ids[260]; int nposted = 0;
+    struct { int id; int gid; } file_pend[260];
+    int nfile = 0;
     for (int i = 0; i < nw && !s.dead; i++) {
         int id = work[i].id, target = work[i].target;
         int posted = 0;
@@ -13480,16 +13522,22 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
                     rpc_call(&s, f_si3, (long)pobj, st_tpg,
                              target > 0 ? target : 255, 0, 0, 0);
             }
-            // options=1 = GENERATED_BY_CODEGEN — the daemon extracts only
-            // events posted as game-generated; option 0 gets journaled but
-            // never reaches the stat extraction pass. Posts go through a
-            // fresh per-post handle (working unlockers never reuse the
-            // registered handle for PostEvent).
+            // Post under the game's borrowed ctx first (daemon-bound); fall
+            // back to a fresh per-post handle on our private ctx.
+            // options MUST be 1 — option 0 gets journaled but the daemon
+            // never runs stat extraction on it (no award, no notification).
+            long rp = -1;
             int32_t phnd = 0;
-            if (!s.dead) rpc_call(&s, f_chnd, s.scratch + 0x18, 0, 0, 0, 0, 0);
-            if (!s.dead) rpc_read(pid, s.scratch + 0x18, &phnd, 4);
-            long rp = (phnd > 0 && !s.dead)
-                ? rpc_call(&s, f_post, ctx, phnd, (long)ev, 1, 0, 0) : -1;
+            if (game_ctx > 0 && game_hnd > 0 && !s.dead)
+                rp = rpc_call(&s, f_post, game_ctx, game_hnd, (long)ev, 1, 0, 0);
+            if ((int32_t)rp < 0) {
+                if (!s.dead) rpc_call(&s, f_chnd, s.scratch + 0x18, 0, 0, 0, 0, 0);
+                if (!s.dead) rpc_read(pid, s.scratch + 0x18, &phnd, 4);
+                rp = (phnd > 0 && !s.dead)
+                    ? rpc_call(&s, f_post, ctx, phnd, (long)ev, 1, 0, 0) : -1;
+                if ((int32_t)rp < 0 && hnd > 0 && !s.dead)
+                    rp = rpc_call(&s, f_post, ctx, hnd, (long)ev, 1, 0, 0);
+            }
             if (phnd > 0 && f_dh > 0 && !s.dead)
                 rpc_call(&s, f_dh, phnd, 0, 0, 0, 0, 0);
             if (f_dev > 0 && !s.dead) rpc_call(&s, f_dev, (long)ev, 0, 0, 0, 0, 0);
@@ -13500,29 +13548,36 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
             // Pump NP callbacks after each post — the daemon only processes
             // the event queue when the game-side NP runtime is pumped.
             if (posted && f_chk > 0 && !s.dead)
-                for (int cb = 0; cb < 3 && !s.dead; cb++)
-                    rpc_call(&s, f_chk, 0, 0, 0, 0, 0, 0);
+                rpc_call(&s, f_chk, 0, 0, 0, 0, 0, 0);
         }
         if (posted) { ok++; if (nposted < 260) posted_ids[nposted++] = id; }
         else fail++;
-        // The daemon refuses to award progressive trophies from UDS posts
-        // (verified live: counter + _UpdateTrophyProgress + _UnlockTrophy
-        // all returned 0, flag stayed 0x10). Pin the earned state at file
-        // level — a no-op when the daemon already wrote the earn itself.
-        // EXCEPTION: evkind==2 custom events (Onimusha-style UnlockTrophy)
-        // DO get extracted+awarded by the daemon itself — it rewrites
-        // TRPTITLE.DAT from its own state, so a forged flag gets wiped and
-        // can even clobber a real award. Let the daemon own the file.
-        if (posted && npwr[0] && work[i].evkind != 2) {
-            char fdiag[80] = "";
-            trophy_force_unlock_file(npwr, id, work[i].gid,
-                                     fdiag, sizeof(fdiag));
-            if (o2 < (int)sizeof(r2) - 200)
-                o2 += snprintf(r2 + o2, sizeof(r2) - o2, " [id%d %s]",
-                               id, fdiag);
+        if (posted && nfile < 260) {
+            file_pend[nfile].id = id;
+            file_pend[nfile].gid = work[i].gid;
+            nfile++;
         }
     }
     free(work);
+    // Post a synthetic activityEnd on the game's borrowed ctx to trigger the
+    // daemon's extraction pass — custom-event games only extract at activity
+    // boundaries, not on every sceNpCheckCallback pump.  Skip for standard/
+    // COUNT games: the extraction re-evaluates ALL trophies and clears file
+    // edits when the daemon's stat thresholds aren't met (Astro Bot failure).
+    if (need_extract && game_ctx > 0 && game_hnd > 0 && ok > 0 && !s.dead) {
+        intptr_t st_ae = s.scratch + 0x200;
+        rpc_write(pid, st_ae, "activityEnd", 12);
+        uint64_t aev = 0;
+        rpc_call(&s, f_cev, st_ae, 0, s.scratch + 0x210, s.scratch + 0x220, 0, 0);
+        rpc_read(pid, s.scratch + 0x210, &aev, 8);
+        if (aev && !s.dead)
+            rpc_call(&s, f_post, game_ctx, game_hnd, (long)aev, 1, 0, 0);
+        if (aev && f_dev > 0 && !s.dead)
+            rpc_call(&s, f_dev, (long)aev, 0, 0, 0, 0, 0);
+        if (f_chk > 0 && !s.dead)
+            for (int cb = 0; cb < 3 && !s.dead; cb++)
+                rpc_call(&s, f_chk, 0, 0, 0, 0, 0, 0);
+    }
     // Detach so the game keeps running while the daemon extracts the posted
     // events — the game pumps sceNpCheckCallback on its own threads, and a
     // frozen process can't receive the trophy notification. Re-attach only
@@ -13555,6 +13610,8 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
             ? krpc_resolve_by_name(pid, t2h, "sceNpTrophy2SystemNetSyncTitles") : 0;
         intptr_t f_cns = t2h
             ? krpc_resolve_by_name(pid, t2h, "sceNpTrophy2SystemCheckNetSyncTitles") : 0;
+        intptr_t f_t2du = t2h
+            ? krpc_resolve_by_name(pid, t2h, "sceNpTrophy2SystemDebugUnlockTrophy") : 0;
         if (f_tcc > 0 && f_tch > 0 && f_trg > 0 && f_tgi > 0) {
             // A foreign Trophy2 ctx can never register (the game holds the
             // title binding — every label fails 0x8055391a). Borrow the game's
@@ -13593,7 +13650,26 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
             }
             if (o2 < (int)sizeof(r2) - 200)
                 o2 += snprintf(r2 + o2, sizeof(r2) - o2,
-                               " t2tbl=%lx,ctx=%d,hnd=%d", (long)tbl, tctx, thnd);
+                               " t2tbl=%lx,ctx=%d,hnd=%d,du=%lx",
+                               (long)tbl, tctx, thnd, (long)f_t2du);
+            // Trophy2 debug unlock — IPMI to SceShellCore, persists through
+            // game restart because the daemon writes its own persistent db.
+            if (tctx > 0 && thnd > 0 && f_t2du > 0 && !s.dead) {
+                int32_t prm[16];
+                memset(prm, 0, sizeof(prm));
+                prm[0] = 2;
+                int ndunl = 0;
+                for (int i = 0; i < nposted && !s.dead; i++) {
+                    prm[1] = posted_ids[i];
+                    rpc_write(pid, s.scratch + 0x80, prm, sizeof(prm));
+                    long ru = rpc_call(&s, f_t2du, tctx, thnd,
+                                       s.scratch + 0x80, 0, 0, 0);
+                    if ((int32_t)ru >= 0) ndunl++;
+                }
+                if (o2 < (int)sizeof(r2) - 200)
+                    o2 += snprintf(r2 + o2, sizeof(r2) - o2,
+                                   " du=%d/%d", ndunl, nposted);
+            }
             long rg = -1;
             if (tctx > 0 && thnd > 0 && !s.dead)
                 rg = rpc_call(&s, f_tgi, tctx, thnd,
@@ -13632,11 +13708,28 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
             }
         }
     }
-    // Destroy our context+handle — this triggers the daemon's journal flush
-    // and extraction pass, which is essential for the trophy to be awarded.
+    // Clean up the minted handle we bound to the game's ctx (if any).
+    if (game_hnd_minted && game_hnd > 0 && f_dh > 0 && !s.dead)
+        rpc_call(&s, f_dh, game_hnd, 0, 0, 0, 0, 0);
+    // Destroy our fresh context+handle — this triggers the daemon's journal
+    // flush and extraction pass.
     if (hnd > 0 && f_dh > 0 && !s.dead) rpc_call(&s, f_dh, hnd, 0, 0, 0, 0, 0);
     if (ctx > 0 && f_dc > 0 && !s.dead) rpc_call(&s, f_dc, ctx, 0, 0, 0, 0, 0);
     rpc_detach(&s);
+    // Deferred file-level unlock — runs AFTER all daemon triggers so the
+    // daemon's extraction/journal-flush has settled.  Brief sleep lets any
+    // pending daemon TRPTITLE rewrite finish before we pin our state.
+    if (nfile > 0 && npwr[0]) {
+        usleep(1500000);
+        for (int i = 0; i < nfile; i++) {
+            char fdiag[80] = "";
+            trophy_force_unlock_file(npwr, file_pend[i].id, file_pend[i].gid,
+                                     fdiag, sizeof(fdiag));
+            if (o2 < (int)sizeof(r2) - 200)
+                o2 += snprintf(r2 + o2, sizeof(r2) - o2, " [id%d %s]",
+                               file_pend[i].id, fdiag);
+        }
+    }
     kernel_set_ucred_authid(me, oa);
     o2 += snprintf(r2 + o2, sizeof(r2) - o2, " ok=%d fail=%d dead=%d",
                    ok, fail, s.dead);

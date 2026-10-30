@@ -238,6 +238,8 @@ namespace PS5Upload
                     Grid.SetRow(StorageInfoGrid.Children[i], i);
                     Grid.SetColumn(StorageInfoGrid.Children[i], 0);
                 }
+           
+                StackAllPageGrids();
             }
             else
             {
@@ -255,6 +257,8 @@ namespace PS5Upload
                     Grid.SetColumn(StorageInfoGrid.Children[i], i);
                     Grid.SetRow(StorageInfoGrid.Children[i], 0);
                 }
+           
+                UnstackAllPageGrids();
             }
         }
 
@@ -277,6 +281,108 @@ namespace PS5Upload
             SidebarPane.Width = double.NaN;
             SidebarPane.HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Stretch;
             if (_isMobileLayout) SidebarPane.IsVisible = false;
+        }
+
+
+        // ---- generic grid stack/unstack for narrow layouts ----
+        private sealed class GridSnap
+        {
+            public List<GridLength> Cols = new();
+            public List<GridLength> Rows = new();
+            public List<(Control c, int col, int row, int cs, int rs, Thickness m)> Cells = new();
+        }
+        private readonly Dictionary<Grid, GridSnap> _stackedGrids = new();
+
+        private void StackGrid(Grid g, bool starRows = false, double gap = 8)
+        {
+            if (g == null || _stackedGrids.ContainsKey(g)) return;
+            var snap = new GridSnap();
+            snap.Cols = g.ColumnDefinitions.Select(d => d.Width).ToList();
+            snap.Rows = g.RowDefinitions.Select(d => d.Height).ToList();
+            var cells = g.Children.Cast<Control>()
+                .OrderBy(c => Grid.GetRow(c)).ThenBy(c => Grid.GetColumn(c)).ToList();
+            foreach (var c in cells)
+                snap.Cells.Add((c, Grid.GetColumn(c), Grid.GetRow(c), Grid.GetColumnSpan(c), Grid.GetRowSpan(c), c.Margin));
+            _stackedGrids[g] = snap;
+
+            g.ColumnDefinitions.Clear();
+            g.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Star));
+            g.RowDefinitions.Clear();
+            for (int i = 0; i < cells.Count; i++)
+            {
+                g.RowDefinitions.Add(new RowDefinition(starRows ? GridLength.Star : GridLength.Auto));
+                var c = cells[i];
+                Grid.SetColumn(c, 0); Grid.SetColumnSpan(c, 1);
+                Grid.SetRow(c, i); Grid.SetRowSpan(c, 1);
+                c.Margin = new Thickness(c.Margin.Left, c.Margin.Top, c.Margin.Right, i < cells.Count - 1 ? gap : 0);
+            }
+        }
+
+        private void UnstackGrid(Grid g)
+        {
+            if (g == null || !_stackedGrids.Remove(g, out var snap)) return;
+            g.ColumnDefinitions.Clear();
+            foreach (var w in snap.Cols) g.ColumnDefinitions.Add(new ColumnDefinition(w));
+            g.RowDefinitions.Clear();
+            foreach (var h in snap.Rows) g.RowDefinitions.Add(new RowDefinition(h));
+            foreach (var (c, col, row, cs, rs, m) in snap.Cells)
+            {
+                Grid.SetColumn(c, col); Grid.SetRow(c, row);
+                Grid.SetColumnSpan(c, cs); Grid.SetRowSpan(c, rs);
+                c.Margin = m;
+            }
+        }
+
+
+        // ---- mobile scroll wrapping for stacked pages that can overflow vertically ----
+        private readonly Dictionary<Control, ScrollViewer> _mobileScrolls = new();
+
+        private void WrapMobileScroll(Control? c)
+        {
+            if (c == null || c.Parent is not TabItem ti) return;
+            var sv = new ScrollViewer { Content = c };
+            ti.Content = sv;
+            _mobileScrolls[c] = sv;
+        }
+
+        private void UnwrapMobileScroll(Control? c)
+        {
+            if (c == null || !_mobileScrolls.Remove(c, out var sv)) return;
+            if (sv.Parent is TabItem ti) ti.Content = c;
+        }
+
+        private void StackAllPageGrids()
+        {
+            StackGrid(SysInfoRowGrid);
+            StackGrid(SysSensorsGrid);
+            StackGrid(SysCpuMemRowGrid);
+            StackGrid(SysNetGrid);
+            StackGrid(MemEditorRootGrid, starRows: true);
+            StackGrid(TrophyMainGrid, starRows: true);
+            StackGrid(GameToolbarGrid);
+            StackGrid(ProsperoToolbarGrid);
+            StackGrid(TrophyToolbarGrid);
+            StackGrid(FpkgIdGrid);
+            StackGrid(FpkgTitleGrid);
+            WrapMobileScroll(MemEditorRootGrid);
+            WrapMobileScroll(PkgRootGrid);
+        }
+
+        private void UnstackAllPageGrids()
+        {
+            UnstackGrid(SysInfoRowGrid);
+            UnstackGrid(SysSensorsGrid);
+            UnstackGrid(SysCpuMemRowGrid);
+            UnstackGrid(SysNetGrid);
+            UnstackGrid(MemEditorRootGrid);
+            UnstackGrid(TrophyMainGrid);
+            UnstackGrid(GameToolbarGrid);
+            UnstackGrid(ProsperoToolbarGrid);
+            UnstackGrid(TrophyToolbarGrid);
+            UnstackGrid(FpkgIdGrid);
+            UnstackGrid(FpkgTitleGrid);
+            UnwrapMobileScroll(MemEditorRootGrid);
+            UnwrapMobileScroll(PkgRootGrid);
         }
 
         private void ShowMobileFilePane(bool ps5)
