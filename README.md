@@ -1,4 +1,4 @@
-# 🎮 PS5 Suite v7.8.0 — Complete PS5 Management Platform
+# 🎮 PS5 Suite v7.8.1 — Complete PS5 Management Platform
 
 **By Manos**
 
@@ -44,6 +44,10 @@ All-in-one management suite for jailbroken PS5 consoles. One app — on **Window
 | `PS5Suite-macOS-ARM64.zip` | Apple Silicon (M1/M2/M3/M4) — same steps |
 | `PS5Suite.apk` | **Android** — signed APK, full feature parity with desktop |
 | `ps5_suite_server.elf` | **Required** on-console server component |
+
+### ✨ New in v7.8.1
+
+- **Fixed: trophies not unlocking on FW 5.50 (issues #16/#17)** — the FW 5.50 trophy daemon rejects the `options=1` post signature with `0x80553102`. Every handle pair is now probed with `options=1` first (13.60+ stat-extraction signature) and automatically falls back to `options=0` (the 7.6.0 signature 5.50 accepts). Verified on FW 5.50: trophies unlock through the daemon's own award path. The unlock log now marks which signature fired (`(o0)`/`(o1)`).
 
 ### ✨ New in v7.8.0
 

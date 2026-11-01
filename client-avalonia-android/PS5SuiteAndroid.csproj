@@ -8,8 +8,8 @@
     <ImplicitUsings>disable</ImplicitUsings>
     <AvaloniaUseCompiledBindingsByDefault>false</AvaloniaUseCompiledBindingsByDefault>
     <ApplicationId>com.manos.ps5suite</ApplicationId>
-    <ApplicationVersion>16</ApplicationVersion>
-    <ApplicationDisplayVersion>7.8.0</ApplicationDisplayVersion>
+    <ApplicationVersion>17</ApplicationVersion>
+    <ApplicationDisplayVersion>7.8.1</ApplicationDisplayVersion>
     <ApplicationTitle>PS5 Suite</ApplicationTitle>
     <AssemblyName>PS5Suite</AssemblyName>
     <RootNamespace>PS5Upload</RootNamespace>

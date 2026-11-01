@@ -2190,7 +2190,7 @@ void release_file_mutex(const char *path) {
 // payload loader (elfldr raw-socket protocol — identical to what the PC
 // client does during deploy). The spawned instance sweeps every stale
 // "payload*" process and binds the port — no explicit handoff needed.
-#define SUITE_VERSION      "7.8.0"
+#define SUITE_VERSION      "7.8.1"
 #define SUITE_DIR          "/data/ps5suite"
 #define UPDATE_STAGE_PATH  "/data/ps5suite/update.elf"
 #define UPDATE_MARKER      "/data/ps5suite/update.marker"

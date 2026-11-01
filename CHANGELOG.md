@@ -1,5 +1,16 @@
 # Changelog - PS5 Suite
 
+## v7.8.1 (November 2026)
+
+### Fixed — trophies not unlocking on FW 5.50 (issues #16, #17)
+
+- **PostEvent signature fallback** — the v7.8.0 borrowed-context fix kept posting UDS trophy events with `options=1`, which the FW 5.50 trophy daemon rejects with `0x80553102` (invalid argument). Every handle pair (borrowed game ctx, fresh per-post handle, registered handle) is now probed with `options=1` first (the 13.60+ stat-extraction signature) and automatically falls back to `options=0` — the journaled 7.6.0 signature that 5.50 accepts and awards from.
+- **Signature marker in diagnostics** — the unlock log now reports which signature fired (`[id37 unlock=0(o0)]` = option 0 worked), so field reports identify the active path at a glance.
+- **activityEnd fallback** — the synthetic `activityEnd` post (custom-event games) uses the same dual-signature probe.
+- **Verified on FW 5.50** — tester confirmed trophies unlock through the daemon's own award path (no file edits needed: `file:0ed 1alrdy`).
+
+---
+
 ## v7.8.0 (October 2026)
 
 ### Mobile UI — responsive layout (Android)
