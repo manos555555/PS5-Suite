@@ -2185,6 +2185,7 @@ void release_file_mutex(const char *path) {
 #define CMD_KLOG_READ   0x6D        // optional tail bytes  → RESP_DATA kmsg
 #define CMD_MOUNT_GAME  0x6F        // "title_id" → mount a single game
 #define CMD_UNMOUNT_ALL 0x6E        // unmount every mounted game
+#define CMD_REPAIR_REG  0x83        // "repair:<title_id|all>" → re-run title registration
 
 // Payload self-update: the running server pushes a newer ELF to the local
 // payload loader (elfldr raw-socket protocol — identical to what the PC
@@ -7853,6 +7854,92 @@ void handle_proc_list(client_session_t *session) {
     send_response(session->sock, RESP_DATA, out, off);
     free(out);
     free(buf);
+}
+
+// REPAIR_REGISTRATION — "repair:<title_id|all>"
+// Suite-mounted games can end up mounted-but-invisible: registration runs
+// only on the FIRST mount, so titles mounted by an older build (or before a
+// registration change) never get their home-screen registry entry refreshed.
+// Recipe proven by Payload Manager's app_installer (GPL-3.0): ensure
+// /user/app/<TID>/sce_sys/{param.json,icon0.png} exist, then re-run
+// register_title() — the AppInstallTitleDir path handles duplicates
+// internally. Only suite-mounted titles (mount.lnk) are touched by "all";
+// real PSN/disc installs are never affected. Restart the UI afterwards if
+// tiles still don't render.
+static int repair_one_title(const char *tid, char *diag, size_t dsz) {
+    diag[0] = 0;
+    char src[PATH_MAX] = {0};
+    char lnk_path[PATH_MAX];
+    snprintf(lnk_path, sizeof(lnk_path), "/user/app/%s/mount.lnk", tid);
+    FILE *lnk = fopen(lnk_path, "r");
+    if (lnk) {
+        if (fgets(src, sizeof(src), lnk))
+            src[strcspn(src, "\r\n")] = '\0';
+        fclose(lnk);
+    }
+    // ensure the two files the home-screen renderer needs exist
+    int copied = 0;
+    static const char *files[] = { "param.json", "icon0.png", NULL };
+    for (int i = 0; files[i]; i++) {
+        char dst[PATH_MAX], s[PATH_MAX];
+        snprintf(dst, sizeof(dst), "/user/app/%s/sce_sys/%s", tid, files[i]);
+        struct stat st;
+        if (stat(dst, &st) == 0 && st.st_size > 0) continue;
+        if (!src[0]) continue;
+        snprintf(s, sizeof(s), "%s/sce_sys/%s", src, files[i]);
+        if (stat(s, &st) != 0 || st.st_size <= 0) continue;
+        FILE *in = fopen(s, "rb"), *out = fopen(dst, "wb");
+        if (!in || !out) { if (in) fclose(in); if (out) fclose(out); continue; }
+        char buf[16384]; size_t n;
+        while ((n = fread(buf, 1, sizeof(buf), in)) > 0)
+            fwrite(buf, 1, n, out);
+        fclose(in); fclose(out);
+        copied++;
+    }
+    // force re-registration (watchdog-wrapped; AppInstallTitleDir handles dups)
+    int rc = register_title(tid, src[0] ? src : "/user/app/");
+    snprintf(diag, dsz, "%s sce_sys+%d rc=%d", src[0] ? src : "-", copied, rc);
+    return rc;
+}
+
+static void handle_repair_registration(client_session_t *session, const char *arg) {
+    char resp[8192];
+    int o = snprintf(resp, sizeof(resp), "repair:");
+    int n_ok = 0, n_fail = 0;
+    if (arg && strncmp(arg, "all", 3) == 0) {
+        DIR *d = opendir("/user/app");
+        if (!d) { send_error(session->sock, "cannot open /user/app"); return; }
+        struct dirent *e;
+        while ((e = readdir(d))) {
+            if (e->d_name[0] == '.') continue;
+            char lnk_path[PATH_MAX];
+            snprintf(lnk_path, sizeof(lnk_path), "/user/app/%s/mount.lnk", e->d_name);
+            FILE *f = fopen(lnk_path, "r");
+            if (!f) continue;               // only suite-mounted titles
+            fclose(f);
+            char diag[PATH_MAX + 32];
+            int rc = repair_one_title(e->d_name, diag, sizeof(diag));
+            if (rc == 0) n_ok++; else n_fail++;
+            if (o < (int)sizeof(resp) - PATH_MAX)
+                o += snprintf(resp + o, sizeof(resp) - o,
+                              "\n%s: %s", e->d_name, diag);
+        }
+        closedir(d);
+    } else if (arg && arg[0]) {
+        char diag[PATH_MAX + 32];
+        int rc = repair_one_title(arg, diag, sizeof(diag));
+        if (rc == 0) n_ok++; else n_fail++;
+        o += snprintf(resp + o, sizeof(resp) - o, "\n%s: %s", arg, diag);
+    } else {
+        send_error(session->sock, "Usage: repair:<title_id|all>");
+        return;
+    }
+    o += snprintf(resp + o, sizeof(resp) - o,
+                  "\nok=%d fail=%d (no UI restart needed — AppInstallTitleDir "
+                  "notifies the home screen itself; restart only helps if a "
+                  "title fell back to direct app.db writes)",
+                  n_ok, n_fail);
+    send_response(session->sock, RESP_DATA, resp, o);
 }
 
 // RESTART_UI — kill ONLY SceShellUI (the WebKit UI renderer, pid 59 here).
@@ -16596,6 +16683,10 @@ void *client_thread(void *arg) {
                 break;
             case CMD_RESTART_UI:
                 handle_restart_ui(session);
+                break;
+            case CMD_REPAIR_REG:
+                if (data) handle_repair_registration(session, (const char *)data);
+                else send_error(session->sock, "Usage: repair:<title_id|all>");
                 break;
             case CMD_SELF_UPDATE:
                 if (data) {

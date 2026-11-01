@@ -2,6 +2,10 @@
 
 ## v7.8.1 (November 2026)
 
+### New — registration repair for invisible mounted games (payload)
+
+- **`repair:<title_id|all>` command** — suite-mounted games that are mounted but missing from the home screen can now be re-registered in place: the payload re-ensures `/user/app/<TID>/sce_sys/{param.json,icon0.png}` (copying them from the game source when missing) and re-runs the title registration (`sceAppInstUtilAppInstallTitleDir` path — the recipe proven by Payload Manager's app_installer, GPL-3.0). `repair:all` touches only suite-mounted titles (`mount.lnk` marker) — real PSN/disc installs are never affected. Registration previously ran only on the first mount, so titles mounted by older builds never got their registry entry refreshed.
+
 ### Fixed — trophies not unlocking on FW 5.50 (issues #16, #17)
 
 - **PostEvent signature fallback** — the v7.8.0 borrowed-context fix kept posting UDS trophy events with `options=1`, which the FW 5.50 trophy daemon rejects with `0x80553102` (invalid argument). Every handle pair (borrowed game ctx, fresh per-post handle, registered handle) is now probed with `options=1` first (the 13.60+ stat-extraction signature) and automatically falls back to `options=0` — the journaled 7.6.0 signature that 5.50 accepts and awards from.
