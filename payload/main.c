@@ -13230,6 +13230,23 @@ static int running_game_uds_member(pid_t pid, const char *name,
 static int trophy_force_unlock_file(const char *npwr, int tid, int gid,
                                     char *diag, size_t dsz);
 
+// PostEvent signature probe. On 13.60+ option 1 is the stat-extraction
+// signature; on FW 5.50 option 1 is rejected with 0x80553102 (invalid
+// argument) and option 0 — the journaled 7.6.0 signature — is the one that
+// awards. Try 1 first, fall back to 0; *opt_out reports which one worked
+// (-1 if both failed).
+static long uds_post_try(rpc_sess_t *s, intptr_t f_post, int32_t c, int32_t h,
+                         long ev, int *opt_out) {
+    static const int opts[2] = { 1, 0 };
+    long rp = -1;
+    *opt_out = -1;
+    for (int i = 0; i < 2 && (int32_t)rp < 0 && !s->dead; i++) {
+        rp = rpc_call(s, f_post, c, h, ev, opts[i], 0, 0);
+        if ((int32_t)rp >= 0) *opt_out = opts[i];
+    }
+    return rp;
+}
+
 // One UDS session in the game process → per-trophy events. want_all posts
 // every entry in the game's tropconf (each with its own event type/target);
 // a single id uses its tropconf entry, or — if the config can't be read —
@@ -13523,28 +13540,37 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
                              target > 0 ? target : 255, 0, 0, 0);
             }
             // Post under the game's borrowed ctx first (daemon-bound); fall
-            // back to a fresh per-post handle on our private ctx.
-            // options MUST be 1 — option 0 gets journaled but the daemon
-            // never runs stat extraction on it (no award, no notification).
+            // back to a fresh per-post handle on our private ctx, then the
+            // registered handle.  Each pair is probed with options=1 then
+            // options=0 (see uds_post_try — FW 5.50 only accepts option 0).
             long rp = -1;
+            int used_opt = -1;
             int32_t phnd = 0;
             if (game_ctx > 0 && game_hnd > 0 && !s.dead)
-                rp = rpc_call(&s, f_post, game_ctx, game_hnd, (long)ev, 1, 0, 0);
-            if ((int32_t)rp < 0) {
-                if (!s.dead) rpc_call(&s, f_chnd, s.scratch + 0x18, 0, 0, 0, 0, 0);
+                rp = uds_post_try(&s, f_post, game_ctx, game_hnd,
+                                  (long)ev, &used_opt);
+            if ((int32_t)rp < 0 && !s.dead) {
+                rpc_call(&s, f_chnd, s.scratch + 0x18, 0, 0, 0, 0, 0);
                 if (!s.dead) rpc_read(pid, s.scratch + 0x18, &phnd, 4);
-                rp = (phnd > 0 && !s.dead)
-                    ? rpc_call(&s, f_post, ctx, phnd, (long)ev, 1, 0, 0) : -1;
-                if ((int32_t)rp < 0 && hnd > 0 && !s.dead)
-                    rp = rpc_call(&s, f_post, ctx, hnd, (long)ev, 1, 0, 0);
+                if (phnd > 0 && !s.dead)
+                    rp = uds_post_try(&s, f_post, ctx, phnd,
+                                      (long)ev, &used_opt);
             }
+            if ((int32_t)rp < 0 && hnd > 0 && !s.dead)
+                rp = uds_post_try(&s, f_post, ctx, hnd, (long)ev, &used_opt);
             if (phnd > 0 && f_dh > 0 && !s.dead)
                 rpc_call(&s, f_dh, phnd, 0, 0, 0, 0, 0);
             if (f_dev > 0 && !s.dead) rpc_call(&s, f_dev, (long)ev, 0, 0, 0, 0, 0);
             if ((int32_t)rp >= 0) posted = 1;
-            if (o2 < (int)sizeof(r2) - 200)
-                o2 += snprintf(r2 + o2, sizeof(r2) - o2, " [id%d %.28s=%lx]",
-                               id, knm, rp);
+            if (o2 < (int)sizeof(r2) - 200) {
+                if (used_opt >= 0)
+                    o2 += snprintf(r2 + o2, sizeof(r2) - o2,
+                                   " [id%d %.28s=%lx(o%d)]", id, knm, rp,
+                                   used_opt);
+                else
+                    o2 += snprintf(r2 + o2, sizeof(r2) - o2,
+                                   " [id%d %.28s=%lx]", id, knm, rp);
+            }
             // Pump NP callbacks after each post — the daemon only processes
             // the event queue when the game-side NP runtime is pumped.
             if (posted && f_chk > 0 && !s.dead)
@@ -13570,8 +13596,10 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
         uint64_t aev = 0;
         rpc_call(&s, f_cev, st_ae, 0, s.scratch + 0x210, s.scratch + 0x220, 0, 0);
         rpc_read(pid, s.scratch + 0x210, &aev, 8);
-        if (aev && !s.dead)
-            rpc_call(&s, f_post, game_ctx, game_hnd, (long)aev, 1, 0, 0);
+        if (aev && !s.dead) {
+            int ae_opt = -1;
+            uds_post_try(&s, f_post, game_ctx, game_hnd, (long)aev, &ae_opt);
+        }
         if (aev && f_dev > 0 && !s.dead)
             rpc_call(&s, f_dev, (long)aev, 0, 0, 0, 0, 0);
         if (f_chk > 0 && !s.dead)
