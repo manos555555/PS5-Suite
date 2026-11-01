@@ -13565,12 +13565,16 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
     }
     if (xj) free(xj); if (ej) free(ej);
 
-    // Onimusha-style: daemon needs activityEnd to extract custom events and
-    // award.  COUNT-based games (Astro Bot) must NOT get activityEnd — the
-    // daemon re-evaluates, can't meet the threshold, and clears our edits.
+    // The daemon extracts custom events at activity boundaries, not on
+    // every sceNpCheckCallback pump — so post a synthetic activityEnd to
+    // trigger the extraction pass.  This now includes COUNT-* events: their
+    // stats use "latest" aggregation, and since the counter fix posts the
+    // trophy's target value, the re-evaluation MEETS the threshold instead
+    // of clearing it (the old counter=0 posts made activityEnd wipe edits —
+    // that is no longer the case).
     int need_extract = 0;
     for (int i = 0; i < nw; i++)
-        if (work[i].evkind == 2 && strncmp(work[i].evname, "COUNT", 5) != 0)
+        if (work[i].evkind == 2)
             need_extract = 1;
 
     intptr_t st_dev = s.scratch + 0x1a0;   // custom event name (per entry)
@@ -13597,6 +13601,24 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
     uint8_t layer[260];
     memset(layer, 0, sizeof(layer));
     int nreq = 0;
+    // The UDS daemon only commits extracted stats inside an open activity —
+    // events posted with no activity open are journaled but never counted,
+    // which is exactly why the awards were session-only.  Open an activity
+    // on the game's own ctx/hnd FIRST so the following events land inside
+    // it; the activityEnd below then commits the pass.
+    if (game_ctx > 0 && game_hnd > 0 && !s.dead) {
+        intptr_t st_as = s.scratch + 0x200;
+        rpc_write(pid, st_as, "activityStart", 14);
+        uint64_t asev = 0;
+        rpc_call(&s, f_cev, st_as, 0, s.scratch + 0x210, s.scratch + 0x220, 0, 0);
+        rpc_read(pid, s.scratch + 0x210, &asev, 8);
+        if (asev && !s.dead) {
+            int as_opt = -1;
+            uds_post_try(&s, f_post, game_ctx, game_hnd, (long)asev, &as_opt);
+        }
+        if (asev && f_dev > 0 && !s.dead)
+            rpc_call(&s, f_dev, (long)asev, 0, 0, 0, 0, 0);
+    }
     for (int i = 0; i < nw && !s.dead; i++) {
         int id = work[i].id, target = work[i].target;
         int posted = 0;
@@ -13827,6 +13849,9 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
                                        s.scratch + 0x80, 0, 0, 0);
                     ndutry++;
                     if ((int32_t)ru >= 0) ndunl++;
+                    else if (o2 < (int)sizeof(r2) - 80)
+                        o2 += snprintf(r2 + o2, sizeof(r2) - o2,
+                                       " [du%d=%lx]", req_ids[i], ru);
                 }
             }
             // Re-query after the debug pass — only verified unlocks count.
@@ -14068,6 +14093,13 @@ static int trp_lock_file(const char *path, int tid, char *diag, size_t dsz) {
     free(d);
     if (!wok) { unlink(tmp); return -2; }
     if (rename(tmp, path) != 0) { unlink(tmp); return -2; }
+    // Same rule as unlock: a leftover .bak makes the daemon freeze its own
+    // writes and recovery-wipe the set on the next title load.
+    {
+        char bak2[PATH_MAX];
+        snprintf(bak2, sizeof(bak2), "%s.bak", path);
+        unlink(bak2);
+    }
 
     if (diag) snprintf(diag, dsz, "cleared %d group masks + %d copies%s",
                        cleared_groups, cleared_copies, have_row ? "" : ", no row");
@@ -14204,6 +14236,16 @@ static int trp_unlock_file(const char *path, int tid, int gid,
     free(d);
     if (!wok) { unlink(tmp); return -2; }
     if (rename(tmp, path) != 0) { unlink(tmp); return -2; }
+    // The trophy daemon treats a sibling .bak as an uncommitted edit: it
+    // stops writing the file itself and runs a state-recovery wipe on the
+    // next title load (observed: the unlock file froze at 9/49 the moment
+    // the first .bak appeared, and every load with a .bak present reset
+    // the set to 0%).  Our edit is byte-precise, so drop the backup now.
+    {
+        char bak2[PATH_MAX];
+        snprintf(bak2, sizeof(bak2), "%s.bak", path);
+        unlink(bak2);
+    }
 
     if (diag) snprintf(diag, dsz, "set %d group masks + %d copies%s",
                        set_groups, set_copies, have_row ? "" : ", no row");
