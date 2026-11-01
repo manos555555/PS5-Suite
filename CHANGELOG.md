@@ -2,6 +2,12 @@
 
 ## v7.8.1 (November 2026)
 
+### New — verified unlock cascade (payload)
+
+- **Every trophy now goes through a verified 4-layer cascade** instead of stopping at the first failure: (1) UDS event posts (with the FW-signature fallback), (2) the daemon's own state is queried via the borrowed Trophy2 pair (`GetTrophyInfo`) to see what actually unlocked, (3) `sceNpTrophy2SystemDebugUnlockTrophy` (IPMI) runs on everything still locked — not only on posted ids, (4) a direct `TRPTITLE.DAT` edit pins whatever the daemon still refuses. Previously the debug-unlock and file-edit layers only ran for trophies whose UDS post succeeded, so games where posts fail (custom-protocol titles) got nothing at all.
+- **Per-trophy layer report** — the unlock response now ends with `post=N du=N file=N already=N stuck=[ids]`, so a field report shows exactly which layer landed each trophy and which ids remain stuck.
+- **Daemon-side facts established by disassembly** (FW 13.60 dump): the post validation rejects `options>=2` with `0x80553102` (FW 5.50 rejects `1`), the (ctx,hnd) pair must be state-consistent or the post fails `0x8055b704`, and the daemon auto-schedules its extraction pass after every accepted post.
+
 ### New — registration repair for invisible mounted games (payload)
 
 - **`repair:<title_id|all>` command** — suite-mounted games that are mounted but missing from the home screen can now be re-registered in place: the payload re-ensures `/user/app/<TID>/sce_sys/{param.json,icon0.png}` (copying them from the game source when missing) and re-runs the title registration (`sceAppInstUtilAppInstallTitleDir` path — the recipe proven by Payload Manager's app_installer, GPL-3.0). `repair:all` touches only suite-mounted titles (`mount.lnk` marker) — real PSN/disc installs are never affected. Registration previously ran only on the first mount, so titles mounted by older builds never got their registry entry refreshed.

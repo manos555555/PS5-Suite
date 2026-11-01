@@ -13334,6 +13334,20 @@ static long uds_post_try(rpc_sess_t *s, intptr_t f_post, int32_t c, int32_t h,
     return rp;
 }
 
+// Query the daemon's own unlock state for one trophy via the borrowed
+// Trophy2 pair (GetTrophyInfo). Returns 1 = unlocked, 0 = locked,
+// -1 = query impossible (no pair / call failed).
+static int t2_query_unlocked(rpc_sess_t *s, pid_t pid, intptr_t f_tti,
+                             int32_t tctx, int32_t thnd, int tid) {
+    if (f_tti <= 0 || tctx <= 0 || thnd <= 0) return -1;
+    long rt = rpc_call(s, f_tti, tctx, thnd, tid,
+                       s->scratch + 0x400, s->scratch + 0xa00, 0);
+    if ((int32_t)rt < 0) return -1;
+    uint32_t un = 0;
+    rpc_read(pid, s->scratch + 0xa04, &un, 4);
+    return un != 0;
+}
+
 // One UDS session in the game process → per-trophy events. want_all posts
 // every entry in the game's tropconf (each with its own event type/target);
 // a single id uses its tropconf entry, or — if the config can't be read —
@@ -13561,7 +13575,7 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
     intptr_t st_dev = s.scratch + 0x1a0;   // custom event name (per entry)
     intptr_t st_dpp = s.scratch + 0x1e0;   // custom property name
 
-    char r2[3000];
+    char r2[6144];
     int o2 = snprintf(r2, sizeof(r2), "pid=%d ctx=%d hnd=%d gc=%d gh=%d cc=%lx ch=%lx reg=%lx plan=%d conf=%s",
                       (int)pid, ctx, hnd, game_ctx, game_hnd, rc_cc, rc_ch, rc_reg, np, conf_diag);
     // NPWR id of the running set — lifted from the tropconf path embedded
@@ -13578,12 +13592,14 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
         }
     }
     int ok = 0, fail = 0;
-    int posted_ids[260]; int nposted = 0;
-    struct { int id; int gid; } file_pend[260];
-    int nfile = 0;
+    int req_ids[260], req_gid[260];
+    uint8_t layer[260];
+    memset(layer, 0, sizeof(layer));
+    int nreq = 0;
     for (int i = 0; i < nw && !s.dead; i++) {
         int id = work[i].id, target = work[i].target;
         int posted = 0;
+        if (nreq < 260) { req_ids[nreq] = id; req_gid[nreq] = work[i].gid; nreq++; }
         // Verified live: custom counter events update the stat but the
         // daemon does NOT award the trophy from them (progress row only),
         // and _UnlockTrophy is ignored for progressive:true trophies.
@@ -13663,13 +13679,8 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
             if (posted && f_chk > 0 && !s.dead)
                 rpc_call(&s, f_chk, 0, 0, 0, 0, 0, 0);
         }
-        if (posted) { ok++; if (nposted < 260) posted_ids[nposted++] = id; }
+        if (posted) { ok++; layer[i] = 1; }
         else fail++;
-        if (posted && nfile < 260) {
-            file_pend[nfile].id = id;
-            file_pend[nfile].gid = work[i].gid;
-            nfile++;
-        }
     }
     free(work);
     // Post a synthetic activityEnd on the game's borrowed ctx to trigger the
@@ -13709,7 +13720,8 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
     // the trophy daemon re-evaluate the title's UDS stat table — the moment
     // the _autoGenTrophy stat reads as earned, the daemon itself writes the
     // TRPTITLE flag and fires the system toast.
-    if (ok > 0 && !s.dead) {
+    int t2_verified = 0;
+    if (!s.dead) {
         uint32_t t2h = 0;
         intptr_t f_tcc = 0, f_tch = 0, f_trg = 0, f_tgi = 0, f_tti = 0;
         if (krpc_dynlib_handle(pid, "libSceNpTrophy2.sprx", &t2h) == 0 && t2h) {
@@ -13767,23 +13779,17 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
                 o2 += snprintf(r2 + o2, sizeof(r2) - o2,
                                " t2tbl=%lx,ctx=%d,hnd=%d,du=%lx",
                                (long)tbl, tctx, thnd, (long)f_t2du);
-            // Trophy2 debug unlock — IPMI to SceShellCore, persists through
-            // game restart because the daemon writes its own persistent db.
-            if (tctx > 0 && thnd > 0 && f_t2du > 0 && !s.dead) {
-                int32_t prm[16];
-                memset(prm, 0, sizeof(prm));
-                prm[0] = 2;
-                int ndunl = 0;
-                for (int i = 0; i < nposted && !s.dead; i++) {
-                    prm[1] = posted_ids[i];
-                    rpc_write(pid, s.scratch + 0x80, prm, sizeof(prm));
-                    long ru = rpc_call(&s, f_t2du, tctx, thnd,
-                                       s.scratch + 0x80, 0, 0, 0);
-                    if ((int32_t)ru >= 0) ndunl++;
+            // Verified cascade — the daemon's own state decides, not our
+            // assumptions: (1) query which requested trophies already read
+            // as unlocked, (2) debug-unlock the rest via IPMI, (3) re-query.
+            if (tctx > 0 && thnd > 0 && f_tti > 0) {
+                t2_verified = 1;
+                for (int i = 0; i < nreq && !s.dead; i++) {
+                    int q = t2_query_unlocked(&s, pid, f_tti, tctx, thnd,
+                                              req_ids[i]);
+                    if (q == 1) layer[i] = layer[i] == 1 ? 1 : 4;
+                    else if (q == 0) layer[i] = 0;
                 }
-                if (o2 < (int)sizeof(r2) - 200)
-                    o2 += snprintf(r2 + o2, sizeof(r2) - o2,
-                                   " du=%d/%d", ndunl, nposted);
             }
             long rg = -1;
             if (tctx > 0 && thnd > 0 && !s.dead)
@@ -13795,17 +13801,39 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
                 if (o2 < (int)sizeof(r2) - 200)
                     o2 += snprintf(r2 + o2, sizeof(r2) - o2,
                                    " t2[g=%lx,unl=%u]", rg, unlocked);
-                if (f_tti > 0)
-                    for (int i = 0; i < nposted && !s.dead; i++) {
-                        long rt = rpc_call(&s, f_tti, tctx, thnd, posted_ids[i],
-                                           s.scratch + 0x400, s.scratch + 0xa00, 0);
-                        uint32_t un = 0;
-                        rpc_read(pid, s.scratch + 0xa04, &un, 4);
-                        if (o2 < (int)sizeof(r2) - 200)
-                            o2 += snprintf(r2 + o2, sizeof(r2) - o2,
-                                           " [t2:%d=%lx,%u]", posted_ids[i], rt, un);
-                    }
-                // Probe the daemon-side sync triggers on the borrowed pair.
+            }
+            // Trophy2 debug unlock — IPMI to SceShellCore, persists through
+            // game restart because the daemon writes its own persistent db.
+            // Without verification (t2_verified=0) every id is attempted —
+            // the debug op is a no-op on already-unlocked trophies.
+            int ndunl = 0, ndutry = 0;
+            if (tctx > 0 && thnd > 0 && f_t2du > 0 && !s.dead) {
+                int32_t prm[16];
+                memset(prm, 0, sizeof(prm));
+                prm[0] = 2;
+                for (int i = 0; i < nreq && !s.dead; i++) {
+                    if (t2_verified && layer[i] != 0) continue;
+                    prm[1] = req_ids[i];
+                    rpc_write(pid, s.scratch + 0x80, prm, sizeof(prm));
+                    long ru = rpc_call(&s, f_t2du, tctx, thnd,
+                                       s.scratch + 0x80, 0, 0, 0);
+                    ndutry++;
+                    if ((int32_t)ru >= 0) ndunl++;
+                }
+            }
+            // Re-query after the debug pass — only verified unlocks count.
+            if (t2_verified && !s.dead)
+                for (int i = 0; i < nreq && !s.dead; i++) {
+                    if (layer[i] != 0) continue;
+                    if (t2_query_unlocked(&s, pid, f_tti, tctx, thnd,
+                                          req_ids[i]) == 1)
+                        layer[i] = 2;
+                }
+            if (o2 < (int)sizeof(r2) - 200)
+                o2 += snprintf(r2 + o2, sizeof(r2) - o2,
+                               " du=%d/%d", ndunl, ndutry);
+            // Probe the daemon-side sync triggers on the borrowed pair.
+            if (tctx > 0 && thnd > 0 && !s.dead) {
                 if (!s.dead && o2 < (int)sizeof(r2) - 300) {
                     if (f_cns > 0)
                         o2 += snprintf(r2 + o2, sizeof(r2) - o2, " cns=%lx",
@@ -13834,20 +13862,39 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
     // Deferred file-level unlock — runs AFTER all daemon triggers so the
     // daemon's extraction/journal-flush has settled.  Brief sleep lets any
     // pending daemon TRPTITLE rewrite finish before we pin our state.
-    if (nfile > 0 && npwr[0]) {
+    if (nreq > 0 && npwr[0]) {
         usleep(1500000);
-        for (int i = 0; i < nfile; i++) {
+        for (int i = 0; i < nreq; i++) {
+            if (t2_verified && layer[i] != 0) continue;
             char fdiag[80] = "";
-            trophy_force_unlock_file(npwr, file_pend[i].id, file_pend[i].gid,
-                                     fdiag, sizeof(fdiag));
+            int fr = trophy_force_unlock_file(npwr, req_ids[i], req_gid[i],
+                                              fdiag, sizeof(fdiag));
+            if (fr > 0) layer[i] = 3;
             if (o2 < (int)sizeof(r2) - 200)
                 o2 += snprintf(r2 + o2, sizeof(r2) - o2, " [id%d %s]",
-                               file_pend[i].id, fdiag);
+                               req_ids[i], fdiag);
         }
     }
     kernel_set_ucred_authid(me, oa);
-    o2 += snprintf(r2 + o2, sizeof(r2) - o2, " ok=%d fail=%d dead=%d",
-                   ok, fail, s.dead);
+    int n_post = 0, n_du = 0, n_file = 0, n_alr = 0, n_stuck = 0;
+    char stuck[160] = ""; int so = 0;
+    for (int i = 0; i < nreq; i++) {
+        if (layer[i] == 1) n_post++;
+        else if (layer[i] == 2) n_du++;
+        else if (layer[i] == 3) n_file++;
+        else if (layer[i] == 4) n_alr++;
+        else {
+            n_stuck++;
+            if (so < (int)sizeof(stuck) - 12)
+                so += snprintf(stuck + so, sizeof(stuck) - so, "%s%d",
+                               so ? "," : "", req_ids[i]);
+        }
+    }
+    o2 += snprintf(r2 + o2, sizeof(r2) - o2,
+                   " ok=%d fail=%d dead=%d | post=%d du=%d file=%d"
+                   " already=%d stuck=%d[%s]",
+                   ok, fail, s.dead, n_post, n_du, n_file, n_alr,
+                   n_stuck, stuck);
     send_response(session->sock, RESP_DATA, r2, (uint32_t)o2);
 }
 
