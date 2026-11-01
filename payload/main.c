@@ -13355,6 +13355,7 @@ static int t2_query_unlocked(rpc_sess_t *s, pid_t pid, intptr_t f_tti,
 // eventName matches that trophy's stat, so the unmatched post is a no-op).
 static void uds_trophy_unlock(client_session_t *session, int want_all, int want_id) {
     pid_t me = getpid();
+    time_t t_start = time(NULL);
     uint64_t oa = kernel_get_ucred_authid(me);
     kernel_set_ucred_authid(me, 0x4800000000010003ULL);
     char cand[256]; uint32_t th = 0;
@@ -13633,8 +13634,15 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
                 rpc_write(pid, st_dpp, work[i].evprop,
                           strlen(work[i].evprop) + 1);
                 intptr_t fset = work[i].evwide && f_si64 > 0 ? f_si64 : f_si3;
-                long pv = work[i].evval >= 0 ? work[i].evval
-                                             : (target > 0 ? target : 1);
+                // COUNT-style events carry the increment in the event itself:
+                // the rule has no value (0), so the counter must be the
+                // trophy's target — otherwise the daemon extracts stat += 0,
+                // never meets the threshold, and wipes the unlock at the
+                // next session flush (ASTRO BOT wipe, journal showed
+                // "counter": 0).  Condition-value rules (Onimusha-style)
+                // keep their explicit evval.
+                long pv = work[i].evval > 0 ? work[i].evval
+                          : (target > 0 ? target : 1);
                 rpc_call(&s, fset, (long)pobj, st_dpp, pv, 0, 0, 0);
             } else {
                 rpc_call(&s, f_si3, (long)pobj, st_tid, id, 0, 0, 0);
@@ -13895,6 +13903,21 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
                    " already=%d stuck=%d[%s]",
                    ok, fail, s.dead, n_post, n_du, n_file, n_alr,
                    n_stuck, stuck);
+    // Persistence probe: the daemon flushes the UDS stat store
+    // (/user/home/<uid>/np_uds/nobackup/stats/<NPWR>/stats.dat) — if its
+    // mtime moved past the unlock start, the session stats reached disk and
+    // the unlocks survive the game-exit re-evaluation (the ASTRO BOT wipe
+    // happened because stats.dat stayed at its old mtime with zero values).
+    {
+        char sp[PATH_MAX];
+        struct stat st;
+        snprintf(sp, sizeof(sp),
+                 "/user/home/%08x/np_uds/nobackup/stats/%s/stats.dat",
+                 uid, npwr);
+        if (uid && npwr[0] && stat(sp, &st) == 0)
+            o2 += snprintf(r2 + o2, sizeof(r2) - o2,
+                           " statsflush=%ld", (long)(st.st_mtime - t_start));
+    }
     send_response(session->sock, RESP_DATA, r2, (uint32_t)o2);
 }
 
