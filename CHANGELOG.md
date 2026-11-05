@@ -19,6 +19,28 @@
 - **activityEnd fallback** — the synthetic `activityEnd` post (custom-event games) uses the same dual-signature probe.
 - **Verified on FW 5.50** — tester confirmed trophies unlock through the daemon's own award path (no file edits needed: `file:0ed 1alrdy`).
 
+### New — on-console Web UI (payload)
+
+- **Home-screen tile + browser dashboard** — the payload registers a `PSUI00001` tile on the PS5 home screen; opening it launches the embedded dashboard served by the payload itself (default port 17382, no PC needed). Pages: Dashboard, System (live CPU/memory/network charts), Games, Install, Trophy, Saves, Screenshots, Files, Kernel Log, Tools.
+- **Saves page rework** — per-save icons (`saveicon` route serves each save's own `icon0.png`, PS4 `savedata` + PS5 `savedata_prospero` formats), friendly game names, PS4/PS5 badges, automatic `sce_bu_*` backup entries filtered out, and per-save actions: Mount, Browse (mount + open in Files), Download, Delete. Mounted-save status with Unmount stays on top.
+- **Tools → Lights** — console LED presets and effects (`ledeffect`: white/blue/orange/purple/pink, sunrise, breathe animations, off/auto) plus DualSense lightbar colors through a new `pad` web route (`lightbar|r,g,b`).
+- **Real filenames on downloads** — the `/dl` endpoint now sends `Content-Disposition` with the actual basename, so browsers save `sdimg_…`/screenshots under their real names instead of `dl`.
+- **Trophy page** — the dangerous one-shot **Unlock ALL** button was removed; per-trophy lock, Lock ALL, per-id unlock and Repair remain.
+- **Web UI re-enabled** — it was left commented out during an earlier debugging session.
+
+### Fixed — payload listener port stacking (payload)
+
+- **TCP listener no longer requests `SO_REUSEPORT`** — with reuse-port set, every redeploy bound an *additional* listener instead of triggering the stale-instance takeover, so ports 9113+ accumulated wedged copies that accepted connections but never answered (unkillable until reboot). Now a new payload kills/takes over stale instances and falls back through 9113–9143 cleanly.
+
+### Fixed — client connection & discovery (PC/Android)
+
+- **Discovered port is now actually used** — UDP discovery found the live port but only the IP was kept; every connection path (main connect, shell, icons, trophies, uploads) still dialed hardcoded 9113. The discovered port is stored silently (no UI field) and used everywhere.
+- **Full fallback-range scanning** — TCP probe and UDP discovery previously covered only 9113–9118, missing payloads that had fallen back to 9119+. Both now scan the complete 9113–9143 range.
+
+### Fixed — file downloads showed no progress (issue #18)
+
+- The bottom progress panel (`ProgressPanel`) was only ever made visible by the upload path, so PS5→PC downloads transferred invisibly (the reporter saw activity only in Task Manager). Single-file, folder and multi-select downloads now all show the panel with percent/speed/filename, and the STOP button cancels downloads too (`OperationCanceledException` handled gracefully).
+
 ---
 
 ## v7.8.0 (October 2026)

@@ -2417,6 +2417,33 @@ static void install_suite_icon(void) {
     if (f) { fwrite(g_ps_icon_png, 1, g_ps_icon_png_len, f); fclose(f); }
 }
 
+// ---- Home-screen tile → embedded Web UI ------------------------------------
+// Payload Manager style: an "app launcher" shortcut — just param.json +
+// icon0.png under /user/app/<id>/sce_sys, NO eboot.bin. The param's
+// applicationCategoryType=0x10000 marks it an app launcher and deeplinkUri
+// points at our embedded web UI, so tapping the tile opens the browser to
+// http://127.0.0.1:<webui> — the live menu. register_title() (daemon IPC)
+// registers it → the home screen notifies itself (tile appears, no UI kill).
+#define WEBUI_TILE_DIR   "/user/app/PSUI00001"
+#define WEBUI_TILE_TITLE "PSUI00001"
+static void install_webui_tile(int port) {
+    mkdir(WEBUI_TILE_DIR, 0755);
+    mkdir(WEBUI_TILE_DIR "/sce_sys", 0755);
+    char param_json[512];
+    snprintf(param_json, sizeof(param_json),
+        "{\"titleId\":\"" WEBUI_TILE_TITLE "\","
+        "\"applicationCategoryType\":65536,"
+        "\"deeplinkUri\":\"http://127.0.0.1:%d/\","
+        "\"localizedParameters\":{\"defaultLanguage\":\"en-US\","
+        "\"en-US\":{\"titleName\":\"PS5 Suite\"}}}", port);
+    FILE *f = fopen(WEBUI_TILE_DIR "/sce_sys/param.json", "w");
+    if (f) { fputs(param_json, f); fclose(f); }
+    f = fopen(WEBUI_TILE_DIR "/sce_sys/icon0.png", "wb");
+    if (f) { fwrite(g_ps_icon_png, 1, g_ps_icon_png_len, f); fclose(f); }
+    if (register_title(WEBUI_TILE_TITLE, WEBUI_TILE_DIR) != 0)
+        appdb_direct_register(WEBUI_TILE_TITLE, WEBUI_TILE_DIR);   // fallback
+}
+
 void send_notification_pretty(const char *body, const char *sub) {
     resolve_sce_notif();
     char fallback[256];
@@ -2504,7 +2531,657 @@ static int is_mounted(const char* path) {
     struct statfs sfs;
     if (statfs(path, &sfs) != 0)
         return 0;
-    return strcmp(sfs.f_fstypename, "nullfs") == 0;
+    if (strcmp(sfs.f_mntonname, path) != 0)
+        return 0;                       // path is not itself a mountpoint
+    return strcmp(sfs.f_fstypename, "nullfs") == 0 ||
+           strcmp(sfs.f_fstypename, "unionfs") == 0;   // backport overlay sits on top
+}
+
+// A mount stack (nullfs + optional unionfs backport) needs one unmount per
+// layer — umount() only pops the top. Loop until nothing stacked remains.
+static int unmount_stack_guarded(const char* path) {
+    int rc = 0;
+    for (int i = 0; i < 4 && is_mounted(path); i++) {
+        if (unmount_guarded(path, 0) != 0 &&
+            unmount_guarded(path, MNT_FORCE) != 0) {
+            rc = -1;
+            break;                      // stuck on a busy vnode — stop hammering
+        }
+    }
+    return rc;
+}
+
+// unionfs backport overlay — ShadowMount-compatible layout: patched files in
+// <scan_root>/backports/<TITLE_ID>[-whatever] transparently cover the mounted
+// game's files at /system_ex/app/<TID>. copymode=transparent lets the lower
+// (game) layer supply anything the overlay doesn't override.
+static int mount_unionfs_overlay(const char* src, const char* dst) {
+    struct statfs sfs;
+    int ro = (statfs(dst, &sfs) == 0 && (sfs.f_flags & MNT_RDONLY));
+    struct iovec iov[] = {
+        IOVEC_ENTRY("fstype"),   IOVEC_ENTRY("unionfs"),
+        IOVEC_ENTRY("from"),     IOVEC_ENTRY(src),
+        IOVEC_ENTRY("fspath"),   IOVEC_ENTRY(dst),
+        IOVEC_ENTRY("copymode"), IOVEC_ENTRY("transparent"),
+        IOVEC_ENTRY("noatime"),  IOVEC_ENTRY(NULL),
+        IOVEC_ENTRY("fnodup"),   IOVEC_ENTRY(NULL),
+    };
+    int rc = wdg_fn_call((void *)nmount, iov, (void *)(long)IOVEC_SIZE(iov),
+                         (void *)(long)ro, NULL, 5000);
+    if (rc == -2) { errno = EBUSY; return -1; }
+    return rc;
+}
+
+// Resolve <scan_root>/backports/<title_id>[*] — the alphabetically first dir
+// whose name starts with the title id (same rule as ShadowMount: exact name
+// wins, otherwise e.g. PPSA01234-backport). Returns 1 + fills `out`.
+static int resolve_backport_dir(const char* scan_root, const char* title_id,
+                                char* out, size_t out_sz) {
+    out[0] = 0;
+    if (!scan_root || !*scan_root || !title_id || !*title_id) return 0;
+    char root[PATH_MAX];
+    snprintf(root, sizeof(root), "%s/backports", scan_root);
+    DIR* d = opendir(root);
+    if (!d) return 0;
+    size_t tid_len = strlen(title_id);
+    struct dirent* e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        if (strncmp(e->d_name, title_id, tid_len) != 0) continue;
+        char cand[PATH_MAX];
+        snprintf(cand, sizeof(cand), "%s/%s", root, e->d_name);
+        struct stat st;
+        if (stat(cand, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+        // Skip empty dirs: this kernel's unionfs does not merge readdir
+        // (listings read empty) so an empty overlay would only hide the
+        // game's directory listing without adding any patched files.
+        DIR* inner = opendir(cand);
+        if (!inner) continue;
+        int has_files = 0;
+        struct dirent* ie;
+        while ((ie = readdir(inner)) != NULL)
+            if (ie->d_name[0] != '.') { has_files = 1; break; }
+        closedir(inner);
+        if (!has_files) continue;
+        if (!out[0] || strcmp(e->d_name, strrchr(out, '/') + 1) < 0)
+            snprintf(out, out_sz, "%s", cand);
+    }
+    closedir(d);
+    return out[0] != 0;
+}
+
+// ============================================================================
+// GAME IMAGE MOUNTING (.ffpkg / .exfat) — virtual-disk flow:
+// the image file is attached as a virtual block device through /dev/lvdctl,
+// nmount'ed as ufs/exfatfs under /mnt/suitemnt/<name>, and the mount point is
+// then fed to process_game() — the rest of the pipeline (nullfs into
+// /system_ex/app, sce_sys staging, registration, mount.lnk) is identical to
+// folder dumps. mount_img.lnk inside /user/app/<TID> records the backing
+// image file + device node so unmount can release the virtual disk again.
+// ============================================================================
+#define SUITE_IMG_MOUNT_BASE "/mnt/suitemnt"
+#define SUITE_LVD_CTRL       "/dev/lvdctl"
+#define SUITE_LVD_ATTACH_V0  0xC0286D00u
+#define SUITE_LVD_DETACH     0xC0286D01u
+
+// LVD attach parameters: SAVE_DATA profile for internal-storage images
+// (/data, /user), legacy SINGLE/DOWNLOAD_DATA profiles for external media.
+#define SUITE_LVD_SECTOR_UFS    4096u
+#define SUITE_LVD_SECTOR_EXFAT  512u
+#define SUITE_LVD_SEC2_IMAGE_IO 0x10000u
+#define SUITE_LVD_IMG_SINGLE    0
+#define SUITE_LVD_IMG_SAVE_DATA 5
+#define SUITE_LVD_IMG_DOWNLOAD  7
+
+typedef struct {
+    uint16_t source_type;    // 1 = file, 2 = special/device
+    uint16_t flags;          // 1 = no bitmap file
+    uint32_t reserved0;
+    const char *path;
+    uint64_t offset;
+    uint64_t size;
+    const char *bitmap_path;
+    uint64_t bitmap_offset;
+    uint64_t bitmap_size;
+} suite_lvd_layer_t;
+
+typedef struct {
+    uint32_t io_version;
+    int32_t  device_id;      // in: -1 auto; out: created lvd unit
+    uint32_t sector_size;
+    uint32_t secondary_unit;
+    uint16_t flags;
+    uint16_t image_type;
+    uint32_t layer_count;
+    uint64_t device_size;
+    suite_lvd_layer_t *layers_ptr;
+} suite_lvd_attach_t;
+
+typedef struct {
+    uint32_t reserved0;
+    int32_t  device_id;
+    uint8_t  reserved[0x20];
+} suite_lvd_detach_t;
+
+// 1 = UFS (.ffpkg), 2 = exFAT (.exfat), 0 = not an image
+static int suite_img_fs_type(const char *name) {
+    const char *dot = name ? strrchr(name, '.') : NULL;
+    if (!dot) return 0;
+    if (!strcasecmp(dot, ".ffpkg")) return 1;
+    if (!strcasecmp(dot, ".exfat")) return 2;
+    return 0;
+}
+
+static uint32_t suite_fnv1a32(const char *s) {
+    uint32_t h = 2166136261u;
+    while (*s) { h ^= (uint8_t)*s++; h *= 16777619u; }
+    return h;
+}
+
+// Deterministic mount point: the same image always lands on the same path,
+// so a remount after reboot/re-scan produces the same mount.lnk target.
+static void suite_img_mount_point(const char *img_path, char *out, size_t out_sz) {
+    const char *base = strrchr(img_path, '/');
+    base = base ? base + 1 : img_path;
+    char stem[160];
+    snprintf(stem, sizeof(stem), "%s", base);
+    char *dot = strrchr(stem, '.');
+    if (dot) *dot = '\0';
+    if (strlen(stem) > 96) stem[96] = '\0';
+    snprintf(out, out_sz, "%s/%s_%08x", SUITE_IMG_MOUNT_BASE, stem,
+             suite_fnv1a32(img_path));
+}
+
+static int suite_lvd_attach(const char *img_path, uint64_t file_size, int fs,
+                            int *unit_out, char *dev_out, size_t dev_sz) {
+    int fd = open(SUITE_LVD_CTRL, O_RDWR);
+    if (fd < 0) return -1;
+
+    int legacy = strncmp(img_path, "/data", 5) != 0 &&
+                 strncmp(img_path, "/user", 5) != 0;
+
+    suite_lvd_layer_t layer;
+    memset(&layer, 0, sizeof(layer));
+    struct stat fst;
+    layer.source_type =
+        (stat(img_path, &fst) == 0 &&
+         (S_ISCHR(fst.st_mode) || S_ISBLK(fst.st_mode))) ? 2 : 1;
+    layer.flags  = 1;                        // no bitmap
+    layer.path   = img_path;
+    layer.offset = 0;
+    layer.size   = file_size;
+
+    uint32_t sector = (fs == 1) ? SUITE_LVD_SECTOR_UFS : SUITE_LVD_SECTOR_EXFAT;
+    uint32_t sec2 = (legacy && fs != 2) ? sector
+                    : (SUITE_LVD_SEC2_IMAGE_IO % sector == 0
+                       ? SUITE_LVD_SEC2_IMAGE_IO : sector);
+
+    // Always attach read-only — game images are never written. Raw flags
+    // SINGLE_RO=0x9 / DD_RO=0xD normalized into the kernel-facing bits.
+    uint16_t raw = (legacy && fs == 1) ? 0x000D : 0x0009;
+    uint16_t flags = 0x0004 | (uint16_t)(raw & 0x8000u);
+    if (raw & 0x1) flags |= 0x08;            // RO variant
+    if (raw & 0x2) flags |= 0x80;            // inner profile
+    if (raw & 0x4) flags |= 0x02;            // download-data profile
+    if (raw & 0x8) flags |= 0x10;            // single-save profile
+
+    uint16_t image_type = legacy ? (fs == 1 ? SUITE_LVD_IMG_DOWNLOAD
+                                            : SUITE_LVD_IMG_SINGLE)
+                                 : SUITE_LVD_IMG_SAVE_DATA;
+
+    suite_lvd_attach_t req;
+    memset(&req, 0, sizeof(req));
+    req.io_version     = 0;
+    req.device_id      = -1;
+    req.sector_size    = sector;
+    req.secondary_unit = sec2;
+    req.flags          = flags;
+    req.image_type     = image_type;
+    req.layer_count    = 1;
+    req.device_size    = file_size;
+    req.layers_ptr     = &layer;
+
+    int rc = wdg_fn_call((void *)ioctl, (void *)(long)fd,
+                         (void *)(long)SUITE_LVD_ATTACH_V0, &req, NULL, 15000);
+    int saved = errno;
+    close(fd);
+    if (rc != 0 || req.device_id < 0) { errno = saved ? saved : EIO; return -1; }
+    *unit_out = req.device_id;
+    snprintf(dev_out, dev_sz, "/dev/lvd%d", req.device_id);
+    return 0;
+}
+
+static int suite_lvd_detach_unit(int unit) {
+    if (unit < 0) return -1;
+    int fd = open(SUITE_LVD_CTRL, O_RDWR);
+    if (fd < 0) return -1;
+    suite_lvd_detach_t req;
+    memset(&req, 0, sizeof(req));
+    req.device_id = unit;
+    int rc = wdg_fn_call((void *)ioctl, (void *)(long)fd,
+                         (void *)(long)SUITE_LVD_DETACH, &req, NULL, 15000);
+    int saved = errno;
+    close(fd);
+    if (rc != 0) { errno = saved; return -1; }
+    return 0;
+}
+
+static int suite_img_nmount(const char *devname, const char *mntpt, int fs) {
+    char errmsg[256];
+    memset(errmsg, 0, sizeof(errmsg));
+    struct iovec iov_ufs[] = {
+        IOVEC_ENTRY("fstype"),      IOVEC_ENTRY("ufs"),
+        IOVEC_ENTRY("from"),        IOVEC_ENTRY(devname),
+        IOVEC_ENTRY("fspath"),      IOVEC_ENTRY(mntpt),
+        IOVEC_ENTRY("budgetid"),    IOVEC_ENTRY("game"),
+        IOVEC_ENTRY("async"),       IOVEC_ENTRY(NULL),
+        IOVEC_ENTRY("noatime"),     IOVEC_ENTRY(NULL),
+        IOVEC_ENTRY("automounted"), IOVEC_ENTRY(NULL),
+        IOVEC_ENTRY("errmsg"),      { (void *)errmsg, sizeof(errmsg) },
+    };
+    struct iovec iov_exfat[] = {
+        IOVEC_ENTRY("from"),        IOVEC_ENTRY(devname),
+        IOVEC_ENTRY("fspath"),      IOVEC_ENTRY(mntpt),
+        IOVEC_ENTRY("fstype"),      IOVEC_ENTRY("exfatfs"),
+        IOVEC_ENTRY("budgetid"),    IOVEC_ENTRY("game"),
+        IOVEC_ENTRY("large"),       IOVEC_ENTRY("yes"),
+        IOVEC_ENTRY("timezone"),    IOVEC_ENTRY("static"),
+        IOVEC_ENTRY("async"),       IOVEC_ENTRY(NULL),
+        IOVEC_ENTRY("noatime"),     IOVEC_ENTRY(NULL),
+        IOVEC_ENTRY("ignoreacl"),   IOVEC_ENTRY(NULL),
+        IOVEC_ENTRY("automounted"), IOVEC_ENTRY(NULL),
+        IOVEC_ENTRY("errmsg"),      { (void *)errmsg, sizeof(errmsg) },
+    };
+    struct iovec *iov = (fs == 1) ? iov_ufs : iov_exfat;
+    int iovlen = (fs == 1) ? (int)IOVEC_SIZE(iov_ufs) : (int)IOVEC_SIZE(iov_exfat);
+    int rc = wdg_fn_call((void *)nmount, iov, (void *)(long)iovlen,
+                         (void *)(long)MNT_RDONLY, NULL, 15000);
+    if (rc == -2) errno = EBUSY;
+    if (rc != 0 && errmsg[0]) {
+        dbg_log("img nmount errmsg: ");
+        dbg_log(errmsg);
+        dbg_log("\n");
+    }
+    return (rc == 0) ? 0 : -1;
+}
+
+// Attach + nmount an image file. Returns 0 = freshly attached (dev_out +
+// unit_out filled), 1 = already mounted (reused), -1 = failure.
+static int suite_image_mount(const char *img_path, char *mntpt_out, size_t mntpt_sz,
+                             char *dev_out, size_t dev_sz, int *unit_out) {
+    int fs = suite_img_fs_type(img_path);
+    if (!fs) return -1;
+    suite_img_mount_point(img_path, mntpt_out, mntpt_sz);
+
+    struct statfs sfs;
+    if (statfs(mntpt_out, &sfs) == 0 &&
+        !strcmp(sfs.f_fstypename, (fs == 1) ? "ufs" : "exfatfs")) {
+        snprintf(dev_out, dev_sz, "%s", sfs.f_mntfromname);
+        *unit_out = -1;
+        return 1;
+    }
+
+    struct stat st;
+    if (stat(img_path, &st) != 0 || !S_ISREG(st.st_mode)) return -1;
+
+    int unit = -1;
+    char dev[64];
+    if (suite_lvd_attach(img_path, (uint64_t)st.st_size, fs, &unit, dev,
+                         sizeof(dev)) != 0)
+        return -1;
+
+    mkdir(SUITE_IMG_MOUNT_BASE, 0755);
+    mkdir(mntpt_out, 0755);
+    if (suite_img_nmount(dev, mntpt_out, fs) != 0) {
+        suite_lvd_detach_unit(unit);
+        rmdir(mntpt_out);
+        return -1;
+    }
+    *unit_out = unit;
+    snprintf(dev_out, dev_sz, "%s", dev);
+    return 0;
+}
+
+// Unmount an image filesystem and detach its virtual device. devname may be
+// empty — the device is then recovered from statfs before the unmount.
+static int suite_image_release(const char *mntpt, const char *devname) {
+    char dev[64];
+    if (devname && devname[0]) {
+        snprintf(dev, sizeof(dev), "%s", devname);
+    } else {
+        struct statfs sfs;
+        if (statfs(mntpt, &sfs) != 0) return -1;
+        snprintf(dev, sizeof(dev), "%s", sfs.f_mntfromname);
+    }
+    // Pop every stacked layer (a unionfs backport overlay or manual test
+    // mount may sit on top of the image fs) before detaching the device.
+    // is_mounted() only knows nullfs/unionfs — the image fs itself (ufs/
+    // exfatfs) is checked via statfs mountpoint match instead.
+    for (int i = 0; i < 4; i++) {
+        struct statfs sfs;
+        if (statfs(mntpt, &sfs) != 0 || strcmp(sfs.f_mntonname, mntpt) != 0)
+            break;
+        if (unmount_guarded(mntpt, 0) != 0 &&
+            unmount_guarded(mntpt, MNT_FORCE) != 0)
+            break;
+    }
+    int unit = -1;
+    if (sscanf(dev, "/dev/lvd%d", &unit) == 1)
+        suite_lvd_detach_unit(unit);
+    rmdir_guarded(mntpt);
+    return 0;
+}
+
+// If /user/app/<tid> tracks an image-backed mount, release the image fs +
+// virtual disk. mount.lnk holds the image mount point for those titles;
+// mount_img.lnk line 2 holds the device node. Returns 1 when an image was
+// released (or attempted), 0 for plain folder mounts.
+static int release_title_image(const char *user_app_dir) {
+    char lnk[PATH_MAX], mp[PATH_MAX] = {};
+    snprintf(lnk, sizeof(lnk), "%s/mount.lnk", user_app_dir);
+    FILE *f = fopen(lnk, "r");
+    if (!f) return 0;
+    if (fgets(mp, sizeof(mp), f)) mp[strcspn(mp, "\r\n")] = '\0';
+    fclose(f);
+    if (strncmp(mp, SUITE_IMG_MOUNT_BASE "/",
+                strlen(SUITE_IMG_MOUNT_BASE) + 1) != 0)
+        return 0;
+    char dev[64] = {};
+    char ilnk[PATH_MAX];
+    snprintf(ilnk, sizeof(ilnk), "%s/mount_img.lnk", user_app_dir);
+    f = fopen(ilnk, "r");
+    if (f) {
+        char line[PATH_MAX];
+        if (fgets(line, sizeof(line), f)) { /* line 1 = image path, unused */ }
+        if (fgets(dev, sizeof(dev), f)) dev[strcspn(dev, "\r\n")] = '\0';
+        fclose(f);
+    }
+    suite_image_release(mp, dev);
+    return 1;
+}
+
+// ============================================================================
+// SANDBOX WATCHER — per-launch fakelib/data/fonts/storage injection.
+//
+// We cannot hook ShellCore's sandbox-ready notification like other tools do,
+// but a game's sandbox directory (/mnt/sandbox/<TITLE>_<n>) is created before
+// its process execs. A ~120 ms poller catches it in time to mount:
+//   <game>/fakelib[2] -> unionfs over <sandbox>/<sub>/common/lib
+//   /data             -> <sandbox>/data            (nullfs)
+//   /preinst/common/font -> <sandbox>/preinst/common/font (nullfs ro)
+//   /mnt/usbN,/mnt/extN,/mnt/disc -> <sandbox>/mnt/<name>  (nullfs)
+// so fakelib games (fpkgs-style images that ship their own lib dir) and
+// games that expect real /data + fonts see them inside the sandbox.
+// Only titles WE mounted (mount.lnk present) are touched; the layers are
+// tracked and popped again when the sandbox directory disappears.
+// ============================================================================
+#define SBX_MAX_SESSIONS 8
+#define SBX_MAX_LAYERS   24
+#define SBX_MAX_CREATED  12
+
+typedef struct {
+    char root[PATH_MAX];                      // /mnt/sandbox/<tid>_<n>
+    char title[16];
+    int  pending;                             // mounts not applied yet
+    long age_ms;
+    int  nlayers;
+    char layers[SBX_MAX_LAYERS][PATH_MAX];    // mountpoints, unmount order
+    int  ncreated;
+    char created[SBX_MAX_CREATED][PATH_MAX];  // dirs we mkdir'd, shallow->deep
+} sbx_session_t;
+
+static sbx_session_t g_sbx[SBX_MAX_SESSIONS];
+
+static int sbx_is_dir(const char *p) {
+    struct stat st;
+    return p && stat(p, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static void sbx_track_layer(sbx_session_t *s, const char *mp) {
+    if (s->nlayers < SBX_MAX_LAYERS)
+        snprintf(s->layers[s->nlayers++], PATH_MAX, "%s", mp);
+}
+static void sbx_track_created(sbx_session_t *s, const char *mp) {
+    if (s->ncreated < SBX_MAX_CREATED)
+        snprintf(s->created[s->ncreated++], PATH_MAX, "%s", mp);
+}
+
+// mkdir one component under the sandbox root and remember it for cleanup
+static int sbx_mkdir1(sbx_session_t *s, const char *path) {
+    if (mkdir(path, 0777) == 0) { sbx_track_created(s, path); return 0; }
+    return errno == EEXIST && sbx_is_dir(path) ? 0 : -1;
+}
+
+// nullfs a real dir into the sandbox (creating the target dir)
+static void sbx_bind(sbx_session_t *s, const char *src, const char *dst,
+                     int ro) {
+    (void)ro;   // nullfs inherits nothing — kernel propagates RO from source
+    if (!sbx_is_dir(src)) return;
+    if (!sbx_is_dir(dst)) {
+        if (mkdir(dst, 0777) == 0) sbx_track_created(s, dst);
+        else if (!sbx_is_dir(dst)) return;
+    }
+    if (mount_nullfs(src, dst) == 0)
+        sbx_track_layer(s, dst);
+}
+
+static int sbx_title_ours(const char *title) {
+    char p[PATH_MAX];
+    snprintf(p, sizeof(p), "/user/app/%s/mount.lnk", title);
+    struct stat st;
+    return stat(p, &st) == 0;
+}
+
+// resolve fakelib dir: <src>/fakelib2 > <src>/fakelib > <scan_root>/backports/
+// <title>/fakelib[2]. scan_root is the parent of the source dir for folder
+// games, or the image file's dir for image mounts (mount_img.lnk line 1).
+static int sbx_find_fakelib(const char *src, const char *scan_root,
+                            const char *title, char *out, size_t out_sz) {
+    char a[PATH_MAX], b[PATH_MAX];
+    snprintf(a, sizeof(a), "%s/fakelib2", src);
+    snprintf(b, sizeof(b), "%s/fakelib", src);
+    if (sbx_is_dir(a)) { snprintf(out, out_sz, "%s", a); return 1; }
+    if (sbx_is_dir(b)) { snprintf(out, out_sz, "%s", b); return 1; }
+    if (scan_root && *scan_root) {
+        char bp[PATH_MAX];
+        if (resolve_backport_dir(scan_root, title, bp, sizeof(bp))) {
+            snprintf(a, sizeof(a), "%s/fakelib2", bp);
+            snprintf(b, sizeof(b), "%s/fakelib", bp);
+            if (sbx_is_dir(a)) { snprintf(out, out_sz, "%s", a); return 1; }
+            if (sbx_is_dir(b)) { snprintf(out, out_sz, "%s", b); return 1; }
+        }
+    }
+    return 0;
+}
+
+static void sbx_apply(sbx_session_t *s) {
+    // mount.lnk -> game source path (folder dir or /mnt/suitemnt/<img>);
+    // mount_img.lnk line 1 -> the image file (its dir is the scan root for
+    // backports). Folder mounts use the mount.lnk parent instead.
+    char src[PATH_MAX] = {}, root[PATH_MAX] = {};
+    char lnk[PATH_MAX];
+    snprintf(lnk, sizeof(lnk), "/user/app/%s/mount.lnk", s->title);
+    FILE *f = fopen(lnk, "r");
+    if (f) { if (fgets(src, sizeof(src), f)) src[strcspn(src, "\r\n")] = 0; fclose(f); }
+    if (!src[0]) snprintf(src, sizeof(src), "/system_ex/app/%s", s->title);
+    snprintf(lnk, sizeof(lnk), "/user/app/%s/mount_img.lnk", s->title);
+    f = fopen(lnk, "r");
+    if (f) {
+        if (fgets(root, sizeof(root), f)) {
+            root[strcspn(root, "\r\n")] = 0;
+            char *sl = strrchr(root, '/');
+            if (sl) *sl = 0; else root[0] = 0;
+        }
+        fclose(f);
+    }
+    if (!root[0]) {
+        snprintf(root, sizeof(root), "%s", src);
+        char *sl = strrchr(root, '/');
+        if (sl) *sl = 0; else root[0] = 0;
+    }
+
+    char app0[PATH_MAX];
+    snprintf(app0, sizeof(app0), "%s/app0", s->root);
+    if (!sbx_is_dir(app0)) return;           // sandbox not populated yet
+
+    // fakelib: overlay <sibling>/common/lib — sibling dirs appear with app0;
+    // a game may have none, so absence is not fatal for the rest.
+    {
+        char fak[PATH_MAX];
+        if (sbx_find_fakelib(src, root, s->title, fak, sizeof(fak))) {
+            DIR *d = opendir(s->root);
+            if (d) {
+                struct dirent *e;
+                while ((e = readdir(d))) {
+                    if (e->d_name[0] == '.' || !strcmp(e->d_name, "app0"))
+                        continue;
+                    char clib[PATH_MAX];
+                    snprintf(clib, sizeof(clib), "%s/%s/common/lib",
+                             s->root, e->d_name);
+                    if (!sbx_is_dir(clib)) continue;
+                    if (mount_unionfs_overlay(fak, clib) == 0)
+                        sbx_track_layer(s, clib);
+                    break;
+                }
+                closedir(d);
+            }
+        }
+    }
+
+    // /data (siblings of app0 live under the same sandbox root)
+    {
+        char mp[PATH_MAX];
+        snprintf(mp, sizeof(mp), "%s/data", s->root);
+        sbx_bind(s, "/data", mp, 0);
+    }
+    // fonts: /preinst/common/font (games crash on font init without it)
+    {
+        char mp[PATH_MAX], par[PATH_MAX];
+        snprintf(par, sizeof(par), "%s/preinst", s->root);        sbx_mkdir1(s, par);
+        snprintf(par, sizeof(par), "%s/preinst/common", s->root); sbx_mkdir1(s, par);
+        snprintf(mp, sizeof(mp), "%s/preinst/common/font", s->root);
+        sbx_bind(s, "/preinst/common/font", mp, 1);
+    }
+    // storage roots: /mnt/usbN, /mnt/extN, /mnt/disc
+    {
+        char mroot[PATH_MAX];
+        snprintf(mroot, sizeof(mroot), "%s/mnt", s->root);
+        int made = (sbx_mkdir1(s, mroot) == 0);
+        if (made || sbx_is_dir(mroot)) {
+            DIR *d = opendir("/mnt");
+            if (d) {
+                struct dirent *e;
+                while ((e = readdir(d))) {
+                    if (e->d_name[0] == '.') continue;
+                    if (strncmp(e->d_name, "usb", 3) &&
+                        strncmp(e->d_name, "ext", 3) &&
+                        strcmp(e->d_name, "disc"))
+                        continue;
+                    char rsrc[PATH_MAX], mp[PATH_MAX];
+                    snprintf(rsrc, sizeof(rsrc), "/mnt/%s", e->d_name);
+                    struct statfs sfs;
+                    if (statfs(rsrc, &sfs) != 0 ||
+                        strcmp(sfs.f_mntonname, rsrc) != 0)
+                        continue;          // not a real mounted volume
+                    snprintf(mp, sizeof(mp), "%s/%s", mroot, e->d_name);
+                    sbx_bind(s, rsrc, mp, 0);
+                }
+                closedir(d);
+            }
+        }
+    }
+}
+
+static void sbx_cleanup(sbx_session_t *s) {
+    for (int i = s->nlayers - 1; i >= 0; i--)
+        if (s->layers[i][0]) {
+            if (unmount_guarded(s->layers[i], 0) != 0)
+                unmount_guarded(s->layers[i], MNT_FORCE);
+        }
+    // rmdir deepest-first (created dirs recorded shallow->deep)
+    for (int i = s->ncreated - 1; i >= 0; i--)
+        if (s->created[i][0]) rmdir_guarded(s->created[i]);
+    memset(s, 0, sizeof(*s));
+}
+
+// parse "<TITLE>_<n>" sandbox dir names — returns title (<=15 chars) or NULL
+static int sbx_parse_name(const char *name, char *title, size_t tsz) {
+    const char *us = strrchr(name, '_');
+    if (!us || us == name || !us[1]) return 0;
+    for (const char *c = us + 1; *c; c++)
+        if (*c < '0' || *c > '9') return 0;
+    size_t tl = us - name;
+    if (tl < 9 || tl >= tsz) return 0;
+    for (size_t i = 0; i < tl; i++) {
+        char c = name[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))) return 0;
+    }
+    memcpy(title, name, tl); title[tl] = 0;
+    return 1;
+}
+
+static void *sbx_watch_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        DIR *d = opendir("/mnt/sandbox");
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d))) {
+                char title[16];
+                if (!sbx_parse_name(e->d_name, title, sizeof(title)))
+                    continue;
+                if (!sbx_title_ours(title)) continue;
+                char root[PATH_MAX];
+                snprintf(root, sizeof(root), "/mnt/sandbox/%s", e->d_name);
+                int found = -1;
+                for (int i = 0; i < SBX_MAX_SESSIONS; i++)
+                    if (g_sbx[i].root[0] &&
+                        !strcmp(g_sbx[i].root, root)) { found = i; break; }
+                if (found < 0) {
+                    for (int i = 0; i < SBX_MAX_SESSIONS; i++)
+                        if (!g_sbx[i].root[0]) { found = i; break; }
+                    if (found < 0) continue;
+                    sbx_session_t *s = &g_sbx[found];
+                    memset(s, 0, sizeof(*s));
+                    snprintf(s->root, sizeof(s->root), "%s", root);
+                    snprintf(s->title, sizeof(s->title), "%s", title);
+                    s->pending = 1; s->age_ms = 0;
+                }
+            }
+            closedir(d);
+        }
+        for (int i = 0; i < SBX_MAX_SESSIONS; i++) {
+            sbx_session_t *s = &g_sbx[i];
+            if (!s->root[0]) continue;
+            struct stat st;
+            if (stat(s->root, &st) != 0) { sbx_cleanup(s); continue; }
+            if (s->pending) {
+                char app0[PATH_MAX];
+                snprintf(app0, sizeof(app0), "%s/app0", s->root);
+                if (sbx_is_dir(app0)) {
+                    sbx_apply(s);
+                    s->pending = 0;
+                    dbg_log("sbx: prepared sandbox for ");
+                    dbg_log(s->title);
+                    dbg_log("\n");
+                } else if ((s->age_ms += 120) > 15000) {
+                    s->pending = 0;   // never populated — give up
+                }
+            }
+        }
+        struct timespec ts = { 0, 120 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    return NULL;
+}
+
+static void sbx_watcher_start(void) {
+    pthread_t t;
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    pthread_create(&t, &at, sbx_watch_thread, NULL);
+    pthread_attr_destroy(&at);
 }
 
 // ---------------- COPY DIRECTORY ----------------
@@ -2849,23 +3526,26 @@ static int appdb_register_work(int mode, const char *title_id,
     const char *now = "datetime('now','localtime')";
 
     // Always start from a clean slate for this title
+    int derr = SQLITE_OK;
     snprintf(sql, sizeof(sql),
              "DELETE FROM tbl_contentinfo WHERE titleId='%s';", title_id);
-    appdb_exec(db, sql);
+    derr = appdb_exec(db, sql);
     if (icon_tbl[0]) {
         snprintf(sql, sizeof(sql),
                  "DELETE FROM %s WHERE titleId='%s';", icon_tbl, title_id);
-        appdb_exec(db, sql);
+        int r = appdb_exec(db, sql); if (derr == SQLITE_OK) derr = r;
     }
     if (concept_tbl[0]) {
         snprintf(sql, sizeof(sql),
                  "DELETE FROM %s WHERE primaryTitleId='%s';", concept_tbl, title_id);
-        appdb_exec(db, sql);
+        int r = appdb_exec(db, sql); if (derr == SQLITE_OK) derr = r;
     }
 
     if (!mode) {                      // unregister = deletes only
+        int nch = sqlite3_total_changes(db);
         sqlite3_close(db);
-        return 0;
+        if (derr != SQLITE_OK) return 1000 + derr;
+        return nch;
     }
 
     // ---- Parse the game's param.json for a daemon-complete row ----
@@ -4098,7 +4778,7 @@ static int full_title_cleanup(const char *title_id, void (*progress)(const char 
 static void unregister_title_async(const char *title_id);
 
 // ---------------- PROCESS ONE GAME ----------------
-static int process_game(const char* game_path, char* game_name_out, size_t name_size, char* title_id_out, size_t tid_size) {
+static int process_game(const char* game_path, char* game_name_out, size_t name_size, char* title_id_out, size_t tid_size, const char* backport_root) {
     char title_id[12] = {};
     char game_name[256] = "Unknown Game";
     char system_ex_app[PATH_MAX];
@@ -4185,7 +4865,7 @@ static int process_game(const char* game_path, char* game_name_out, size_t name_
             snprintf(chk, sizeof(chk), "%s: unmounting stale mount...", title_id);
             send_progress_message(chk);
         }
-        unmount_guarded(system_ex_app, 0);
+        unmount_stack_guarded(system_ex_app);
     }
 
     {
@@ -4200,6 +4880,25 @@ static int process_game(const char* game_path, char* game_name_out, size_t name_
             send_progress_message(chk);
         }
         return -1;
+    }
+
+    // Backport overlay: <scan_root>/backports/<TITLE_ID>* supplies patched
+    // files that transparently cover the mounted game (ShadowMount layout).
+    // Non-fatal — a title whose backport fails to mount still runs unpatched.
+    {
+        char bp[PATH_MAX];
+        if (resolve_backport_dir(backport_root, title_id, bp, sizeof(bp))) {
+            if (mount_unionfs_overlay(bp, system_ex_app) == 0) {
+                char chk[160];
+                snprintf(chk, sizeof(chk), "%s: backport applied", title_id);
+                send_progress_message(chk);
+            } else {
+                char chk[160];
+                snprintf(chk, sizeof(chk), "%s: backport mount failed errno=%d",
+                         title_id, errno);
+                send_progress_message(chk);
+            }
+        }
     }
 
     // ========================================================================
@@ -4318,12 +5017,36 @@ static int auto_unmount_deleted_games(void) {
             game_path[strcspn(game_path, "\r\n")] = '\0';
             fclose(f);
 
+            // Image-backed mounts: mount.lnk holds the image mount point —
+            // check the real backing file (mount_img.lnk line 1) instead.
+            char chk_path[PATH_MAX];
+            int check_dir = 1;
+            snprintf(chk_path, sizeof(chk_path), "%s", game_path);
+            {
+                char ilnk[PATH_MAX];
+                snprintf(ilnk, sizeof(ilnk), "/user/app/%s/mount_img.lnk", e->d_name);
+                FILE *jf = fopen(ilnk, "r");
+                if (jf) {
+                    if (fgets(chk_path, sizeof(chk_path), jf)) {
+                        chk_path[strcspn(chk_path, "\r\n")] = '\0';
+                        check_dir = 0;
+                    }
+                    fclose(jf);
+                }
+            }
+
             struct stat st;
-            if (stat(game_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+            int gone = (stat(chk_path, &st) != 0) ||
+                       (check_dir ? !S_ISDIR(st.st_mode) : !S_ISREG(st.st_mode));
+            if (gone) {
                 char system_ex_app[PATH_MAX];                snprintf(system_ex_app, sizeof(system_ex_app), "/system_ex/app/%s", e->d_name);
-                
-                if (is_mounted(system_ex_app)) {
-                    unmount_guarded(system_ex_app, 0);
+
+                unmount_stack_guarded(system_ex_app);
+
+                {
+                    char ua[PATH_MAX];
+                    snprintf(ua, sizeof(ua), "/user/app/%s", e->d_name);
+                    release_title_image(ua);
                 }
 
                 // Registry row first (background), then dirs — same model as
@@ -6251,6 +6974,114 @@ typedef struct {
 // the worker clears the flag on both the normal and crash paths.
 static int g_mount_running = 0;
 
+// Mount one game image end-to-end: virtual-disk attach → fs nmount under
+// /mnt/suitemnt → the regular process_game() pipeline on the mount point.
+// On success (or an already-mounted hit) mount_img.lnk records the backing
+// image + device so unmount can detach again; on failure anything we
+// attached is released right away.
+static int process_image_file(const char *img_path, char *game_name_out,
+                              size_t name_size, char *title_id_out, size_t tid_size,
+                              const char *backport_root) {
+    char mntpt[PATH_MAX], dev[64];
+    int unit = -1;
+    {
+        char chk[300];
+        const char *bn = strrchr(img_path, '/');
+        snprintf(chk, sizeof(chk), "Attaching image %s...",
+                 bn ? bn + 1 : img_path);
+        send_progress_message(chk);
+    }
+    int mrc = suite_image_mount(img_path, mntpt, sizeof(mntpt),
+                                dev, sizeof(dev), &unit);
+    if (mrc < 0) {
+        send_progress_message("Image attach failed (/dev/lvdctl)");
+        return -1;
+    }
+    int prc = process_game(mntpt, game_name_out, name_size, title_id_out, tid_size,
+                           backport_root);
+    if ((prc == 0 || prc == 2) && title_id_out && title_id_out[0]) {
+        // Fresh mounts wrote mount.lnk = mntpt; the already-mounted path is
+        // only reached when mount.lnk already equals mntpt — either way the
+        // title's tracking now points at this image's mount point, so it is
+        // safe to record the backing image + device for later detach.
+        char ilnk[PATH_MAX];
+        snprintf(ilnk, sizeof(ilnk), "/user/app/%s/mount_img.lnk", title_id_out);
+        FILE *f = fopen(ilnk, "w");
+        if (f) { fprintf(f, "%s\n%s", img_path, dev); fclose(f); }
+        return prc;
+    }
+    if (mrc == 0)                       // only release what we attached
+        suite_image_release(mntpt, dev);
+    return prc;
+}
+
+// Per-game result bookkeeping shared by the top-level scan and the nested
+// image scan (one directory level inside each entry).
+typedef struct {
+    mount_job_t *job;
+    int total_games, current_game;
+    int mounted_count, skipped_count, failed_count, duplicate_count;
+    char mounted_games[20][300];
+    int stored_names;
+} mount_ctx_t;
+
+static void mount_result_note(mount_ctx_t *ctx, int result,
+                              const char *game_name, const char *title_id) {
+    ctx->current_game++;
+    if (result == 0) {
+        if (ctx->stored_names < 20) {
+            snprintf(ctx->mounted_games[ctx->stored_names],
+                     sizeof(ctx->mounted_games[0]), "%s", game_name);
+            ctx->stored_names++;
+        }
+        ctx->mounted_count++;
+        char notify_msg[512];
+        snprintf(notify_msg, sizeof(notify_msg), "Mounting %d/%d (%d%%)\n%s",
+                 ctx->current_game, ctx->total_games,
+                 ctx->total_games > 0 ? (ctx->current_game * 100) / ctx->total_games : 0,
+                 game_name);
+        send_notification(notify_msg);
+    }
+    {
+        char prog[384];
+        snprintf(prog, sizeof(prog), "%d/%d: %s", ctx->current_game,
+                 ctx->total_games, game_name[0] ? game_name : title_id);
+        send_progress_message(prog);
+    }
+    if (result == 2) ctx->skipped_count++;
+    else if (result == 3) ctx->duplicate_count++;
+    else if (result != 0) ctx->failed_count++;
+}
+
+// Scan one directory level for image files and run the full mount pipeline
+// on each (called for every scan-path entry — folder dumps can hold images
+// next to their game files, plain dirs can be image containers).
+static void scan_nested_images(const char *dir, mount_ctx_t *ctx,
+                               const char *backport_root) {
+    // The backports dir holds patch files, not games — never descend into it.
+    const char *bn = strrchr(dir, '/');
+    if (bn && strcmp(bn + 1, "backports") == 0) return;
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *e;
+    const char *flt = ctx->job->title_filter;
+    while ((e = readdir(d))) {
+        if (!suite_img_fs_type(e->d_name)) continue;
+        if (flt[0] && strncmp(e->d_name, flt, strlen(flt)) != 0) continue;
+        char p[PATH_MAX];
+        snprintf(p, sizeof(p), "%s/%s", dir, e->d_name);
+        struct stat st;
+        if (stat(p, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        char gn[256] = {}, tid[12] = {};
+        dbg_log("img> "); dbg_log(e->d_name); dbg_log("\n");
+        int r = process_image_file(p, gn, sizeof(gn), tid, sizeof(tid),
+                                   backport_root);
+        dbg_kv("img< result=", (unsigned long)r);
+        mount_result_note(ctx, r, gn, tid);
+    }
+    closedir(d);
+}
+
 // The real scan/mount/registration body — runs inside the crash guard of
 // mount_games_worker so a faulting Sce call can never take the server down.
 static void mount_games_body(mount_job_t* job, int sock);
@@ -6346,19 +7177,13 @@ static void mount_games_body(mount_job_t* job, int sock) {
     int cleaned = auto_unmount_deleted_games();
     dbg_kv("mount_body cleaned=", (unsigned long)cleaned);
 
-    int mounted_count = 0;
-    int skipped_count = 0;
-    int failed_count = 0;
-    int duplicate_count = 0;
-    int total_games = 0;
-    int current_game = 0;
+    mount_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.job = job;
     struct stat st;
-    
-    // Store mounted game names for response (up to 20)
-    char mounted_games[20][300];
-    int stored_names = 0;
 
-    // First pass: count total games across all paths
+    // First pass: count total games across all paths (folder dumps + image
+    // files, both at top level and one level inside each subdirectory).
     for (int pi = 0; pi < (int)NUM_GAME_SCAN_PATHS; pi++) {
         if (stat(GAME_SCAN_PATHS[pi], &st) != 0 || !S_ISDIR(st.st_mode))
             continue;
@@ -6367,12 +7192,34 @@ static void mount_games_body(mount_job_t* job, int sock) {
         struct dirent* e;
         while ((e = readdir(d))) {
             if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
-            if (job->title_filter[0] &&
-                strncmp(e->d_name, job->title_filter, strlen(job->title_filter)) != 0)
-                continue;
+            int name_match = !(job->title_filter[0] &&
+                strncmp(e->d_name, job->title_filter, strlen(job->title_filter)) != 0);
             char gp[PATH_MAX];
             snprintf(gp, sizeof(gp), "%s/%s", GAME_SCAN_PATHS[pi], e->d_name);
-            if (stat(gp, &st) == 0 && S_ISDIR(st.st_mode)) total_games++;
+            if (stat(gp, &st) != 0) continue;
+            if (S_ISREG(st.st_mode)) {
+                if (name_match && suite_img_fs_type(e->d_name))
+                    ctx.total_games++;
+                continue;
+            }
+            if (!S_ISDIR(st.st_mode)) continue;
+            if (name_match) ctx.total_games++;
+            DIR *sd = opendir(gp);
+            if (sd) {
+                struct dirent *se;
+                while ((se = readdir(sd))) {
+                    if (!suite_img_fs_type(se->d_name)) continue;
+                    if (job->title_filter[0] &&
+                        strncmp(se->d_name, job->title_filter,
+                                strlen(job->title_filter)) != 0) continue;
+                    char sp[PATH_MAX];
+                    snprintf(sp, sizeof(sp), "%s/%s", gp, se->d_name);
+                    struct stat sst;
+                    if (stat(sp, &sst) == 0 && S_ISREG(sst.st_mode))
+                        ctx.total_games++;
+                }
+                closedir(sd);
+            }
         }
         closedir(d);
     }
@@ -6380,72 +7227,58 @@ static void mount_games_body(mount_job_t* job, int sock) {
     // Send progress: starting
     {
         char prog_msg[256];
-        snprintf(prog_msg, sizeof(prog_msg), "Scanning %d games across %d locations...", 
-                 total_games, (int)NUM_GAME_SCAN_PATHS);
+        snprintf(prog_msg, sizeof(prog_msg), "Scanning %d games across %d locations...",
+                 ctx.total_games, (int)NUM_GAME_SCAN_PATHS);
         send_notification(prog_msg);
     }
 
-    // Second pass: process all games
+    // Second pass: process all games — folder dumps via process_game(), image
+    // files via the virtual-disk pipeline, plus image files one level inside
+    // each subdirectory.
     for (int pi = 0; pi < (int)NUM_GAME_SCAN_PATHS; pi++) {
         const char* base_path = GAME_SCAN_PATHS[pi];
         if (stat(base_path, &st) != 0 || !S_ISDIR(st.st_mode))
             continue;
-        
+
         DIR* d = opendir(base_path);
         if (!d) continue;
-        
+
         struct dirent* e;
         while ((e = readdir(d))) {
             if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
-            
+
             char game_path[PATH_MAX];
             snprintf(game_path, sizeof(game_path), "%s/%s", base_path, e->d_name);
-            if (stat(game_path, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
-            if (job->title_filter[0] &&
-                strncmp(e->d_name, job->title_filter, strlen(job->title_filter)) != 0)
-                continue;
+            if (stat(game_path, &st) != 0) continue;
+            int name_match = !(job->title_filter[0] &&
+                strncmp(e->d_name, job->title_filter, strlen(job->title_filter)) != 0);
 
-            current_game++;
-            dbg_log("pg> "); dbg_log(e->d_name); dbg_log("\n");
             char game_name[256] = {};
             char title_id[12] = {};
-            int result = process_game(game_path, game_name, sizeof(game_name), title_id, sizeof(title_id));
-            dbg_kv("pg< result=", (unsigned long)result);
-            
-            if (result == 0) {
-                // Successfully mounted
-                if (stored_names < 20) {
-                    snprintf(mounted_games[stored_names], sizeof(mounted_games[0]), "%s", game_name);
-                    stored_names++;
-                }
-                mounted_count++;
-                // Send PS5 notification for each mounted game
-                char notify_msg[512];
-                snprintf(notify_msg, sizeof(notify_msg), "Mounting %d/%d (%d%%)\n%s", 
-                         current_game, total_games, 
-                         total_games > 0 ? (current_game * 100) / total_games : 0,
-                         game_name);
-                send_notification(notify_msg);
-            }
 
-            // STREAMING PROGRESS: push a RESP_PROGRESS line to the client for
-            // every processed game (mounted/skipped/duplicate/failed). The new
-            // clients rely on these to keep their read timeout alive during
-            // long mounts; old clients simply ignore unknown progress lines.
-            {
-                char prog[384];
-                snprintf(prog, sizeof(prog), "%d/%d: %s", current_game, total_games,
-                         game_name[0] ? game_name : title_id);
-                send_progress_message(prog);
+            if (S_ISREG(st.st_mode)) {
+                if (!name_match || !suite_img_fs_type(e->d_name)) continue;
+                dbg_log("img> "); dbg_log(e->d_name); dbg_log("\n");
+                int result = process_image_file(game_path, game_name,
+                                                sizeof(game_name), title_id,
+                                                sizeof(title_id), base_path);
+                dbg_kv("img< result=", (unsigned long)result);
+                mount_result_note(&ctx, result, game_name, title_id);
+                continue;
             }
+            if (!S_ISDIR(st.st_mode)) continue;
+            // The backports dir holds patch trees, not games — skip it as a
+            // candidate AND as a nested-image source.
+            if (strcmp(e->d_name, "backports") == 0) continue;
 
-            if (result == 2) {
-                skipped_count++;
-            } else if (result == 3) {
-                duplicate_count++;
-            } else if (result != 0) {
-                failed_count++;
+            if (name_match) {
+                dbg_log("pg> "); dbg_log(e->d_name); dbg_log("\n");
+                int result = process_game(game_path, game_name, sizeof(game_name),
+                                          title_id, sizeof(title_id), base_path);
+                dbg_kv("pg< result=", (unsigned long)result);
+                mount_result_note(&ctx, result, game_name, title_id);
             }
+            scan_nested_images(game_path, &ctx, base_path);
         }
         closedir(d);
     }
@@ -6460,35 +7293,35 @@ static void mount_games_body(mount_job_t* job, int sock) {
     }
     
     off += snprintf(response + off, sizeof(response) - off,
-                   "New mounts: %d\n", mounted_count);
-    
-    if (mounted_count > 0 && stored_names > 0) {
+                   "New mounts: %d\n", ctx.mounted_count);
+
+    if (ctx.mounted_count > 0 && ctx.stored_names > 0) {
         off += snprintf(response + off, sizeof(response) - off, "Mounted games:\n");
-        for (int i = 0; i < stored_names && off < (int)sizeof(response) - 100; i++) {
+        for (int i = 0; i < ctx.stored_names && off < (int)sizeof(response) - 100; i++) {
             off += snprintf(response + off, sizeof(response) - off,
-                          "  %s\n", mounted_games[i]);
+                          "  %s\n", ctx.mounted_games[i]);
         }
     }
-    
+
     off += snprintf(response + off, sizeof(response) - off,
-                   "Already mounted: %d\n", skipped_count);
-    if (duplicate_count > 0) {
+                   "Already mounted: %d\n", ctx.skipped_count);
+    if (ctx.duplicate_count > 0) {
         off += snprintf(response + off, sizeof(response) - off,
-                       "Duplicates skipped: %d\n", duplicate_count);
+                       "Duplicates skipped: %d\n", ctx.duplicate_count);
     }
     off += snprintf(response + off, sizeof(response) - off,
                    "Failed: %d\nTotal active: %d",
-                   failed_count, mounted_count + skipped_count);
+                   ctx.failed_count, ctx.mounted_count + ctx.skipped_count);
 
     // Send final PS5 notification
-    if (mounted_count > 0) {
+    if (ctx.mounted_count > 0) {
         char msg[2048];
         snprintf(msg, sizeof(msg), "Game Mounter\nMounted %d new game(s)\n%d already mounted",
-                 mounted_count, skipped_count);
+                 ctx.mounted_count, ctx.skipped_count);
         send_notification(msg);
-    } else if (skipped_count > 0) {
+    } else if (ctx.skipped_count > 0) {
         char msg[256];
-        snprintf(msg, sizeof(msg), "Game Mounter\nAll %d game(s) already mounted", skipped_count);
+        snprintf(msg, sizeof(msg), "Game Mounter\nAll %d game(s) already mounted", ctx.skipped_count);
         send_notification(msg);
     } else {
         send_notification("Game Mounter\nNo games found to mount");
@@ -7868,15 +8701,28 @@ void handle_proc_list(client_session_t *session) {
 // tiles still don't render.
 static int repair_one_title(const char *tid, char *diag, size_t dsz) {
     diag[0] = 0;
+    // Guardrails — repair must NEVER create a registration for an arbitrary
+    // string (the repair:* fake-tiles bug): the id must look like a real
+    // title id AND the title must already be suite-mounted (mount.lnk).
+    int tid_ok = tid && strlen(tid) <= 12;
+    for (const char *p = tid; tid_ok && *p; p++)
+        if (!((*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9')))
+            tid_ok = 0;
+    if (!tid_ok) {
+        snprintf(diag, dsz, "rejected: invalid title id");
+        return -1;
+    }
     char src[PATH_MAX] = {0};
     char lnk_path[PATH_MAX];
     snprintf(lnk_path, sizeof(lnk_path), "/user/app/%s/mount.lnk", tid);
     FILE *lnk = fopen(lnk_path, "r");
-    if (lnk) {
-        if (fgets(src, sizeof(src), lnk))
-            src[strcspn(src, "\r\n")] = '\0';
-        fclose(lnk);
+    if (!lnk) {
+        snprintf(diag, dsz, "skipped: not suite-mounted (no mount.lnk)");
+        return -1;
     }
+    if (fgets(src, sizeof(src), lnk))
+        src[strcspn(src, "\r\n")] = '\0';
+    fclose(lnk);
     // ensure the two files the home-screen renderer needs exist
     int copied = 0;
     static const char *files[] = { "param.json", "icon0.png", NULL };
@@ -9473,11 +10319,17 @@ static long rpc_call(rpc_sess_t *s, intptr_t fn,
         if ((t1.tv_sec - t0.tv_sec) * 1000 +
             (t1.tv_nsec - t0.tv_nsec) / 1000000 > 3000) {
             // The remote call blocked (lock contention inside ShellCore).
-            // Force-stop, restore the hijacked thread, mark session dead.
+            // Force-stop, restore the hijacked thread, then RESUME the
+            // process — a timed-out call must never leave the game SIGSTOP'd
+            // (frozen). The waitpid is bounded so a missed stop can't hang
+            // this payload either.
             kill(s->pid, SIGSTOP);
             int st2 = 0;
-            waitpid(s->pid, &st2, 0);
+            for (int w = 0; w < 200 &&
+                 waitpid(s->pid, &st2, WNOHANG) != s->pid; w++)
+                usleep(1000);
             ptrace(PT_SETREGS, s->pid, (caddr_t)&s->bak, 0);
+            ptrace(PT_CONTINUE, s->pid, (caddr_t)1, 0);
             return -0x1004;
         }
         usleep(1000);
@@ -10844,16 +11696,17 @@ static int full_title_cleanup(const char *title_id, void (*progress)(const char 
     snprintf(user_app_dir, sizeof(user_app_dir), "/user/app/%s", title_id);
     snprintf(appmeta_dir, sizeof(appmeta_dir), "/user/appmeta/%s", title_id);
 
-    // 1) Unmount the nullfs overlay FIRST (guarded: 5s normal + 5s forced).
+    // 1) Unmount the stack FIRST — unionfs backport on top, nullfs below
+    //    (each guarded: 5s normal + 5s forced per layer).
     if (progress) progress("Unmounting game data...");
-    if (is_mounted(system_ex_app)) {
-        if (unmount_guarded(system_ex_app, 0) != 0) {
-            if (unmount_guarded(system_ex_app, MNT_FORCE) != 0) {
-                rc = -1;   // stayed busy (game running?) — keep going anyway
-            }
-        }
-    }
+    if (unmount_stack_guarded(system_ex_app) != 0)
+        rc = -1;   // stayed busy (game running?) — keep going anyway
     usleep(100000); // 100ms
+
+    // 1b) Image-backed mounts: release the image fs + virtual disk while
+    //     mount.lnk / mount_img.lnk still exist to read.
+    if (release_title_image(user_app_dir) && progress)
+        progress("Released game image");
 
     // 2) Remove the registry row in the background — this is what actually
     //    takes the icon off the home screen (filesystem deletes alone don't).
@@ -13382,6 +14235,7 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
     intptr_t f_dh   = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemDestroyHandle") : 0;
     intptr_t f_dc   = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemDestroyContext") : 0;
     intptr_t f_si64 = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemEventPropertyObjectSetInt64") : 0;
+    intptr_t f_ss = uh ? krpc_resolve_by_name(pid, uh, "sceNpUniversalDataSystemEventPropertyObjectSetString") : 0;
     // NP callback pump — the daemon only processes the posted event queue /
     // delivers trophy notifications when the game-side NP runtime is pumped
     // (verified against a working trophy unlocker, which pumps
@@ -13601,23 +14455,30 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
     uint8_t layer[260];
     memset(layer, 0, sizeof(layer));
     int nreq = 0;
-    // The UDS daemon only commits extracted stats inside an open activity —
-    // events posted with no activity open are journaled but never counted,
-    // which is exactly why the awards were session-only.  Open an activity
-    // on the game's own ctx/hnd FIRST so the following events land inside
-    // it; the activityEnd below then commits the pass.
-    if (game_ctx > 0 && game_hnd > 0 && !s.dead) {
-        intptr_t st_as = s.scratch + 0x200;
-        rpc_write(pid, st_as, "activityStart", 14);
-        uint64_t asev = 0;
-        rpc_call(&s, f_cev, st_as, 0, s.scratch + 0x210, s.scratch + 0x220, 0, 0);
-        rpc_read(pid, s.scratch + 0x210, &asev, 8);
-        if (asev && !s.dead) {
-            int as_opt = -1;
-            uds_post_try(&s, f_post, game_ctx, game_hnd, (long)asev, &as_opt);
+    // Open OUR OWN activity on the game's ctx (unique id "ps5suite") so the
+    // custom stat events (COUNT-*) are counted by the extraction: stat-based
+    // trophies need their events inside an activity, otherwise the daemon
+    // drops them at commit (the 41/49 wall — the 8 COUNT ones never persist).
+    // A distinct activityId is CRITICAL: posting activityEnd with the game's
+    // own id closed its real activity and killed the session; ours is new.
+    intptr_t st_act = s.scratch + 0x1c0, st_aid = s.scratch + 0x1d0;
+    if (f_ss > 0 && game_ctx > 0 && game_hnd > 0 && !s.dead) {
+        rpc_write(pid, st_act, "activityStart", 14);
+        rpc_write(pid, st_aid, "activityId", 11);
+        uint64_t aev = 0;
+        rpc_call(&s, f_cev, st_act, 0, s.scratch + 0x1e8, s.scratch + 0x1f0, 0, 0);
+        rpc_read(pid, s.scratch + 0x1e8, &aev, 8);
+        uint64_t apobj = 0;
+        rpc_read(pid, s.scratch + 0x1f0, &apobj, 8);
+        if (!apobj) apobj = aev;
+        if (aev && !s.dead) {
+            intptr_t vid = s.scratch + 0x1f8;
+            rpc_write(pid, vid, "ps5suite", 9);
+            rpc_call(&s, f_ss, (long)apobj, st_aid, vid, 0, 0, 0);
+            int aopt = -1;
+            uds_post_try(&s, f_post, game_ctx, game_hnd, (long)aev, &aopt);
+            if (f_dev > 0) rpc_call(&s, f_dev, (long)aev, 0, 0, 0, 0, 0);
         }
-        if (asev && f_dev > 0 && !s.dead)
-            rpc_call(&s, f_dev, (long)asev, 0, 0, 0, 0, 0);
     }
     for (int i = 0; i < nw && !s.dead; i++) {
         int id = work[i].id, target = work[i].target;
@@ -13713,27 +14574,30 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
         else fail++;
     }
     free(work);
-    // Post a synthetic activityEnd on the game's borrowed ctx to trigger the
-    // daemon's extraction pass — custom-event games only extract at activity
-    // boundaries, not on every sceNpCheckCallback pump.  Skip for standard/
-    // COUNT games: the extraction re-evaluates ALL trophies and clears file
-    // edits when the daemon's stat thresholds aren't met (Astro Bot failure).
-    if (need_extract && game_ctx > 0 && game_hnd > 0 && ok > 0 && !s.dead) {
-        intptr_t st_ae = s.scratch + 0x200;
-        rpc_write(pid, st_ae, "activityEnd", 12);
+    // Close OUR activity (same unique id "ps5suite") — commits the stat
+    // extraction pass for the COUNT events posted inside it. The game's own
+    // activity is untouched (different id), so its session stays healthy.
+    if (f_ss > 0 && game_ctx > 0 && game_hnd > 0 && !s.dead) {
+        rpc_write(pid, st_act, "activityEnd", 12);
         uint64_t aev = 0;
-        rpc_call(&s, f_cev, st_ae, 0, s.scratch + 0x210, s.scratch + 0x220, 0, 0);
-        rpc_read(pid, s.scratch + 0x210, &aev, 8);
+        rpc_call(&s, f_cev, st_act, 0, s.scratch + 0x1e8, s.scratch + 0x1f0, 0, 0);
+        rpc_read(pid, s.scratch + 0x1e8, &aev, 8);
+        uint64_t apobj = 0;
+        rpc_read(pid, s.scratch + 0x1f0, &apobj, 8);
+        if (!apobj) apobj = aev;
         if (aev && !s.dead) {
-            int ae_opt = -1;
-            uds_post_try(&s, f_post, game_ctx, game_hnd, (long)aev, &ae_opt);
+            intptr_t vid = s.scratch + 0x1f8;
+            rpc_call(&s, f_ss, (long)apobj, st_aid, vid, 0, 0, 0);
+            intptr_t v_out = s.scratch + 0x200, k_out = s.scratch + 0x208;
+            rpc_write(pid, k_out, "outcome", 8);
+            rpc_write(pid, v_out, "completed", 10);
+            rpc_call(&s, f_ss, (long)apobj, k_out, v_out, 0, 0, 0);
+            int aopt = -1;
+            uds_post_try(&s, f_post, game_ctx, game_hnd, (long)aev, &aopt);
+            if (f_dev > 0) rpc_call(&s, f_dev, (long)aev, 0, 0, 0, 0, 0);
         }
-        if (aev && f_dev > 0 && !s.dead)
-            rpc_call(&s, f_dev, (long)aev, 0, 0, 0, 0, 0);
-        if (f_chk > 0 && !s.dead)
-            for (int cb = 0; cb < 3 && !s.dead; cb++)
-                rpc_call(&s, f_chk, 0, 0, 0, 0, 0, 0);
     }
+    (void)need_extract;
     // Detach so the game keeps running while the daemon extracts the posted
     // events — the game pumps sceNpCheckCallback on its own threads, and a
     // frozen process can't receive the trophy notification. Re-attach only
@@ -13746,12 +14610,17 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
         for (int i = 0; i < 4 && !s.dead; i++) {
             if (rpc_call(&s, f_chk, 0, 0, 0, 0, 0, 0) < 0) break;
         }
-    // Trophy2 poll: a fresh Trophy2 context + GetGameInfo/GetTrophyInfo makes
-    // the trophy daemon re-evaluate the title's UDS stat table — the moment
-    // the _autoGenTrophy stat reads as earned, the daemon itself writes the
-    // TRPTITLE flag and fires the system toast.
+    // The Trophy2 verification cascade is DISABLED: it runs a per-trophy
+    // GetTrophyInfo query + debug-unlock + netsync probe (~3 rpc calls per
+    // trophy), each of which can sit in the ShellCore lock for up to 3 s.
+    // For unlock:all that is ~150 calls = many minutes with the game held
+    // suspended — the client read times out (IO error) and the queued
+    // trophy toasts only fire once the game finally detaches. The event
+    // posts above are the real award path (trophies persist); this whole
+    // block is diagnostic/fallback overhead that the debug op never
+    // succeeds at anyway (0x80553908). Skip it — just detach and report.
     int t2_verified = 0;
-    if (!s.dead) {
+    if (0 && !s.dead) {
         uint32_t t2h = 0;
         intptr_t f_tcc = 0, f_tch = 0, f_trg = 0, f_tgi = 0, f_tti = 0;
         if (krpc_dynlib_handle(pid, "libSceNpTrophy2.sprx", &t2h) == 0 && t2h) {
@@ -13892,22 +14761,11 @@ static void uds_trophy_unlock(client_session_t *session, int want_all, int want_
     if (hnd > 0 && f_dh > 0 && !s.dead) rpc_call(&s, f_dh, hnd, 0, 0, 0, 0, 0);
     if (ctx > 0 && f_dc > 0 && !s.dead) rpc_call(&s, f_dc, ctx, 0, 0, 0, 0, 0);
     rpc_detach(&s);
-    // Deferred file-level unlock — runs AFTER all daemon triggers so the
-    // daemon's extraction/journal-flush has settled.  Brief sleep lets any
-    // pending daemon TRPTITLE rewrite finish before we pin our state.
-    if (nreq > 0 && npwr[0]) {
-        usleep(1500000);
-        for (int i = 0; i < nreq; i++) {
-            if (t2_verified && layer[i] != 0) continue;
-            char fdiag[80] = "";
-            int fr = trophy_force_unlock_file(npwr, req_ids[i], req_gid[i],
-                                              fdiag, sizeof(fdiag));
-            if (fr > 0) layer[i] = 3;
-            if (o2 < (int)sizeof(r2) - 200)
-                o2 += snprintf(r2 + o2, sizeof(r2) - o2, " [id%d %s]",
-                               req_ids[i], fdiag);
-        }
-    }
+    // Deferred file-level unlock is DISABLED: writing TRPTITLE.DAT by hand
+    // leaves it internally inconsistent (no hash/state rebuild), the daemon
+    // detects it, drops into a degraded state (GetGameInfo → 0x80553998) and
+    // stops firing awards/toasts for the whole title. Posts only from here.
+    (void)req_ids; (void)req_gid;
     kernel_set_ucred_authid(me, oa);
     int n_post = 0, n_du = 0, n_file = 0, n_alr = 0, n_stuck = 0;
     char stuck[160] = ""; int so = 0;
@@ -13970,6 +14828,7 @@ static uint32_t trp_u32be(const uint8_t *p) {
 
 // Returns 0 on successful rewrite, -1 on parse failure, -2 on I/O failure,
 // 1 if the file parsed but the trophy was already locked.
+__attribute__((unused))
 static int trp_lock_file(const char *path, int tid, char *diag, size_t dsz) {
     FILE *f = fopen(path, "rb");
     if (!f) return -2;
@@ -14255,6 +15114,7 @@ static int trp_unlock_file(const char *path, int tid, int gid,
 // Apply trp_unlock_file for every user that has this set registered.
 // Quiet helper — reports back via diag so the caller can append it to the
 // UDS post result line.
+__attribute__((unused))
 static int trophy_force_unlock_file(const char *npwr, int tid, int gid,
                                     char *diag, size_t dsz) {
     DIR *home = opendir("/user/home");
@@ -14282,41 +15142,49 @@ static int trophy_force_unlock_file(const char *npwr, int tid, int gid,
     return edited;
 }
 
-// Rewrite TRPTITLE.DAT for <npwr> under every user profile that has one.
+// Reset a title's trophy set to 0%: DELETE its persistent data files so the
+// daemon recreates them fresh on the next title load. The previous approach —
+// editing TRPTITLE.DAT — corrupted the database: TRPTITLE is a generated
+// OUTPUT file the daemon rebuilds from the UDS stat store, so bit-editing it
+// desynced the real state and the daemon wiped/rebuilt the set (the game had
+// to be reopened to recover). Deleting stats.dat + TRPTITLE.DAT makes the
+// daemon rebuild a clean empty set — a true 0%, no corruption.
 static void trophy_lock(client_session_t *session, const char *npwr, int tid) {
+    (void)tid;   // clean reset removes the whole set, not a single trophy
     char resp[1024];
-    int off = snprintf(resp, sizeof(resp), "lock %s:%d", npwr, tid);
-    int edited = 0, errors = 0, already = 0;
+    int off = snprintf(resp, sizeof(resp), "reset %s (clean delete → daemon rebuilds at 0%%)", npwr);
+    int removed = 0, errors = 0;
 
     DIR *home = opendir("/user/home");
     if (!home) { send_error(session->sock, "cannot open /user/home"); return; }
     struct dirent *e;
     while ((e = readdir(home))) {
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
-        char path[PATH_MAX];
-        snprintf(path, sizeof(path),
-                 "/user/home/%s/trophy2/nobackup/data/%s/TRPTITLE.DAT",
-                 e->d_name, npwr);
-        // access() consults REAL creds while our jailbroken context swaps
-        // effective authid — fopen is what the list path proves works.
-        FILE *probe = fopen(path, "rb");
-        if (!probe) continue;   // this user never registered the set
-        fclose(probe);
-        char diag[128] = "";
-        int rc = trp_lock_file(path, tid, diag, sizeof(diag));
-        if (rc == 0) { edited++; off += snprintf(resp + off, sizeof(resp) - off, "\n  %s: %s", e->d_name, diag); }
-        else if (rc == 1) { already++; off += snprintf(resp + off, sizeof(resp) - off, "\n  %s: already locked", e->d_name); }
-        else { errors++; off += snprintf(resp + off, sizeof(resp) - off, "\n  %s: failed (%s)", e->d_name, diag[0] ? diag : "io/parse"); }
+        const char *u = e->d_name;
+        // The title's real persistent state — the UDS stat store + the
+        // generated TRPTITLE. Delete both so the daemon rebuilds a clean set.
+        static const char *paths[][2] = {
+            { "/user/home/%s/np_uds/nobackup/stats/%s/stats.dat", "stats.dat" },
+            { "/user/home/%s/np_uds/nobackup/data/%s/events.dat", "events.dat" },
+            { "/user/home/%s/trophy2/nobackup/data/%s/TRPTITLE.DAT", "TRPTITLE" },
+        };
+        int hit = 0;
+        for (int i = 0; i < 3; i++) {
+            char path[PATH_MAX];
+            snprintf(path, sizeof(path), paths[i][0], u, npwr);
+            if (unlink(path) == 0) { hit = 1; removed++; }
+        }
+        if (hit) off += snprintf(resp + off, sizeof(resp) - off, "\n  %s: reset", u);
     }
     closedir(home);
 
-    if (!edited && !already && !errors) {
-        send_error(session->sock, "no TRPTITLE.DAT for this set (never registered?)");
+    if (!removed && !errors) {
+        send_error(session->sock, "no trophy data for this set (never registered?)");
         return;
     }
     off += snprintf(resp + off, sizeof(resp) - off,
-                    "\n=> %d rewritten, %d already locked, %d failed", edited, already, errors);
-    if (edited) send_notification("Trophy re-locked — restart the game/home screen to refresh");
+                    "\n=> %d files removed, %d failed — reopen the game; the daemon rebuilds a clean 0%% set", removed, errors);
+    if (removed) send_notification("Trophy set reset — reopen the game; the daemon rebuilds a clean 0% set");
     send_response(session->sock, RESP_DATA, resp, (uint32_t)off);
 }
 
@@ -14735,7 +15603,72 @@ void handle_trophy_unlock(client_session_t *session, const char *arg) {
         return;
     }
 
+    // "pinfo:<pid>" — dump the proc struct so we can locate the exec-time
+    // authinfo (the signed-attributes field the daemon's debug check reads,
+    // distinct from the ucred's mutable cr_sceAttrs). Compare a debug-authority
+    // process (SceShellCore) against a game to find which field carries bit-30.
+    // "pinfo:<pid>:<kaddr_hex>" — dump 0x80 bytes at a KERNEL address (to
+    // follow proc pointer fields like p_authinfo/p_ucred).
+    if (!strncmp(p, "pinfo:", 6)) {
+        char *colon = strchr(p + 6, ':');
+        if (colon) {
+            intptr_t kaddr = (intptr_t)strtoull(colon + 1, NULL, 16);
+            if (!kaddr) { send_error(session->sock, "usage pinfo:pid:kaddr"); return; }
+            pid_t me = getpid();
+            uint64_t oa = kernel_get_ucred_authid(me);
+            kernel_set_ucred_authid(me, 0x4800000000010003ULL);
+            char *m = malloc(4096); int n = 0;
+            for (int off = 0; off < 0x80 && n < 3900; off += 8)
+                n += snprintf(m + n, 4096 - n, "+%02x:%016lx\n", off,
+                              (unsigned long)kernel_getlong(kaddr + off));
+            kernel_set_ucred_authid(me, oa);
+            send_response(session->sock, RESP_DATA, m, (uint32_t)n);
+            free(m);
+            return;
+        }
+        int kpid = atoi(p + 6);
+        if (kpid <= 0) { send_error(session->sock, "usage pinfo:pid"); return; }
+        pid_t me = getpid();
+        uint64_t oa = kernel_get_ucred_authid(me);
+        kernel_set_ucred_authid(me, 0x4800000000010003ULL);
+        intptr_t proc = kernel_get_proc(kpid);
+        char *m = malloc(16384); int n = 0;
+        if (!proc) {
+            n += snprintf(m + n, 16384 - n, "pid=%d no proc\n", kpid);
+        } else {
+            n += snprintf(m + n, 16384 - n, "pid=%d proc=%lx\n", kpid, (long)proc);
+            // dump a wide window of proc fields as u64 — authinfo is a
+            // distinctive region of the exec-time signed attributes.
+            for (long off = 0; off < 0x400 && n < 15000; off += 8) {
+                uint64_t v = kernel_getlong((intptr_t)(proc + off));
+                n += snprintf(m + n, 16384 - n, "+%03lx:%016llx\n",
+                              off, (unsigned long long)v);
+            }
+        }
+        kernel_set_ucred_authid(me, oa);
+        send_response(session->sock, RESP_DATA, m, (uint32_t)n);
+        free(m);
+        return;
+    }
+
     // "ucred:<pid>" — dump authid + caps + attrs (find the authinfo bit30 field).
+    // "kset:<kaddr_hex>:<val_hex>" — write a u64 to a kernel address (e.g.
+    // proc->p_authinfo). Used to lend a process another's signed attributes.
+    if (!strncmp(p, "kset:", 5)) {
+        char *colon = strchr(p + 5, ':');
+        if (!colon) { send_error(session->sock, "usage kset:kaddr:val"); return; }
+        intptr_t kaddr = (intptr_t)strtoull(p + 5, NULL, 16);
+        uint64_t kval = strtoull(colon + 1, NULL, 16);
+        pid_t me = getpid();
+        uint64_t oa = kernel_get_ucred_authid(me);
+        kernel_set_ucred_authid(me, 0x4800000000010003ULL);
+        kernel_setlong(kaddr, kval);
+        kernel_set_ucred_authid(me, oa);
+        char m[64]; int n = snprintf(m, 64, "set %lx = %lx\n",
+                                     (long)kaddr, (long)kval);
+        send_response(session->sock, RESP_DATA, m, (uint32_t)n);
+        return;
+    }
     if (!strncmp(p, "ucred:", 6)) {
         int kpid = atoi(p + 6);
         if (kpid <= 0) { send_error(session->sock, "usage ucred:pid"); return; }
@@ -15314,8 +16247,8 @@ void handle_trophy_unlock(client_session_t *session, const char *arg) {
     // The op is auth-gated for game callers (0x80553908); a vsh process is
     // the intended caller class. Probes libSceNpTrophy2 in SceShellUI,
     // creates its own ctx+handle pair and IPMIs the award.
-    if (!strncmp(p, "su:", 3)) {
-        int tid = atoi(p + 3);
+    if (!strncmp(p, "su:", 3) || !strncmp(p, "sul:", 4)) {
+        int tid = atoi(p + (p[2] == 'l' ? 4 : 3));
         pid_t me = getpid();
         uint64_t oa = kernel_get_ucred_authid(me);
         kernel_set_ucred_authid(me, 0x4800000000010003ULL);
@@ -15331,6 +16264,9 @@ void handle_trophy_unlock(client_session_t *session, const char *arg) {
         if (!f_tch) f_tch = t2h ? krpc_resolve_by_name(pid, t2h, "sceNpTrophy2CreateHandle") : 0;
         intptr_t f_reg = t2h ? krpc_resolve_by_name(pid, t2h, "sceNpTrophy2RegisterContext") : 0;
         intptr_t f_unl = t2h ? krpc_resolve_by_name(pid, t2h, "sceNpTrophy2SystemDebugUnlockTrophy") : 0;
+        intptr_t f_lck = t2h ? krpc_resolve_by_name(pid, t2h, "sceNpTrophy2SystemDebugLockTrophy") : 0;
+        int want_lock = (p[2] == 'l');   // "sul:<id>" uses the debug LOCK op
+        intptr_t f_op = want_lock ? f_lck : f_unl;
         intptr_t f_tdh = t2h ? krpc_resolve_by_name(pid, t2h, "sceNpTrophy2SystemDestroyHandle") : 0;
         if (!f_tdh) f_tdh = t2h ? krpc_resolve_by_name(pid, t2h, "sceNpTrophy2DestroyHandle") : 0;
         intptr_t f_tdc = t2h ? krpc_resolve_by_name(pid, t2h, "sceNpTrophy2SystemDestroyContext") : 0;
@@ -15343,6 +16279,35 @@ void handle_trophy_unlock(client_session_t *session, const char *arg) {
         }
         o += snprintf(rr + o, sizeof(rr) - o, " t2h=%x tcc=%lx unl=%lx fgu=%lx",
                       t2h, (long)f_tcc, (long)f_unl, (long)f_fgu);
+        // The daemon auth-gates RegisterContext/DebugUnlock on the CALLER's
+        // ucred authinfo bit 30 → 0x80553908 for a plain caller. The rpc calls
+        // run in SceShellUI's context, so lend THAT process full caps + the
+        // ShellCore authid for the duration, then restore at the end.
+        static const uint8_t caps_all[16] = {
+            0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+            0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff
+        };
+        // SceShellCore's own authinfo attrs — has the bit-30 debug authority.
+        // Lend SceShellUI the same attrs (not just caps/authid) so the daemon's
+        // authinfo check sees the privileged bit.
+        static const uint8_t attrs_shellcore[32] = {
+            0x00,0x00,0x00,0x80,0x00,0x40,0x00,0x40,0x00,0x00,0x00,0x00,
+            0x00,0x00,0x00,0x80,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x08,
+            0x00,0x40,0xff,0xff,0x00,0x00,0x00,0xf0
+        };
+        uint64_t old_sh_authid = 0;
+        uint8_t old_sh_caps[16], old_sh_attrs[32];
+        int sh_cred_saved = 0;
+        if (pid > 0) {
+            old_sh_authid = kernel_get_ucred_authid(pid);
+            if (kernel_get_ucred_caps(pid, old_sh_caps) == 0 &&
+                kernel_get_ucred_attrs(pid, old_sh_attrs) == 0) {
+                kernel_set_ucred_caps(pid, caps_all);
+                kernel_set_ucred_attrs(pid, attrs_shellcore);
+                kernel_set_ucred_authid(pid, 0x4800000000010003ULL);
+                sh_cred_saved = 1;
+            }
+        }
         rpc_sess_t s;
         memset(&s, 0, sizeof(s));
         if (f_tcc > 0 && f_unl > 0 && rpc_attach(&s, pid, f_tcc) == 0) {
@@ -15405,9 +16370,10 @@ void handle_trophy_unlock(client_session_t *session, const char *arg) {
                 prm[0] = 2;
                 prm[1] = tid;
                 rpc_write(pid, s.scratch + 0x80, prm, sizeof(prm));
-                long ru = rpc_call(&s, f_unl, tctx, thnd,
+                long ru = rpc_call(&s, f_op, tctx, thnd,
                                    s.scratch + 0x80, 0, 0, 0);
-                o += snprintf(rr + o, sizeof(rr) - o, " unlock=%lx", ru);
+                o += snprintf(rr + o, sizeof(rr) - o, " %s=%lx",
+                              want_lock ? "lock" : "unlock", ru);
                 if (f_cns2 > 0 && !s.dead) {
                     long rc2 = rpc_call(&s, f_cns2, tctx, thnd,
                                         s.scratch + 0x100, s.scratch + 0x140,
@@ -15434,6 +16400,11 @@ void handle_trophy_unlock(client_session_t *session, const char *arg) {
             rpc_detach(&s);
         } else {
             o += snprintf(rr + o, sizeof(rr) - o, " attach-fail");
+        }
+        if (sh_cred_saved) {
+            kernel_set_ucred_caps(pid, old_sh_caps);
+            kernel_set_ucred_attrs(pid, old_sh_attrs);
+            kernel_set_ucred_authid(pid, old_sh_authid);
         }
         kernel_set_ucred_authid(me, oa);
         send_response(session->sock, RESP_DATA, rr, (uint32_t)o);
@@ -16350,8 +17321,10 @@ void handle_trophy_unlock(client_session_t *session, const char *arg) {
     // game's already-bound hnd is a daemon-side no-op (no objects created),
     // which is why DebugUnlock's daemon lookup returned 0x80553909. A fresh
     // hnd forces RegisterContext to run the real bind.
-    if (ctx > 0 && ctx_ours == 0 && hnd_borrowed > 0)
-        hnd = hnd_borrowed;               // fully borrowed pair — no reg needed
+    // Do NOT reuse the game's already-bound hnd: registering it is a
+    // daemon-side no-op (no objects created) → DebugUnlock's daemon lookup
+    // returns 0x80553909. Always mint + register our own fresh handle so the
+    // daemon runs the real bind.
     if (ctx > 0 && hnd <= 0 && !s.dead) {
         rc_h = rpc_call(&s, fn_create_h, s.scratch + 4, 0, 0, 0, 0, 0);
         rpc_read(pid, s.scratch + 4, &hnd, 4);
@@ -16565,6 +17538,778 @@ void handle_trophy_unlock(client_session_t *session, const char *arg) {
 }
 
 // Handle client
+// ============================================================================
+// Embedded Web UI — Payload Manager-style menu on the PS5's own browser
+// A homebrew tile launches http://127.0.0.1:<port>; this server renders an
+// HTML/JS menu whose buttons hit /api?cmd=<name>&arg=<arg>. Each command runs
+// through the *existing* client_thread dispatch on a unix socketpair — the
+// whole CMD_* table is reused untouched, so every Suite op is reachable.
+// ============================================================================
+#define WEB_UI_PORT 17382
+static volatile int g_webui_running = 0;
+static int g_webui_port = 0;
+
+extern void *client_thread(void *arg);
+
+// Run one framed command through the real dispatch and capture the framed
+// response. A socketpair stands in for the client TCP socket so
+// send_response()/recv() work unchanged; the session thread exits on EOF.
+static uint32_t web_exec(uint8_t opcode, const char *arg, uint32_t arglen,
+                         uint8_t *rtype, uint8_t *out, uint32_t outcap) {
+    int fds[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) return 0;
+    client_session_t *sess = calloc(1, sizeof(client_session_t));
+    if (!sess) { close(fds[0]); close(fds[1]); return 0; }
+    sess->sock = fds[0];
+    pthread_t t; pthread_attr_t a;
+    pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&t, &a, client_thread, sess) != 0) {
+        close(fds[0]); close(fds[1]); free(sess);
+        pthread_attr_destroy(&a); return 0;
+    }
+    pthread_attr_destroy(&a);
+    uint8_t hdr[5]; hdr[0] = opcode; memcpy(hdr + 1, &arglen, 4);
+    send(fds[1], hdr, 5, 0);
+    if (arglen) send(fds[1], arg, arglen, 0);
+    uint8_t rh[5];
+    if (recv(fds[1], rh, 5, MSG_WAITALL) != 5) { close(fds[1]); return 0; }
+    uint32_t rl; memcpy(&rl, rh + 1, 4); *rtype = rh[0];
+    uint32_t got = 0;
+    while (got < rl) {
+        uint32_t want = rl - got, cap = outcap - got;
+        ssize_t n = recv(fds[1], out + got, want < cap ? want : cap, 0);
+        if (n <= 0) break;
+        got += n;
+        if (got >= outcap) {  // drain the rest so the session isn't write-blocked
+            uint8_t j[2048]; uint32_t left = rl - got;
+            while (left) { ssize_t m = recv(fds[1], j, left > 2048 ? 2048 : left, 0); if (m <= 0) break; left -= m; }
+            break;
+        }
+    }
+    shutdown(fds[1], SHUT_RDWR);   // EOF → session loop breaks → frees session
+    close(fds[1]);
+    return got;
+}
+
+// ---- the menu page (Payload Manager-style: sidebar + live dashboard) ----
+static const char g_webui_html[] =
+"<!doctype html><html><head><meta charset=utf-8><title>PS5 Suite</title>"
+"<meta name=viewport content='width=device-width,initial-scale=1'><style>"
+":root{--bg:#070b14;--bg2:#0c1220;--card:#111a2e;--card2:#0e1526;--bd:#1e2a4a;--acc:#3c9dff;--acc2:#7be38b;--txt:#dfe6f5;--dim:#8fa3d0}"
+"*{box-sizing:border-box;margin:0;padding:0}"
+"body{background:var(--bg);color:var(--txt);font-family:'Segoe UI',system-ui,sans-serif;overflow:hidden}"
+".wrap{display:flex;height:100vh}"
+"nav{width:235px;background:var(--bg2);border-right:1px solid var(--bd);display:flex;flex-direction:column;padding:20px 14px;flex-shrink:0}"
+".logo{color:#fff;font-size:19px;font-weight:700;padding:4px 8px 18px;display:flex;align-items:center;gap:8px}"
+".logo .dot{width:9px;height:9px;border-radius:50%;background:var(--acc2);box-shadow:0 0 8px var(--acc2)}"
+".logo em{color:var(--dim);font-size:12px;font-style:normal;font-weight:400;margin-left:auto}"
+"nav button{display:flex;align-items:center;gap:11px;width:100%;background:none;border:none;color:var(--dim);text-align:left;padding:12px;font-size:15px;cursor:pointer;border-radius:9px;margin-bottom:3px;font-family:inherit}"
+"nav button .ic{width:20px;text-align:center;opacity:.85;font-size:16px}"
+"nav button:hover{color:#fff;background:#16203a}"
+"nav button.on{color:#fff;background:linear-gradient(90deg,#1c2a52,#16203a);box-shadow:inset 3px 0 0 var(--acc)}"
+".navfoot{margin-top:auto;padding:12px 8px;color:var(--dim);font-size:12px;border-top:1px solid var(--bd);line-height:1.7}"
+".navfoot b{color:var(--acc2)}.navfoot .ip{color:var(--acc);font-family:monospace}"
+"main{flex:1;overflow-y:auto;padding:0 30px 30px}"
+"header{display:flex;align-items:center;gap:14px;padding:22px 0 18px;border-bottom:1px solid var(--bd);margin-bottom:22px}"
+"header h1{font-size:23px;font-weight:600;color:#fff;flex:1}"
+".chip{background:var(--card);border:1px solid var(--bd);border-radius:20px;padding:6px 14px;font-size:12px;color:var(--dim)}"
+".chip b{color:var(--acc);font-family:monospace}"
+".chip.on b{color:var(--acc2)}"
+".stats{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:14px;margin-bottom:24px}"
+".stat{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:18px}"
+".stat .k{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.7px;margin-bottom:10px}"
+".stat .v{font-size:25px;font-weight:700;color:#fff;letter-spacing:-.5px}"
+".stat .s{font-size:11px;color:var(--dim);margin-top:4px}"
+".bar{height:6px;background:#0d1424;border-radius:3px;margin-top:12px;overflow:hidden}"
+".bar i{display:block;height:100%;background:linear-gradient(90deg,var(--acc),var(--acc2));border-radius:3px;transition:width .5s}"
+".sec{font-size:16px;font-weight:600;color:#fff;margin:4px 0 13px;display:flex;align-items:center;gap:9px}"
+".sec .ic{color:var(--acc)}"
+".coll{border:1px solid var(--bd);border-radius:12px;background:var(--card);margin-bottom:18px;overflow:hidden}"
+".coll .hd{display:flex;align-items:center;gap:11px;padding:15px 18px;cursor:pointer;user-select:none;font-size:16px;font-weight:600}"
+".coll .hd:hover{background:#16203a}"
+".coll .hd .arr{transition:transform .2s;color:var(--acc);font-size:13px}"
+".coll .hd .cnt{margin-left:auto;font-size:12px;color:var(--dim);font-weight:400}"
+".coll .bd{display:none;padding:0;border-top:1px solid var(--bd)}"
+".coll.open .bd{display:block}"
+".coll.open .hd .arr{transform:rotate(90deg)}"
+".coll .bd table{border:none;border-radius:0;margin-bottom:0}"
+"table{width:100%;border-collapse:collapse;background:var(--card);border-radius:12px;overflow:hidden;border:1px solid var(--bd);margin-bottom:24px}"
+"th{text-align:left;padding:12px 16px;font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--dim);border-bottom:1px solid var(--bd);background:var(--card2)}"
+"td{padding:12px 16px;font-size:14px;border-bottom:1px solid #16203a;vertical-align:middle}"
+"tr:last-child td{border-bottom:none}tbody tr:hover td{background:#16203a}"
+".mono{font-family:monospace;font-size:13px;color:var(--acc)}"
+".badge{background:#1c2a52;color:var(--acc);padding:3px 11px;border-radius:12px;font-size:11px;white-space:nowrap}"
+".badge.g{background:#153528;color:var(--acc2)}.badge.d{background:#2a1620;color:#ff9d9d}"
+".btn{background:var(--acc);border:none;color:#fff;padding:7px 15px;border-radius:8px;font-size:13px;cursor:pointer;font-family:inherit;white-space:nowrap}"
+".btn:hover{filter:brightness(1.15)}.btn.dim{background:#1c2a52;color:var(--dim)}.btn.dgr{background:#8f2b2b}"
+".grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(215px,1fr));gap:13px}"
+".card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:18px;cursor:pointer;transition:.15s}"
+".card:hover{background:#1a2545;border-color:var(--acc);transform:translateY(-2px)}"
+".card .t{font-size:15px;font-weight:600;margin-bottom:5px;display:flex;align-items:center;gap:9px}"
+".card .d{font-size:12px;color:var(--dim)}"
+"#out{margin-top:4px;background:#0a0f1d;border:1px solid var(--bd);border-radius:12px;padding:18px;white-space:pre-wrap;font-family:'Cascadia Code',Consolas,monospace;font-size:13px;max-height:450px;overflow-y:auto;color:#9ff0b0;display:none}"
+".path{font-family:monospace;font-size:12px;color:var(--dim);margin-bottom:12px;display:flex;align-items:center;gap:8px}"
+".path b{color:var(--acc)}"
+".empty{color:var(--dim);padding:26px;text-align:center;font-size:14px}"
+"</style></head><body><div class=wrap>"
+"<nav><div class=logo><span class=dot></span>PS5 Suite<em id=ver></em></div>"
+"<button class=on data-p=dash><span class=ic>◆</span>Dashboard</button>"
+"<button data-p=system><span class=ic>≋</span>System</button>"
+"<button data-p=games><span class=ic>▶</span>Games</button>"
+"<button data-p=install><span class=ic>⬇</span>Install</button>"
+"<button data-p=trophy><span class=ic>★</span>Trophy</button>"
+"<button data-p=saves><span class=ic>💾</span>Saves</button>"
+"<button data-p=screens><span class=ic>📷</span>Screenshots</button>"
+"<button data-p=files><span class=ic>≡</span>Files</button>"
+"<button data-p=klog><span class=ic>📜</span>Kernel Log</button>"
+"<button data-p=tools><span class=ic>⚙</span>Tools</button>"
+"<div class=navfoot><b>●</b> Online<br><span class=ip id=ip></span><br><span id=up></span></div></nav>"
+"<main><header><h1 id=pg>Dashboard</h1>"
+"<div class=chip>Local <b>127.0.0.1:17382</b></div><div class=chip on id=st></div></header>"
+"<div id=content></div><div id=out></div></main></div>"
+"<script>"
+"const $=i=>document.getElementById(i);"
+"function api(c,a){return fetch('/api?cmd='+c+(a?'&arg='+encodeURIComponent(a):'')).then(r=>r.text()).catch(e=>'ERR '+e);}"
+"function run(c,a){let o=$('out');o.style.display='block';o.textContent='…';api(c,a).then(t=>{o.textContent=t||'(no output)';});}"
+"function ask(c,a){let v=prompt('Argument:',a);if(v===null)return;run(c,v||'');}"
+"function fmt(b){b=+b||0;const u=['B','KB','MB','GB','TB'];let i=0;while(b>=1024&&i<4){b/=1024;i++;}return b.toFixed(1)+' '+u[i];}"
+"function kv(t){let o={};t.split(/\\r?\\n/).forEach(l=>{let i=l.indexOf('=');if(i>0)o[l.slice(0,i).trim()]=l.slice(i+1).trim();});return o;}"
+"function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;');}"
+"function jsq(s){return String(s).replace(/\\\\/g,'\\\\\\\\').replace(/'/g,\"\\\\'\").replace(/\"/g,'\\\\x22').replace(/\\n/g,'\\\\n');}"
+"function lines(t){return t.split(/\\r?\\n/).filter(l=>l.trim());}"
+"function togColl(id){$(id).classList.toggle('open');}"
+"const PAGES={dash:'Dashboard',system:'System',games:'Games',install:'Install',trophy:'Trophy',saves:'Saves',screens:'Screenshots',files:'Files',klog:'Kernel Log',tools:'Tools'};"
+"function card(t,d,c,a){return '<div class=card onclick=\"ask(\\''+c+'\\',\\''+(a||'')+'\\')\"><div class=t>'+t+'</div><div class=d>'+d+'</div></div>';}"
+"function card0(t,d,c){return '<div class=card onclick=\"run(\\''+c+'\\')\"><div class=t>'+t+'</div><div class=d>'+d+'</div></div>';}"
+"function cardF(t,d,c,a){return '<div class=card onclick=\"run(\\''+c+'\\',\\''+(a||'')+'\\')\"><div class=t>'+t+'</div><div class=d>'+d+'</div></div>';}"
+"function dash(){let h='<div class=stats>';"
+"h+='<div class=stat><div class=k>Storage</div><div class=v id=s_sto>…</div><div class=s id=s_sto2></div><div class=bar><i id=b_sto></i></div></div>';"
+"h+='<div class=stat><div class=k>Mounted Games</div><div class=v id=s_mnt>…</div><div class=s>active mounts</div></div>';"
+"h+='<div class=stat><div class=k>Running Apps</div><div class=v id=s_run>…</div><div class=s>processes</div></div>';"
+"h+='<div class=stat><div class=k>Uptime</div><div class=v id=s_up>…</div><div class=s id=s_up2></div></div>';"
+"h+='</div><div class=coll id=c_apps><div class=hd onclick=\"togColl(\\'c_apps\\')\"><span class=arr>▶</span><span class=ic>▶</span>Running Apps<span class=cnt id=apps_cnt></span></div><div class=bd id=apps></div></div>';"
+"h+='<div class=coll id=c_games><div class=hd onclick=\"togColl(\\'c_games\\')\"><span class=arr>▶</span><span class=ic>▶</span>Installed Games<span class=cnt id=games_cnt></span></div><div class=bd id=gametab></div></div>';"
+"$('content').innerHTML=h;"
+"api('info').then(t=>{let o=kv(t);let tot=+o.storage_total||0,fr=+o.storage_free||0;"
+"if(tot){$('s_sto').textContent=fmt(fr);$('s_sto2').textContent='free of '+fmt(tot);$('b_sto').style.width=Math.round(100*(tot-fr)/tot)+'%';}"
+"$('s_mnt').textContent=o.mounted_games||'0';$('ver').textContent='v'+(o.server_version||'');"
+"let u=+o.server_uptime||0;$('s_up').textContent=Math.floor(u/3600)+'h '+Math.floor(u%3600/60)+'m';$('s_up2').textContent=o.hostname||'';});"
+"api('apps').then(t=>{let ls=lines(t);let real=ls.filter(l=>l.split('|').length>4&&/^[A-Za-z0-9_.\\-]/.test(l.split('|')[3]||''));$('s_run').textContent=real.length||'0';if($('apps_cnt'))$('apps_cnt').textContent=real.length+' running';"
+"if(!real.length){$('apps').innerHTML='<div class=empty>No apps running</div>';return;}"
+"let h='<table><tr><th>Process</th><th>PID</th><th>AppId</th><th>CPU</th><th></th></tr>';"
+"real.slice(0,12).forEach(l=>{let p=l.split('|');let nm=esc(p[3]||p[0]);let pid=p[0];let aid=p[1]||'';let cpu=(p[5]&&+p[5]>=0)?(+p[5]/100).toFixed(1)+'%':'—';"
+"h+='<tr><td>'+nm+'</td><td class=mono>'+esc(pid)+'</td><td class=mono style=font-size:12px>'+esc(aid)+'</td><td>'+cpu+'</td><td>'"
+"+'<button class=\"btn dim\" style=\"font-size:11px\" onclick=\"run(\\'appsuspend\\',\\''+esc(jsq(aid||pid))+'\\')\">Suspend</button> '"
+"+'<button class=\"btn dim\" style=\"font-size:11px\" onclick=\"run(\\'appresume\\',\\''+esc(jsq(aid||pid))+'\\')\">Resume</button> '"
+"+'<button class=\"btn dgr\" style=\"font-size:11px\" onclick=\"run(\\'appkill\\',\\''+esc(jsq(aid||pid))+'\\')\">Kill</button></td></tr>';});"
+"h+='</table>';$('apps').innerHTML=h;}).catch(()=>{$('apps').innerHTML='<div class=empty>—</div>';});"
+"api('games').then(t=>{let ls=lines(t).filter(l=>l.split('|').length>3);if($('games_cnt'))$('games_cnt').textContent=ls.length+' installed';"
+"if(!ls.length){$('gametab').innerHTML='<div class=empty>No games</div>';return;}"
+"let h='<table><tr><th></th><th>Title</th><th>Name</th><th>Size</th><th></th></tr>';"
+"ls.slice(0,10).forEach(l=>{let p=l.split('|');let tid=p[0],nm=esc(p[1]),sz=p[3]?fmt(+p[3]):'—';let mt=p[5];"
+"h+='<tr><td><img src=\"/api?cmd=icon&arg='+esc(tid)+'\" width=42 height=42 style=\"border-radius:8px;vertical-align:middle\" onerror=\"this.style.display=\\'none\\'\"/></td><td class=mono>'+esc(tid)+'</td><td>'+nm+'</td><td>'+sz+'</td><td><button class=btn dim onclick=\"run(\\'launchgame\\',\\''+esc(jsq(tid))+'\\')\">Launch</button></td></tr>';});"
+"h+='</table>';$('gametab').innerHTML=h;}).catch(()=>{$('gametab').innerHTML='';});}"
+"function games(){let h='<div class=coll open id=c_gl><div class=hd onclick=\"togColl(\\'c_gl\\')\"><span class=arr>▶</span><span class=ic>▶</span>Installed Games<span class=cnt id=gcl></span></div><div class=bd id=gtab>…</div></div>';"
+"h+='<div class=sec><span class=ic>⚙</span>Global Actions</div><div class=grid>';"
+"h+=card0('Mount All Games','mount every detected game','mount');"
+"h+=card0('Unmount All','unmount all mounts','unmount');"
+"h+=cardF('Repair ALL registrations','re-register every suite-mounted title','repair','all');"
+"h+='</div>';$('content').innerHTML=h;"
+"api('games').then(t=>{let ls=lines(t).filter(l=>l.split('|').length>3);$('gcl').textContent=ls.length+' installed';"
+"if(!ls.length){$('gtab').innerHTML='<div class=empty>No games detected</div>';return;}"
+"let h='<table><tr><th></th><th>Title</th><th>Name</th><th>Path</th><th>Size</th><th>Actions</th></tr>';"
+"ls.forEach(l=>{let p=l.split('|');let tid=p[0];let mt=p[5]==='1';"
+"h+='<tr><td><img src=\"/api?cmd=icon&arg='+esc(tid)+'\" width=40 height=40 style=\"border-radius:8px;vertical-align:middle\" onerror=\"this.style.display=\\'none\\'\"/></td><td class=mono>'+esc(tid)+'</td><td>'+esc(p[1])+'</td><td class=mono style=font-size:11px>'+esc((p[2]||'').slice(0,40))+'</td><td>'+(p[3]?fmt(+p[3]):'—')+'</td>'"
+"+'<td><button class=btn dim onclick=\"run(\\'launchgame\\',\\''+esc(jsq(tid))+'\\')\">Launch</button> '"
+"+'<button class=btn dim onclick=\"run(\\'repair\\',\\''+esc(jsq(tid))+'\\')\">Repair</button> '"
+"+'<button class=btn dim onclick=\"run(\\'unmountgame\\',\\''+esc(jsq(tid))+'\\')\">Unmount</button>'+(mt?' <span class=badge g>mounted</span>':'')+'</td></tr>';});"
+"h+='</table>';$('gtab').innerHTML=h;});}"
+"var ibPath='/data',ibSel='',ibTimer=0;"
+"function install(){let h='<div class=sec><span class=ic>⬇</span>PKG Install</div>';"
+"h+='<div class=path>📁 <b id=ibp></b> <button class=\"btn dim\" style=\"margin-left:10px\" onclick=\"ibUp()\">⬆ Up</button></div>';"
+"h+='<div id=ibq style=\"display:flex;flex-wrap:wrap;gap:8px;margin:10px 0\"></div>';"
+"h+='<div id=ibt style=\"max-height:44vh;overflow-y:auto;border:1px solid #1c2b4a;border-radius:10px;background:#0d1524\"></div>';"
+"h+='<div id=ibs style=\"display:none;margin-top:12px;padding:12px;background:#0e1a30;border:1px solid #2a4a8a;border-radius:10px\">'"
+"+'<div class=mono id=ibsp style=\"word-break:break-all;font-size:13px\"></div>'"
+"+'<button class=btn style=\"margin-top:10px\" onclick=\"ibInstall()\">▶ Install Selected PKG</button></div>';"
+"h+='<div id=ibst class=mono style=\"margin-top:12px;font-size:12px;color:#8fa3c8\"></div>';"
+"$('content').innerHTML=h;ibSel='';"
+"let q='';['/data/pkg','/data/homebrew','/mnt/usb0','/mnt/usb1','/mnt/ext0','/data'].forEach(p=>{q+='<button class=\"btn dim\" onclick=\"ibNav(\\''+p+'\\')\">'+p+'</button>';});"
+"$('ibq').innerHTML=q;ibNav('/data/pkg');ibTick();}"
+"function ibNav(p){ibPath=p;ibSel='';if($('ibs'))$('ibs').style.display='none';$('ibp').textContent=p;"
+"$('ibt').innerHTML='<div class=dim style=\"padding:16px\">Loading…</div>';"
+"api('jls',p).then(t=>{try{ibRender(JSON.parse(t));}catch(e){$('ibt').innerHTML='<div class=dim style=\"padding:16px\">Cannot read '+esc(p)+'</div>';}});}"
+"function ibUp(){let p=ibPath;if(p.length<=1)return;let i=p.lastIndexOf('/');ibNav(i<=0?'/':p.substring(0,i));}"
+"function ibRender(o){let rows=(o.e||[]).slice();rows.sort((a,b)=>(b.d-a.d)||a.n.localeCompare(b.n));"
+"let h='<table style=\"width:100%\">';"
+"if(ibPath!='/')h+='<tr style=\"cursor:pointer\" onclick=\"ibUp()\"><td style=\"padding:10px 14px\">📁 ..</td><td></td></tr>';"
+"rows.forEach(e=>{let fp=ibPath+(ibPath=='/'?'':'/')+e.n;"
+"if(e.d)h+='<tr style=\"cursor:pointer\" onclick=\"ibNav(\\''+esc(jsq(fp))+'\\')\"><td style=\"padding:10px 14px\">📁 '+esc(e.n)+'</td><td class=dim>dir</td></tr>';"
+"else{let pkg=/\\.pkg$/i.test(e.n);"
+"h+='<tr '+(pkg?'onclick=\"ibPick(\\''+esc(jsq(fp))+'\\')\" style=\"cursor:pointer\"':'class=dim')+'><td style=\"padding:10px 14px\">'+(pkg?'📦 ':'📄 ')+esc(e.n)+'</td><td class=dim>'+fmt(e.s)+'</td></tr>';}});"
+"h+='</table>';$('ibt').innerHTML=h||'<div class=dim style=\"padding:16px\">empty</div>';}"
+"function ibPick(p){ibSel=p;$('ibsp').textContent=p;$('ibs').style.display='block';}"
+"function ibInstall(){if(!ibSel)return;$('ibst').textContent='Starting install…';"
+"api('install',ibSel).then(t=>{$('ibst').textContent=t;}).catch(e=>{$('ibst').textContent='install request failed';});}"
+"function ibTick(){clearInterval(ibTimer);ibTimer=setInterval(()=>{if(!$('ibst')){clearInterval(ibTimer);return;}"
+"api('installstatus').then(t=>{if(t&&t!='IDLE'&&$('ibst'))$('ibst').textContent=t;});},2500);}"
+"var trSets=[];"
+"function apiBin(c,a){return fetch('/api?cmd='+c+(a?'&arg='+encodeURIComponent(a):'')).then(r=>r.arrayBuffer());}"
+"function trophy(){let h='<div class=sec><span class=ic>★</span>Trophy Sets</div>';"
+"h+='<div class=dim style=\"margin:4px 0 12px;font-size:12px\">Lock works offline (file edit). Unlock goes through the running game — launch the title first.</div>';"
+"h+='<div style=\"display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:14px\">'"
+"+'<input id=truid type=number min=0 max=255 placeholder=id style=\"width:70px;background:#0d1524;border:1px solid #1c2b4a;border-radius:8px;color:#dde;padding:8px\">'"
+"+'<button class=\"btn dim\" onclick=\"let v=$(\\'truid\\').value;if(v!==\\'\\')run(\\'unlock\\',v)\">Unlock #</button></div>';"
+"h+='<div id=trlist><div class=dim style=\"padding:16px\">Loading…</div></div>';"
+"$('content').innerHTML=h;trLoad();}"
+"function trDec(u){try{return new TextDecoder().decode(u);}catch(e){return'';}}"
+"function trParse(b){let dv=new DataView(b.buffer,b.byteOffset,b.byteLength),o=0;"
+"let n=dv.getUint16(o,true);o+=2;let sets=[],td=new TextDecoder();"
+"let rs=()=>{let l=b[o++];let s=td.decode(b.subarray(o,o+l));o+=l;return s;};"
+"let rb=()=>{let l=dv.getUint32(o,true);o+=4;let x=b.subarray(o,o+l);o+=l;return x;};"
+"for(let i=0;i<n;i++)sets.push({npwr:rs(),tid:rs(),uid:rs(),uname:rs(),conf:rb(),meta:rb(),trp:rb()});"
+"return sets;}"
+"function trRec(d,o,th,sl){return o+8<=d.length&&!d[o]&&!d[o+1]&&d[o+2]==th&&!d[o+3]&&!d[o+4]&&!d[o+5]&&!d[o+6]&&d[o+7]==sl;}"
+"function trU32(d,o){return((d[o]<<24)|(d[o+1]<<16)|(d[o+2]<<8)|d[o+3])>>>0;}"
+"function trParseSet(s){let conf={},names={},groups={};s.title='';"
+"try{(JSON.parse(trDec(s.conf)).trophies||[]).forEach(t=>{if(t&&t.id!=null)conf[t.id]={grade:t.grade||'',hidden:!!t.hidden,group:t.groupId||''};});}catch(e){}"
+"try{let md=JSON.parse(trDec(s.meta)).metadata||{};"
+"if(md.titleMetadata)s.title=md.titleMetadata.name||'';"
+"(md.groupMetadata||[]).forEach(g=>{if(g&&g.id!=null)groups[g.id]=g.name||'';});"
+"(md.trophyMetadata||[]).forEach(t=>{if(t&&t.id!=null)names[t.id]={n:t.name||'',d:t.detail||''};});}catch(e){}"
+"s.list=Object.keys(conf).sort().map(k=>{let nm=names[k]||{};"
+"return{id:+k,grade:conf[k].grade,hidden:conf[k].hidden,group:groups[conf[k].group]||conf[k].group,"
+"name:nm.n||('Trophy '+k),detail:nm.d||'',unlocked:false,when:0};});trApplyState(s);}"
+"function trApplyState(s){let d=s.trp;if(!d||d.length<0x200||d[0]!=84||d[1]!=50||d[2]!=80||d[3]!=68)return;"
+"let maxId=-1;for(let o=0x200;o+0x14<=d.length;o+=4){if(!trRec(d,o,5,0xC0))continue;"
+"let id=trU32(d,o+0x10);if(id<512&&id>maxId)maxId=id;}"
+"if(maxId<0)return;let nbits=maxId+1,nb=(nbits+7)>>3;"
+"let um=new Uint8Array(nb),gr=0;"
+"for(let o=0x800;o+0x40+nb<=d.length;o+=4){if(!trRec(d,o,7,0xB0))continue;gr++;for(let j=0;j<nb;j++)um[j]|=d[o+0x40+j];}"
+"if(!gr)return;let rows={},stray=false,up=0;"
+"for(let o=0x800;o+0x28<=d.length;o+=4){if(!trRec(d,o,8,0x50))continue;let id=trU32(d,o+0x10);if(id>=nbits)continue;"
+"rows[id]={u:(trU32(d,o+0x14)&1)!=0,ts:0};for(let j=0;j<8;j++)rows[id].ts=rows[id].ts*256+d[o+0x20+j];}"
+"for(let i=0;i<nb*8;i++){if(!((um[i>>3]>>(i&7))&1))continue;if(i>=nbits){stray=true;break;}up++;}"
+"let mask;if(stray){if(!Object.keys(rows).length)return;mask=new Uint8Array(nb);"
+"for(let k in rows)if(rows[k].u)mask[k>>3]|=1<<(k&7);}"
+"else if(!up)mask=new Uint8Array(nb);"
+"else{let found=null;for(let o=0x200;o+nb+4<=d.length&&!found;o+=8){let pop=0,ok=true;"
+"for(let j=0;j<nb&&ok;j++){let by=d[o+j];for(let bit=0;bit<8;bit++)if((by>>bit)&1){if(j*8+bit>=nbits){ok=false;break;}pop++;}}"
+"if(!ok||pop!=up)continue;if(d[o+nb]||d[o+nb+1]||d[o+nb+2]||d[o+nb+3])continue;found=d.subarray(o,o+nb);}mask=found||um;}"
+"s.list.forEach(t=>{if(t.id<0||t.id>=nbits)return;let u=((mask[t.id>>3]>>(t.id&7))&1)!=0,r=rows[t.id];"
+"if(r){u=u||r.u;t.when=r.ts;}t.unlocked=u;});}"
+"function trGCol(g){return{platinum:'#a8b8d8',gold:'#f0c040',silver:'#c0c8d8',bronze:'#d08050'}[g]||'#888';}"
+"function trGL(g){return{platinum:'P',gold:'G',silver:'S',bronze:'B'}[g]||'?';}"
+"function trLoad(){apiBin('trophy').then(b=>{try{trSets=trParse(new Uint8Array(b));}catch(e){trSets=[];}"
+"if(!trSets.length){$('trlist').innerHTML='<div class=dim style=\"padding:16px\">No trophy sets registered.</div>';return;}"
+"trSets.forEach(trParseSet);let h='';"
+"trSets.forEach((s,i)=>{let un=s.list.filter(t=>t.unlocked).length;"
+"h+='<div class=coll id=cts'+i+'><div class=hd onclick=\"togColl(\\'cts'+i+'\\')\"><span class=arr>▶</span><span class=ic>★</span>'+esc(s.title||s.npwr)"
+"+'<span class=cnt>'+un+'/'+s.list.length+'</span></div><div class=bd id=trb'+i+'></div></div>';});"
+"$('trlist').innerHTML=h;trSets.forEach((s,i)=>trFill(i));});}"
+"function trFill(i){let s=trSets[i],h='';"
+"h+='<div class=dim style=\"font-size:12px;margin-bottom:8px\">'+esc(s.npwr)+(s.tid?' · '+esc(s.tid):'')+(s.uname?' · '+esc(s.uname):'')+'</div>';"
+"h+='<div style=\"margin-bottom:10px\"><button class=\"btn dim\" onclick=\"run(\\'repair\\',\\''+esc(jsq(s.tid))+'\\')\">Repair Reg.</button>'"
+"+(s.list.some(t=>t.unlocked)?' <button class=\"btn dim\" onclick=\"trLockAll('+i+')\">Lock ALL</button>':'')+'</div>';"
+"h+='<table><tr><th>#</th><th>Trophy</th><th>Grade</th><th>Status</th><th></th></tr>';"
+"s.list.forEach(t=>{let ic=s.npwr+'|trop'+String(t.id).padStart(4,'0')+'.png';"
+"h+='<tr><td class=mono>'+t.id+'</td><td><img src=\"/api?cmd=ticon&arg='+encodeURIComponent(ic)+'\" style=\"width:28px;height:28px;vertical-align:middle;margin-right:8px\" onerror=\"this.style.display=\\'none\\'\">'"
+"+'<b>'+esc(t.name)+'</b>'+(t.detail?'<div class=dim style=\"font-size:11px\">'+esc(t.detail)+'</div>':'')+(t.hidden?' <span class=badge>hidden</span>':'')+'</td>'"
+"+'<td><span style=\"color:'+trGCol(t.grade)+'\">'+trGL(t.grade)+'</span></td>'"
+"+'<td>'+(t.unlocked?'<span class=\"badge g\">✓</span>':'<span class=dim>—</span>')+'</td>'"
+"+'<td>'+(t.unlocked?'<button class=\"btn dim\" onclick=\"trLock('+i+','+t.id+')\">Lock</button>':'')+'</td></tr>';});"
+"h+='</table>';$('trb'+i).innerHTML=h;}"
+"function trLock(i,id){api('lock',trSets[i].npwr+':'+id).then(()=>trLoad());}"
+"function trLockAll(i){let s=trSets[i],q=s.list.filter(t=>t.unlocked).map(t=>t.id);"
+"(function nx(){if(!q.length){trLoad();return;}api('lock',s.npwr+':'+q.shift()).then(nx);})();}"
+"function files(){let h='<div class=path>Path: <b id=fp>/data</b> <button class=\"btn dim\" style=\"margin-left:10px;font-size:11px\" onclick=\"fbMkdir()\">+ New Folder</button></div><div id=ftab>…</div>';"
+"h+='<div class=sec style=\"margin-top:20px\"><span class=ic>≡</span>Quick Paths</div><div class=grid>';"
+"['/data','/data/homebrew','/data/pkg','/user','/mnt','/data/etaHEN'].forEach(p=>{"
+"h+='<div class=card onclick=\"browse(\\''+p+'\\')\"><div class=t>'+p+'</div><div class=d>browse</div></div>';});"
+"h+='</div>';$('content').innerHTML=h;browse('/data');}"
+"var fbPath='/data';"
+"function browse(p){fbPath=p;$('fp').textContent=p;$('ftab').innerHTML='<div class=dim style=\"padding:16px\">Loading…</div>';"
+"api('jls',p).then(t=>{try{fbRender(JSON.parse(t));}catch(e){$('ftab').innerHTML='<div class=dim style=\"padding:16px\">Cannot read '+esc(p)+'</div>';}});}"
+"function fbUp(){let p=fbPath;if(p.length<=1)return;let i=p.lastIndexOf('/');browse(i<=0?'/':p.substring(0,i));}"
+"function fbMkdir(){let n=prompt('New folder name:');if(!n)return;api('createdir',fbPath+'/'+n).then(()=>browse(fbPath));}"
+"function fbDel(fp,isdir){if(!confirm('Delete '+(isdir?'folder':'file')+'?\\n'+fp))return;"
+"api(isdir?'deletedir':'deletefile',fp).then(t=>{let o=$('out');o.style.display='block';o.textContent=t||'Deleted';browse(fbPath);});}"
+"function fbRename(fp){let nn=prompt('New name:');if(!nn)return;let dir=fbPath;api('renamefile',fp+'|'+dir+'/'+nn).then(t=>{let o=$('out');o.style.display='block';o.textContent=t||'Renamed';browse(fbPath);});}"
+"function fbRender(o){let rows=(o.e||[]).slice();rows.sort((a,b)=>(b.d-a.d)||a.n.localeCompare(b.n));"
+"let h='<table><tr><th>Name</th><th>Size</th><th>Actions</th></tr>';"
+"if(fbPath!='/')h+='<tr style=\"cursor:pointer\" onclick=\"fbUp()\"><td>📁 ..</td><td></td><td></td></tr>';"
+"rows.forEach(e=>{let fp=fbPath+(fbPath=='/'?'':'/')+e.n;let efp=esc(jsq(fp));"
+"if(e.d)h+='<tr><td style=\"cursor:pointer\" onclick=\"browse(\\''+efp+'\\')\">📁 '+esc(e.n)+'</td><td class=dim>dir</td>'"
+"+'<td><button class=\"btn dim\" style=\"font-size:11px\" onclick=\"fbRename(\\''+efp+'\\')\">Rename</button> '"
+"+'<button class=\"btn dgr\" style=\"font-size:11px\" onclick=\"fbDel(\\''+efp+'\\',true)\">Delete</button></td></tr>';"
+"else h+='<tr><td>📄 '+esc(e.n)+'</td><td class=dim>'+fmt(e.s)+'</td>'"
+"+'<td><a class=\"btn dim\" style=\"font-size:11px;text-decoration:none;display:inline-block\" href=\"/dl?path='+encodeURIComponent(fp)+'\" download>Download</a> '"
+"+'<button class=\"btn dim\" style=\"font-size:11px\" onclick=\"fbRename(\\''+efp+'\\')\">Rename</button> '"
+"+'<button class=\"btn dgr\" style=\"font-size:11px\" onclick=\"fbDel(\\''+efp+'\\',false)\">Delete</button></td></tr>';});"
+"h+='</table>';$('ftab').innerHTML=h||'<div class=dim style=\"padding:16px\">empty</div>';}"
+"var HIST={},sysT=0;"
+"function hPush(k,v){let a=HIST[k]=HIST[k]||[];a.push(v);if(a.length>60)a.shift();}"
+"function tempCol(t){return t>=75?'#ff6b6b':t>=60?'#f0c040':'#7be38b';}"
+"function chDraw(id,series,mn,mx,unit){let c=$(id);if(!c)return;"
+"c.width=c.clientWidth||600;let w=c.width,h=c.height,x=c.getContext('2d');"
+"x.clearRect(0,0,w,h);if(mx<=mn)mx=mn+1;"
+"x.strokeStyle='#1c2b4a';x.fillStyle='#5d6f96';x.font='10px monospace';"
+"for(let g=0;g<=4;g++){let y=8+(h-20)*g/4;x.globalAlpha=.5;x.beginPath();x.moveTo(36,y);x.lineTo(w-4,y);x.stroke();x.globalAlpha=1;"
+"x.fillText((mx-(mx-mn)*g/4).toFixed(0)+unit,2,y+3);}"
+"series.forEach(s=>{let d=HIST[s.k]||[];if(d.length<2)return;"
+"x.beginPath();d.forEach((v,i)=>{let px=36+i/59*(w-42),py=8+(h-20)*(1-(Math.min(mx,Math.max(mn,v))-mn)/(mx-mn));i?x.lineTo(px,py):x.moveTo(px,py);});"
+"x.strokeStyle=s.c;x.lineWidth=1.8;x.stroke();"
+"let lx=36+(d.length-1)/59*(w-42);x.lineTo(lx,h-6);x.lineTo(36,h-6);x.closePath();x.fillStyle=s.c+'22';x.fill();});}"
+"function mBar(lbl,used,total,extra){let p=total?Math.round(used*1000/total)/10:0;"
+"return '<div style=\"margin-bottom:12px\"><div style=\"display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px\"><span>'+lbl+'</span><span class=dim>'+fmt(used)+' / '+fmt(total)+(extra?' · '+extra:'')+'</span></div><div class=bar style=\"height:8px\"><i style=\"width:'+Math.min(100,p)+'%\"></i></div></div>';}"
+"function system(){let h='<div class=stats>';"
+"h+='<div class=stat><div class=k>CPU Temp</div><div class=v id=sy_ct>…</div><div class=s id=sy_ctm>peak —</div></div>';"
+"h+='<div class=stat><div class=k>SoC Temp</div><div class=v id=sy_st>…</div><div class=s id=sy_stm>peak —</div></div>';"
+"h+='<div class=stat><div class=k>SoC Power</div><div class=v id=sy_pw>…</div><div class=s id=sy_pwm>peak —</div></div>';"
+"h+='<div class=stat><div class=k>CPU Freq</div><div class=v id=sy_fq>…</div><div class=s id=sy_ld>load —</div></div>';"
+"h+='</div>';"
+"h+='<div class=\"coll open\"><div class=hd><span class=ic>♨</span>Temperatures<span class=cnt>live · 2s</span></div><div class=bd style=\"padding:14px 16px\"><canvas id=ch_t style=\"width:100%;height:170px\"></canvas><div class=dim style=\"font-size:11px;margin-top:8px\"><span style=\"color:#ff9d9d\">●</span> CPU temp &nbsp;&nbsp;<span style=\"color:#f0c040\">●</span> SoC temp</div></div></div>';"
+"h+='<div class=\"coll open\"><div class=hd><span class=ic>⚡</span>Power Draw<span class=cnt>live · 2s</span></div><div class=bd style=\"padding:14px 16px\"><canvas id=ch_p style=\"width:100%;height:150px\"></canvas><div class=dim style=\"font-size:11px;margin-top:8px\"><span style=\"color:#7be38b\">●</span> SoC power consumption (W)</div></div></div>';"
+"h+='<div class=\"coll open\"><div class=hd><span class=ic>≋</span>CPU Load<span class=cnt id=sy_lcap></span></div><div class=bd style=\"padding:14px 16px\" id=sy_bars></div></div>';"
+"h+='<div class=\"coll open\"><div class=hd><span class=ic>▦</span>Memory<span class=cnt>live</span></div><div class=bd style=\"padding:14px 16px\" id=sy_mem></div></div>';"
+"h+='<div class=\"coll open\"><div class=hd><span class=ic>◆</span>Console</div><div class=bd><table id=sy_hw></table></div></div>';"
+"$('content').innerHTML=h;HIST={};"
+"api('hw').then(t=>{if(!$('sy_hw'))return;let d=kv(t);"
+"$('sy_hw').innerHTML='<tr><td class=dim style=\"width:110px\">Model</td><td>'+esc(d.model||d.hw_model||'PlayStation 5')+'</td><td class=dim style=\"width:110px\">Firmware</td><td class=mono>'+esc(d.os||'?')+'</td></tr>'"
+"+'<tr><td class=dim>Serial</td><td class=mono>'+esc(d.serial||'?')+'</td><td class=dim>CPU Cores</td><td class=mono>'+(d.ncpu||'?')+'</td></tr>'"
+"+'<tr><td class=dim>Machine</td><td class=mono>'+esc(d.hw_machine||'?')+'</td><td class=dim>RAM</td><td class=mono>'+fmt(d.physmem)+'</td></tr>'"
+"+'<tr><td class=dim>Uptime</td><td class=mono id=sy_up>…</td><td class=dim>Storage</td><td class=mono id=sy_sto>…</td></tr>';});"
+"sysTick();clearInterval(sysT);sysT=setInterval(()=>{if(!$('ch_t')){clearInterval(sysT);return;}sysTick();},2000);}"
+"function sysTick(){"
+"api('temps').then(t=>{if(!$('ch_t'))return;let d=kv(t);"
+"let ct=+d.cpu_temp||0,st=+d.soc_temp||0,pw=(+d.soc_power_mw||0)/1000,fq=+d.cpu_freq_mhz||0;"
+"hPush('ct',ct);hPush('st',st);hPush('pw',pw);"
+"if($('sy_ct')){$('sy_ct').textContent=ct+'°C';$('sy_ct').style.color=tempCol(ct);$('sy_ctm').textContent='peak '+(Math.max(...HIST.ct))+'°C';}"
+"if($('sy_st')){$('sy_st').textContent=st+'°C';$('sy_st').style.color=tempCol(st);$('sy_stm').textContent='peak '+(Math.max(...HIST.st))+'°C';}"
+"if($('sy_pw')){$('sy_pw').textContent=pw.toFixed(1)+' W';$('sy_pwm').textContent='peak '+(Math.max(...HIST.pw)).toFixed(1)+' W';}"
+"if($('sy_fq'))$('sy_fq').textContent=fq>0?fq+' MHz':'—';"
+"chDraw('ch_t',[{k:'ct',c:'#ff9d9d'},{k:'st',c:'#f0c040'}],20,95,'°');"
+"chDraw('ch_p',[{k:'pw',c:'#7be38b'}],0,250,'W');"
+"let bh='',tot=0;for(let i=0;i<8;i++){let u=+d['cpu_usage_'+i]||0;tot+=u;"
+"bh+='<div style=\"display:flex;align-items:center;gap:10px;margin-bottom:7px\"><span class=dim style=\"width:42px;font-size:11px\">cpu'+i+'</span><div class=bar style=\"flex:1;height:8px;margin-top:0\"><i style=\"width:'+Math.min(100,u)+'%\"></i></div><span class=mono style=\"width:56px;text-align:right;font-size:11px\">'+u+'%</span></div>';}"
+"if($('sy_bars'))$('sy_bars').innerHTML=bh;"
+"if($('sy_lcap'))$('sy_lcap').textContent='total '+(tot/100).toFixed(2)+' load';"
+"if($('sy_ld'))$('sy_ld').textContent='load '+(tot/100).toFixed(2);});"
+"api('mem').then(t=>{if(!$('sy_mem'))return;let d=kv(t);"
+"let ct=+d.cpu_pool_total||0,cf=+d.cpu_pool_free||0,gt=+d.gpu_pool_total||0,gf=+d.gpu_pool_free||0;"
+"$('sy_mem').innerHTML=mBar('System RAM (CPU pool)',ct-cf,ct)+mBar('GPU pool',gt-gf,gt)+mBar('Direct memory',+d.direct_used||0,+d.direct_total||0)"
+"+'<div class=dim style=\"font-size:11px\">Flexible available: '+fmt(d.flexible_available)+' · Free: '+fmt(d.free_memory)+'</div>';});"
+"api('power').then(t=>{if($('sy_up')){let d=kv(t);$('sy_up').textContent=(+d.operating_time_hours||0)+'h '+(+d.operating_time_minutes||0)+'m';}});"
+"api('info').then(t=>{if($('sy_sto')){let d=kv(t),tt=+d.storage_total||0,ff=+d.storage_free||0;$('sy_sto').textContent=fmt(tt-ff)+' / '+fmt(tt);}});}"
+"function saves(){let h='<div class=sec><span class=ic>💾</span>Save Data Manager</div>';"
+"h+='<div style=\"background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:14px 18px;margin-bottom:16px;display:flex;align-items:center;gap:12px;flex-wrap:wrap\">"
+"<button class=\"btn dim\" onclick=\"svLoad()\">⟳ Refresh</button>"
+"<span class=dim style=\"font-size:13px\" id=sv_mst></span></div>';"
+"h+='<div id=sv_tab><div class=dim style=\"padding:16px\">Loading…</div></div>';$('content').innerHTML=h;"
+"svLoad();svMountSt();}"
+"var svNames={};"
+"function svLoad(){$('sv_tab').innerHTML='<div class=dim style=\"padding:16px\">Loading…</div>';"
+"api('games').then(t=>{svNames={};lines(t).forEach(l=>{let p=l.split('|');if(p[0]&&p[1])svNames[p[0]]=p[1];});}).catch(()=>{}).finally(()=>{"
+"api('savescan').then(t=>{let ls=lines(t).filter(l=>l.trim());"
+"if(!ls.length){api('saves').then(t2=>{let ls2=lines(t2).filter(l=>l.trim());"
+"svRender(ls2);});return;}svRender(ls);});});}"
+"function svRender(ls){ls=ls.filter(l=>{let p=l.split('|');let n=p[2]||'';return n.indexOf('sce_bu_')<0;});"
+"if(!ls.length){$('sv_tab').innerHTML='<div class=dim style=\"padding:16px\">No saves found</div>';return;}"
+"let h='<div class=grid>';ls.forEach(l=>{let p=l.split('|');let fp=p[0]||'';let tid=p[1]||'';let sn=p[2]||'';let uid=p[3]||'';let sz=p[4]?fmt(+p[4]):'—';let ps4=p[5]==='1';"
+"let gn=svNames[tid]||'';"
+"h+='<div style=\"background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:14px;display:flex;gap:12px\">'"
+"+'<div style=\"position:relative;width:52px;height:52px;border-radius:10px;background:#0a0f1d;display:flex;align-items:center;justify-content:center;font-size:22px;flex:none\">'+(ps4?'🎮':'🕹')+'<img src=\"/api?cmd=saveicon&arg='+encodeURIComponent(fp)+'\" style=\"position:absolute;inset:0;width:52px;height:52px;border-radius:10px;object-fit:cover\" onerror=\"this.remove()\"></div>'"
+"+'<div style=\"flex:1;min-width:0\">'"
+"+'<div style=\"display:flex;align-items:center;gap:8px;margin-bottom:2px\"><b style=\"font-size:13px\">'+(gn?esc(gn):esc(tid))+'</b><span class=badge>'+(ps4?'PS4':'PS5')+'</span></div>'"
+"+'<div class=dim style=\"font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis\" title=\"'+esc(sn)+'\">'+esc(sn)+'</div>'"
+"+'<div class=dim style=\"font-size:11px;font-family:monospace;margin:2px 0 8px\">'+sz+' · '+esc(tid)+'</div>'"
+"+'<div style=\"display:flex;gap:6px;flex-wrap:wrap\"><button class=\"btn dim\" style=\"font-size:12px\" onclick=\"svMount(\\''+esc(jsq(fp))+'\\')\">Mount</button>'"
+"+'<button class=\"btn dim\" style=\"font-size:12px\" onclick=\"svBrowse(\\''+esc(jsq(fp))+'\\')\">Browse</button>'"
+"+'<a class=\"btn dim\" style=\"font-size:12px;text-decoration:none;display:inline-block\" href=\"/dl?path='+encodeURIComponent(fp)+'\" download>Download</a>'"
+"+'<button class=\"btn dgr\" style=\"font-size:12px\" onclick=\"svDel(\\''+esc(jsq(fp))+'\\')\">Delete</button></div></div></div>';});"
+"h+='</div>';$('sv_tab').innerHTML=h;}"
+"function svBrowse(p){let o=$('out');o.style.display='block';o.textContent='Mounting '+p+'…';"
+"api('savemount',p).then(t=>{o.textContent=t||'Mounted';svMountSt();show('files');browse('/data/save_mnt');});}"
+"function svMount(p){let o=$('out');o.style.display='block';o.textContent='Mounting '+p+'…';"
+"api('savemount',p).then(t=>{o.textContent=t||'Mounted';svMountSt();});}"
+"function svUnmount(){let o=$('out');o.style.display='block';o.textContent='Unmounting…';"
+"api('saveunmount').then(t=>{o.textContent=t||'Unmounted';svMountSt();});}"
+"function svDel(p){if(!confirm('Delete save?\\n'+p))return;let o=$('out');o.style.display='block';o.textContent='Deleting…';"
+"api('savedelete',p).then(t=>{o.textContent=t||'Deleted';svLoad();});}"
+"function svMountSt(){api('savemountstatus').then(t=>{let e=$('sv_mst');"
+"if(e)e.innerHTML=t&&t!='NONE'?'Mounted: <b class=mono>'+esc(t)+'</b> <button class=\"btn dim\" style=\"margin-left:8px\" onclick=\"svUnmount()\">Unmount</button>':'No save mounted';});}"
+"function screens(){let h='<div class=sec><span class=ic>📷</span>Screenshots</div>';"
+"h+='<div id=ss_tab><div class=dim style=\"padding:16px\">Loading…</div></div>';$('content').innerHTML=h;"
+"api('screenshots').then(t=>{let ls=lines(t).filter(l=>l.trim()&&l!='NO_SCREENSHOTS');"
+"if(!ls.length){$('ss_tab').innerHTML='<div class=dim style=\"padding:16px\">No screenshots found</div>';return;}"
+"let h='<div style=\"display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:14px\">';ls.forEach(l=>{let p=l.split('|');let fp=p[0]||l;let fn=p[1]||fp.split('/').pop();let sz=p[2]?fmt(+p[2]):'—';"
+"h+='<div style=\"background:var(--card);border:1px solid var(--bd);border-radius:12px;overflow:hidden\">'"
+"+'<div style=\"height:160px;background:#0a0f1d;display:flex;align-items:center;justify-content:center;cursor:pointer\" onclick=\"window.open(\\'/dl?path='+encodeURIComponent(fp)+'\\',\\'_blank\\')\">"
+"<img src=\"/dl?path='+encodeURIComponent(fp)+'\" style=\"max-width:100%;max-height:160px;object-fit:contain\" onerror=\"this.parentNode.innerHTML=\\'<span class=dim>No preview</span>\\'\"/></div>'"
+"+'<div style=\"padding:10px\"><div style=\"font-size:12px;font-family:monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis\" title=\"'+esc(fn)+'\">'+esc(fn)+'</div>'"
+"+'<div style=\"display:flex;justify-content:space-between;align-items:center;margin-top:6px\"><span class=dim style=\"font-size:11px\">'+sz+'</span>'"
+"+'<button class=\"btn dgr\" style=\"font-size:11px;padding:4px 10px\" onclick=\"ssDel(\\''+esc(jsq(fp))+'\\')\">Delete</button></div></div></div>';});"
+"h+='</div>';$('ss_tab').innerHTML=h;});}"
+"function ssDel(p){if(!confirm('Delete screenshot?'))return;api('delscreenshot',p).then(()=>screens());}"
+"function klog(){let h='<div class=sec><span class=ic>📜</span>Kernel Log</div>';"
+"h+='<div style=\"margin-bottom:10px\"><button class=\"btn dim\" onclick=\"klogRefresh()\">Refresh</button></div>';"
+"h+='<div id=kl style=\"background:#0a0f1d;border:1px solid var(--bd);border-radius:12px;padding:18px;white-space:pre-wrap;font-family:monospace;font-size:12px;max-height:600px;overflow-y:auto;color:#9ff0b0\">Loading…</div>';"
+"$('content').innerHTML=h;klogRefresh();}"
+"function klogRefresh(){api('klog').then(t=>{let e=$('kl');if(e){e.textContent=t||'(empty)';e.scrollTop=e.scrollHeight;}});}"
+"function tools(){let h='';"
+"h+='<div class=sec><span class=ic>⚙</span>Utilities</div><div class=grid>';"
+"h+=card('Notify','send a PS5 notification','notify','text');"
+"h+=card('Shell','run a shell command','shell','cmd');"
+"h+=card0('Restart UI','restart ShellUI process','restartui');"
+"h+='</div>';"
+"h+='<div class=\"coll open\" style=\"margin-top:18px\"><div class=hd><span class=ic>🌀</span>Fan Control<span class=cnt id=fc_lbl>loading…</span></div><div class=bd style=\"padding:18px\">';"
+"h+='<div style=\"display:flex;align-items:center;gap:14px;margin-bottom:14px\">"
+"<input id=fc_sl type=range min=0 max=100 value=0 style=\"flex:1;accent-color:var(--acc)\">"
+"<span class=mono style=\"min-width:40px;text-align:right\" id=fc_val>0</span></div>';"
+"h+='<div style=\"display:flex;gap:8px;flex-wrap:wrap\">"
+"<button class=\"btn dim\" onclick=\"fanApply(30)\">Quiet (30)</button>"
+"<button class=\"btn dim\" onclick=\"fanApply(50)\">Normal (50)</button>"
+"<button class=\"btn dim\" onclick=\"fanApply(70)\">Performance (70)</button>"
+"<button class=\"btn dim\" onclick=\"fanApply(100)\">Max (100)</button>"
+"<button class=btn onclick=\"fanApply(+$(\\'fc_sl\\').value)\">Apply</button></div>';"
+"h+='</div></div>';"
+"h+='<div class=\"coll open\" style=\"margin-top:14px\"><div class=hd><span class=ic>🌐</span>Network Info</div><div class=bd id=net_info style=\"padding:2px\"><div class=dim style=\"padding:16px\">Loading…</div></div></div>';"
+"h+='<div class=\"coll open\" style=\"margin-top:14px\"><div class=hd><span class=ic>🎮</span>Controller Info</div><div class=bd id=pad_info style=\"padding:2px\"><div class=dim style=\"padding:16px\">Loading…</div></div></div>';"
+"h+='<div class=\"coll open\" style=\"margin-top:14px\"><div class=hd><span class=ic>💡</span>Lights</div><div class=bd style=\"padding:18px\">';"
+"h+='<div class=dim style=\"font-size:12px;margin-bottom:8px\">Console LED</div>';"
+"h+='<div style=\"display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px\">'"
+"+ledB('White','ledeffect|white')+ledB('Blue','ledeffect|blue')+ledB('Orange','ledeffect|orange')+ledB('Purple','ledeffect|purple')+ledB('Pink','ledeffect|pink')+'</div>';"
+"h+='<div style=\"display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px\">'"
+"+ledB('Sunrise','ledeffect|sunrise')+ledB('Blue breathe','ledeffect|blue-breathe')+ledB('White breathe','ledeffect|white-breathe')+ledB('Pink breathe','ledeffect|pink-breathe')+ledB('Off','ledeffect|off')+ledB('Auto','ledeffect|auto')+'</div>';"
+"h+='<div class=dim style=\"font-size:12px;margin-bottom:8px\">Controller lightbar</div>';"
+"h+='<div style=\"display:flex;gap:8px;flex-wrap:wrap;align-items:center\">'"
+"+lbB('Blue','0,0,255')+lbB('Red','255,0,0')+lbB('Green','0,255,0')+lbB('Purple','160,32,240')+lbB('White','255,255,255')+lbB('Off','0,0,0')+'</div>';"
+"h+='</div></div>';"
+"h+='<div class=sec style=\"margin-top:22px\"><span class=ic>⚠</span>Power</div><div class=grid>';"
+"h+=card0('Reboot','reboot the console','reboot');"
+"h+=card0('Shutdown','power off','shutdown');"
+"h+='</div>';$('content').innerHTML=h;"
+"var sl=$('fc_sl');if(sl)sl.oninput=function(){$('fc_val').textContent=this.value;};"
+"api('fanget').then(t=>{let v=parseInt(t)||0;if($('fc_sl'))$('fc_sl').value=v;if($('fc_val'))$('fc_val').textContent=v;if($('fc_lbl'))$('fc_lbl').textContent='threshold: '+v;});"
+"api('netinfo').then(t=>{let e=$('net_info');if(e){if(!t||t=='ERR'){e.innerHTML='<div class=dim style=\"padding:16px\">Network info unavailable</div>';return;}"
+"let h='<table>';t.split(/\\r?\\n/).forEach(l=>{let i=l.indexOf('=');if(i>0){let k=l.slice(0,i).trim().replace(/_/g,' ');h+='<tr><td class=dim style=\"width:180px;padding:10px 16px;text-transform:capitalize\">'+esc(k)+'</td><td class=mono style=\"padding:10px 16px\">'+esc(l.slice(i+1).trim())+'</td></tr>';}});"
+"h+='</table>';e.innerHTML=h;}});"
+"api('padinfo').then(t=>{let e=$('pad_info');if(e){if(!t||t=='ERR'){e.innerHTML='<div class=dim style=\"padding:16px\">No controller connected</div>';return;}"
+"let h='<table>';t.split(/\\r?\\n/).forEach(l=>{let i=l.indexOf('=');if(i>0){let k=l.slice(0,i).trim().replace(/_/g,' ');h+='<tr><td class=dim style=\"width:180px;padding:10px 16px;text-transform:capitalize\">'+esc(k)+'</td><td class=mono style=\"padding:10px 16px\">'+esc(l.slice(i+1).trim())+'</td></tr>';}});"
+"h+='</table>';e.innerHTML=h;}});}"
+"function fanApply(v){v=Math.max(0,Math.min(100,v));if($('fc_sl'))$('fc_sl').value=v;if($('fc_val'))$('fc_val').textContent=v;"
+"api('fanset',String(v)).then(t=>{let o=$('out');o.style.display='block';o.textContent=t||'Fan set to '+v;if($('fc_lbl'))$('fc_lbl').textContent='threshold: '+v;});}"
+"function ledB(l,a){return '<button class=\"btn dim\" style=\"font-size:12px\" onclick=\"ledC(\\''+a+'\\')\">'+l+'</button>';}"
+"function lbB(l,c){return '<button class=\"btn dim\" style=\"font-size:12px;border-bottom:3px solid rgb('+c+')\" onclick=\"lbC(\\''+c+'\\')\">'+l+'</button>';}"
+"function ledC(a){api('icc',a).then(t=>{let o=$('out');o.style.display='block';o.textContent=t;});}"
+"function lbC(c){api('pad','lightbar|'+c).then(t=>{let o=$('out');o.style.display='block';o.textContent=t;});}"
+"const FN={dash,system,games,install,trophy,saves,screens,files,klog,tools};"
+"function show(p){document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.p==p));"
+"$('pg').textContent=PAGES[p];$('out').style.display='none';$('out').textContent='';FN[p]();}"
+"api('info').then(t=>{let o=kv(t);$('ip').textContent=o.hostname||'127.0.0.1';$('ver').textContent='v'+(o.server_version||'');"
+"let u=+o.server_uptime||0;$('up').textContent='up '+Math.floor(u/3600)+'h '+Math.floor(u%3600/60)+'m';});"
+"api('ping').then(()=>{$('st').innerHTML='payload <b>online</b>';}).catch(()=>{$('st').innerHTML='payload <b style=color:#f66>offline</b>';});"
+"document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>show(b.dataset.p));show('dash');"
+"</script></body></html>";
+
+// URL args arrive percent-encoded (api() uses encodeURIComponent) — decode in
+// place: %XX bytes and '+' → space.
+static void web_urldecode(char *s) {
+    if (!s) return;
+    char *r = s, *w = s;
+    while (*r) {
+        if (*r == '%' && r[1] && r[2]) {
+            int hi = r[1], lo = r[2], v = -1;
+            hi = hi >= '0' && hi <= '9' ? hi - '0' : hi >= 'a' && hi <= 'f' ? hi - 'a' + 10 : hi >= 'A' && hi <= 'F' ? hi - 'A' + 10 : -1;
+            lo = lo >= '0' && lo <= '9' ? lo - '0' : lo >= 'a' && lo <= 'f' ? lo - 'a' + 10 : lo >= 'A' && lo <= 'F' ? lo - 'A' + 10 : -1;
+            if (hi >= 0 && lo >= 0) { v = (hi << 4) | lo; r += 3; }
+            if (v >= 0) { *w++ = (char)v; continue; }
+        }
+        *w++ = (*r == '+') ? ' ' : *r;
+        r++;
+    }
+    *w = 0;
+}
+
+// append `s` to out as a JSON-escaped string body (no surrounding quotes).
+// UTF-8 passes through raw; " \ and control bytes are escaped.
+static size_t web_json_escape(uint8_t *out, size_t cap, const char *s) {
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p && o + 8 < cap; p++) {
+        if (*p == '"' || *p == '\\') { out[o++] = '\\'; out[o++] = *p; }
+        else if (*p < 0x20) o += snprintf((char *)out + o, cap - o, "\\u%04x", *p);
+        else out[o++] = *p;
+    }
+    return o;
+}
+
+// serve one HTTP connection — / or /api?cmd=<name>&arg=<arg>
+static void web_serve_one(int cs) {
+    struct timeval tv = {5, 0};
+    setsockopt(cs, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    char req[4096]; int n = recv(cs, req, sizeof(req) - 1, 0);
+    if (n <= 0) { close(cs); return; }
+    req[n] = 0;
+    char *sp = strchr(req, ' '); if (!sp) { close(cs); return; }
+    char *path = sp + 1; char *end = strchr(path, ' '); if (end) *end = 0;
+
+    if (strncmp(path, "/dl?path=", 9) == 0) {
+        char dlpath[1024] = {0};
+        strncpy(dlpath, path + 9, sizeof(dlpath) - 1);
+        web_urldecode(dlpath);
+        const char *ext = strrchr(dlpath, '.');
+        const char *ct = "application/octet-stream";
+        if (ext) {
+            if (!strcasecmp(ext, ".png")) ct = "image/png";
+            else if (!strcasecmp(ext, ".jpg") || !strcasecmp(ext, ".jpeg")) ct = "image/jpeg";
+            else if (!strcasecmp(ext, ".bmp")) ct = "image/bmp";
+            else if (!strcasecmp(ext, ".webp")) ct = "image/webp";
+            else if (!strcasecmp(ext, ".gif")) ct = "image/gif";
+        }
+        int dfd = open(dlpath, O_RDONLY);
+        if (dfd < 0) {
+            const char *r404 = "HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+            send_all(cs, (const uint8_t *)r404, strlen(r404));
+            close(cs); return;
+        }
+        struct stat dst;
+        fstat(dfd, &dst);
+        const char *dname = strrchr(dlpath, '/');
+        dname = dname ? dname + 1 : dlpath;
+        char dhdr[1024];
+        int dhl = snprintf(dhdr, sizeof(dhdr),
+            "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %llu\r\n"
+            "Access-Control-Allow-Origin: *\r\nConnection: close\r\n"
+            "Content-Disposition: %s; filename=\"%s\"\r\n\r\n",
+            ct, (unsigned long long)dst.st_size,
+            strncmp(ct, "image/", 6) == 0 ? "inline" : "attachment",
+            dname);
+        send_all(cs, (const uint8_t *)dhdr, dhl);
+        uint8_t *dchunk = malloc(65536);
+        if (!dchunk) { close(dfd); close(cs); return; }
+        ssize_t drd;
+        while ((drd = read(dfd, dchunk, 65536)) > 0)
+            send_all(cs, dchunk, drd);
+        free(dchunk);
+        close(dfd);
+        close(cs);
+        return;
+    }
+    if (strncmp(path, "/api", 4) == 0) {
+        // /api?cmd=<name>&arg=<arg> → map name → opcode + run
+        char cname[32] = {0}, carg[256] = {0};
+        char *q = strchr(path, '?');
+        if (q) {
+            char *c = strstr(q, "cmd="), *a = strstr(q, "arg=");
+            if (c) sscanf(c + 4, "%31[^&]", cname);
+            if (a) sscanf(a + 4, "%255[^& ]", carg);
+        }
+        web_urldecode(carg);
+        struct { const char *name; uint8_t op; int takes_arg; } map[] = {
+            {"info",0x32,0},{"apps",0x70,0},{"games",0x3A,0},{"mount",0x30,0},
+            {"unmount",0x6E,0},{"unmountgame",0x3B,1},{"mountgame",0x6F,1},
+            {"install",0x50,1},{"installstatus",0x51,0},{"ls",0x03,1},
+            {"launch",0x38,1},{"launchgame",0x44,1},{"kill",0x37,1},
+            {"icon",0x3C,1},{"gicon",0x3C,1},{"ticon",0x81,1},
+            {"screenshot",0x7B,0},{"notify",0x7C,1},{"reboot",0x77,0},
+            {"shutdown",0x77,0},{"trophy",0x80,0},{"unlock",0x82,1},
+            {"lock",0x82,1},{"repair",0x83,1},{"shell",0x21,1},{"usb",0x78,0},
+            {"hw",0x34,0},{"temps",0x35,0},{"mem",0x49,0},{"proc",0x66,0},
+            {"power",0x39,0},
+            {"sysinfo",0x47,0},{"saves",0x3F,0},{"ping",0x01,0},
+            {"screenshots",0x45,0},{"delscreenshot",0x46,1},
+            {"fanget",0x52,0},{"fanset",0x53,1},
+            {"savescan",0x60,0},{"savemount",0x61,1},{"saveunmount",0x62,0},
+            {"savemountstatus",0x63,0},{"savedelete",0x64,1},{"saveicon",0x65,1},
+            {"appsuspend",0x71,1},{"appresume",0x72,1},{"appkill",0x73,1},
+            {"netinfo",0x75,0},{"klog",0x6D,0},
+            {"createdir",0x04,1},{"deletefile",0x05,1},{"deletedir",0x06,1},
+            {"renamefile",0x07,1},
+            {"indexstart",0x40,0},{"indexstatus",0x41,0},{"search",0x42,1},
+            {"padinfo",0x79,0},{"icc",0x7E,1},{"pad",0x7D,1},{"restartui",0x67,0},
+            {0,0,0}};
+        const char *res = "unknown command"; int res_len = 0, http_st = 200;
+        const char *ctype = "text/plain; charset=utf-8";
+        uint8_t *buf = malloc(1 << 20); uint8_t rtype = 0;
+        int handled = 0;
+        if (!buf) { close(cs); return; }
+        // direct-call specials (no framed protocol): unreg:<title> removes a
+        // stale/bogus app.db registration — e.g. the repair:* tiles an arg bug
+        // once wrote — via AppUnInstall which notifies the home screen itself.
+        if (!strcmp(cname, "unreg")) {
+            if (!carg[0]) { res = "usage: unreg:<title>"; res_len = strlen(res); http_st = 400; }
+            else { // daemon IPC remove (notifies UI itself) + direct DB fallback
+                   int arc = -1;
+                   if (scb_appinst_init() == 0)
+                       arc = wdg_fn_call((void*)sceAppInstUtilAppUnInstall, (void*)carg, NULL,NULL,NULL, 20000);
+                   int drc = appdb_direct_unregister(carg);
+                   g_ui_dirty = 1;
+                   static char ures[96]; snprintf(ures, sizeof(ures), "unreg daemon=%d db=%d", arc, drc);
+                   res = ures; res_len = strlen(res); }
+        } else if (!strcmp(cname, "jls")) {
+            // jls:<dir> — JSON directory listing for the embedded file manager
+            // (ls's framed binary format is unreadable from a browser).
+            handled = 1; ctype = "application/json; charset=utf-8";
+            const char *dirp = carg[0] ? carg : "/data";
+            const size_t cap = (1 << 20) - 64;
+            size_t jo = snprintf((char *)buf, cap, "{\"dir\":\"");
+            jo += web_json_escape(buf + jo, cap - jo, dirp);
+            jo += snprintf((char *)buf + jo, cap - jo, "\",\"e\":[");
+            DIR *jd = opendir(dirp);
+            if (jd) {
+                struct dirent *e; int first = 1; char full[1024];
+                while ((e = readdir(jd)) != NULL && jo < cap - 768) {
+                    if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+                    snprintf(full, sizeof(full), "%s/%s", dirp, e->d_name);
+                    struct stat st; int sok = (stat(full, &st) == 0);
+                    int isdir = e->d_type == DT_DIR ||
+                                (e->d_type == DT_UNKNOWN && sok && S_ISDIR(st.st_mode));
+                    if (!first) buf[jo++] = ',';
+                    first = 0;
+                    jo += snprintf((char *)buf + jo, cap - jo, "{\"n\":\"");
+                    jo += web_json_escape(buf + jo, cap - jo, e->d_name);
+                    jo += snprintf((char *)buf + jo, cap - jo,
+                                   "\",\"d\":%d,\"s\":%llu}", isdir,
+                                   (unsigned long long)(sok ? st.st_size : 0));
+                }
+                closedir(jd);
+            }
+            jo += snprintf((char *)buf + jo, cap - jo, "]}");
+            res = (char *)buf; res_len = (int)jo;
+        } else if (!strcmp(cname, "mntstat")) {
+            // mntstat:<path> — debug: statfs + stacked mount-table entries
+            handled = 1;
+            struct statfs ms;
+            size_t mo = 0;
+            if (statfs(carg, &ms) == 0)
+                mo += snprintf((char *)buf + mo, (1 << 20) - 64 - mo,
+                    "statfs %s\n  type=%s from=%s on=%s flags=0x%lx\n",
+                    carg, ms.f_fstypename, ms.f_mntfromname, ms.f_mntonname,
+                    (unsigned long)ms.f_flags);
+            else
+                mo += snprintf((char *)buf + mo, (1 << 20) - 64 - mo,
+                    "statfs %s failed errno=%d\n", carg, errno);
+            int mn = getfsstat(NULL, 0, MNT_NOWAIT);
+            struct statfs *mt = NULL;
+            if (mn > 0 && (mt = malloc((size_t)mn * sizeof(*mt))) != NULL)
+                mn = getfsstat(mt, (long)(mn * sizeof(*mt)), MNT_NOWAIT);
+            else
+                mn = 0;
+            if (!strcmp(carg, "*"))
+                for (int i = 0; i < mn && mo < (1 << 20) - 256; i++)
+                    mo += snprintf((char *)buf + mo, (1 << 20) - 64 - mo,
+                        "%s type=%s from=%s flags=0x%lx\n",
+                        mt[i].f_mntonname, mt[i].f_fstypename,
+                        mt[i].f_mntfromname, (unsigned long)mt[i].f_flags);
+            for (int i = 0; i < mn && mo < (1 << 20) - 256; i++)
+                if (!strcmp(mt[i].f_mntonname, carg))
+                    mo += snprintf((char *)buf + mo, (1 << 20) - 64 - mo,
+                        "layer: type=%s from=%s flags=0x%lx\n",
+                        mt[i].f_fstypename, mt[i].f_mntfromname,
+                        (unsigned long)mt[i].f_flags);
+            if (mt) free(mt);
+            res = (char *)buf; res_len = (int)mo;
+        } else
+        for (int i = 0; map[i].name; i++) {
+            if (strcmp(cname, map[i].name)) continue;
+            handled = 1;
+            if (!strcmp(cname, "icon") || !strcmp(cname, "gicon") || !strcmp(cname, "ticon") || !strcmp(cname, "saveicon")) ctype = "image/png";
+            // translate friendly arg → the real arg form
+            const char *earg = carg;
+            char argbuf[320];
+            if (!strcmp(cname, "lock")) snprintf(argbuf, sizeof(argbuf), "lock:%s", carg), earg = argbuf;
+            else if (!strcmp(cname, "unlock") && carg[0] && strcmp(carg, "all")) snprintf(argbuf, sizeof(argbuf), "unlock:%s", carg), earg = argbuf;
+            else if (!strcmp(cname, "reboot")) earg = "reboot";
+            else if (!strcmp(cname, "shutdown")) earg = "shutdown";
+            else if (!strcmp(cname, "unmount")) earg = "all";
+            else if (!strcmp(cname, "repair")) snprintf(argbuf, sizeof(argbuf), "%s", carg[0] ? carg : "all"), earg = argbuf;
+            uint32_t dl = earg ? strlen(earg) : 0;
+            uint32_t got = web_exec(map[i].op, earg, dl, &rtype, buf, (1 << 20) - 1);
+            buf[got] = 0; res = (char *)buf; res_len = got;
+            break;
+        }
+        if (!handled) res_len = strlen(res);
+        char h[256];
+        int hl = snprintf(h, sizeof(h), "HTTP/1.1 %d OK\r\nContent-Type: %s\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\nContent-Length: %d\r\n\r\n", http_st, ctype, res_len);
+        send_all(cs, (const uint8_t *)h, hl);
+        if (res_len) send_all(cs, (const uint8_t *)res, res_len);
+        free(buf); close(cs); return;
+    }
+    if (strcmp(path, "/") != 0 && strcmp(path, "") != 0) {
+        const char *r404 = "HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+        send_all(cs, (const uint8_t *)r404, strlen(r404));
+        close(cs); return;
+    }
+    char head[256];
+    int hn = snprintf(head, sizeof(head), "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %d\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n", (int)strlen(g_webui_html));
+    send_all(cs, (const uint8_t *)head, hn);
+    send_all(cs, (const uint8_t *)g_webui_html, strlen(g_webui_html));
+    close(cs);
+}
+
+static void *webui_tile_wrapper(void *arg) {
+    install_webui_tile((int)(intptr_t)arg);
+    return NULL;
+}
+
+static struct { char msg[128]; char sub[96]; } g_startup_notif;
+static void *startup_notif_thread(void *arg) {
+    (void)arg;
+    install_suite_icon();
+    send_notification_pretty(g_startup_notif.msg, g_startup_notif.sub);
+    return NULL;
+}
+
+static void *web_serve_wrapper(void *arg) {
+    int cs = (int)(intptr_t)arg;
+    web_serve_one(cs);
+    return NULL;
+}
+
+static void *web_ui_thread(void *arg) {
+    (void)arg;
+    int ls = socket(AF_INET, SOCK_STREAM, 0);
+    int one = 1, np = 1;
+    setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    setsockopt(ls, SOL_SOCKET, SO_NOSIGPIPE, &np, sizeof(np));
+    struct sockaddr_in sa; memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET; sa.sin_addr.s_addr = htonl(INADDR_ANY);
+    int bound = 0;
+    for (int p = WEB_UI_PORT; p < WEB_UI_PORT + 30; p++) {
+        sa.sin_port = htons(p);
+        if (bind(ls, (struct sockaddr *)&sa, sizeof(sa)) == 0) { bound = p; break; }
+    }
+    if (!bound || listen(ls, 16) != 0) { close(ls); g_webui_running = 0; return NULL; }
+    g_webui_port = bound;
+    {
+        pthread_t tt; pthread_attr_t ta;
+        pthread_attr_init(&ta); pthread_attr_setdetachstate(&ta, PTHREAD_CREATE_DETACHED);
+        pthread_create(&tt, &ta, webui_tile_wrapper, (void*)(intptr_t)bound);
+        pthread_attr_destroy(&ta);
+    }
+    while (g_webui_running) {
+        int cs = accept(ls, NULL, NULL);
+        if (cs < 0) { usleep(30000); continue; }
+        setsockopt(cs, SOL_SOCKET, SO_NOSIGPIPE, &np, sizeof(np));
+        pthread_t ct; pthread_attr_t ca;
+        pthread_attr_init(&ca); pthread_attr_setdetachstate(&ca, PTHREAD_CREATE_DETACHED);
+        pthread_attr_setstacksize(&ca, 2 * 1024 * 1024);
+        if (pthread_create(&ct, &ca, web_serve_wrapper, (void *)(intptr_t)cs) != 0)
+            web_serve_one(cs);
+        pthread_attr_destroy(&ca);
+    }
+    close(ls); return NULL;
+}
+
+void web_ui_start(void) {
+    if (g_webui_running) return;
+    g_webui_running = 1;
+    pthread_t t; pthread_attr_t a;
+    pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&t, &a, web_ui_thread, NULL) != 0) g_webui_running = 0;
+    pthread_attr_destroy(&a);
+}
+
 void *client_thread(void *arg) {
     client_session_t *session = (client_session_t *)arg;
     // +1: the buffer is reused across commands and handlers treat `data` as a
@@ -17063,16 +18808,16 @@ static int      g_elevated     = 0;
 // process was about to lose anyway. No kernel memory reads at all.
 
 static void kill_stale_instances(void) {
-    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PROC, 0 };
+    int mib[3] = { CTL_KERN, KERN_PROC, KERN_PROC_PROC };
     size_t size = 0;
-    if (sysctl(mib, 4, NULL, &size, NULL, 0) != 0 || size == 0) return;
-    size += size / 8;   /* processes come and go between the two calls */
+    if (sysctl(mib, 3, NULL, &size, NULL, 0) != 0 || size == 0) return;
+    size += size / 8;
     char *buf = malloc(size);
     if (!buf) return;
 
     pid_t self = getpid();
 
-    if (sysctl(mib, 4, buf, &size, NULL, 0) == 0) {
+    if (sysctl(mib, 3, buf, &size, NULL, 0) == 0) {
         for (char *p = buf; p + sizeof(int) <= buf + size; ) {
             struct kinfo_proc *ki = (struct kinfo_proc *)p;
             if (ki->ki_structsize <= 0) break;
@@ -17246,7 +18991,10 @@ int main() {
     
     int opt = 1;
     setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    
+    // NO SO_REUSEPORT here — it lets a second instance bind the same port while
+    // a stale copy still listens, so bind() never fails and the stale-kill /
+    // takeover path below never runs (instances stack up, port stays open).
+
     // Prevent SIGPIPE
     int no_sigpipe = 1;
     setsockopt(server_sock, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe));
@@ -17337,10 +19085,6 @@ int main() {
         setsockopt(server_sock, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
         setsockopt(server_sock, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
         if (bind(server_sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-            // The stale process is wedged in uninterruptible kernel IPC —
-            // SIGKILL is pending but can never land, so its listener keeps
-            // the port forever. Instead of dying (and forcing a PS5 reboot),
-            // fall back to a secondary port. The client scans 9113+ range.
             int bound_port = 0;
             for (int p = SERVER_PORT + 1; p <= SERVER_PORT + 30 && bound_port == 0; p++) {
                 close(server_sock);
@@ -17410,16 +19154,25 @@ bound_ok:
         freeifaddrs(ifaddr);
     }
     
-    install_suite_icon();
-    char msg[128];
-    char sub[96];
+    sbx_watcher_start();
     if (update_prev[0])
-        snprintf(msg, sizeof(msg), "PS5 Suite updated: v%s → v" SUITE_VERSION, update_prev);
+        snprintf(g_startup_notif.msg, sizeof(g_startup_notif.msg),
+                 "PS5 Suite updated: v%s → v" SUITE_VERSION, update_prev);
     else
-        snprintf(msg, sizeof(msg), "Welcome to PS5 Suite v" SUITE_VERSION);
-    snprintf(sub, sizeof(sub), "Server ready — %s:%d", ip_str, g_bound_port);
-    send_notification_pretty(msg, sub);
-    
+        snprintf(g_startup_notif.msg, sizeof(g_startup_notif.msg),
+                 "Welcome to PS5 Suite v" SUITE_VERSION);
+    snprintf(g_startup_notif.sub, sizeof(g_startup_notif.sub),
+             "Server ready — %s:%d", ip_str, g_bound_port);
+    {
+        pthread_t nt; pthread_attr_t na;
+        pthread_attr_init(&na); pthread_attr_setdetachstate(&na, PTHREAD_CREATE_DETACHED);
+        pthread_create(&nt, &na, startup_notif_thread, NULL);
+        pthread_attr_destroy(&na);
+    }
+    web_ui_start();
+    { FILE *sf = fopen("/data/ps5_suite_status.txt", "w");
+      if (sf) { fprintf(sf, "READY port=%d\n", g_bound_port); fclose(sf); } }
+
     while (1) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);

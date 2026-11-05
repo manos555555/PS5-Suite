@@ -158,7 +158,9 @@ namespace PS5Upload
             // every other port will fail identically, so bail immediately
             // instead of hanging ~30s on a wrong IP.
             var ports = new List<int> { port };
-            for (int p = 9113; p <= 9118; p++)
+            // Server falls back up to +30 ports when the base port is held by
+            // a wedged instance — scan the whole range, not just 9113-9118.
+            for (int p = 9113; p <= 9143; p++)
                 if (!ports.Contains(p)) ports.Add(p);
 
             // Probe ALL ports in parallel — a wedged payload accepts TCP but
@@ -248,9 +250,9 @@ namespace PS5Upload
         {
             // The payload's discovery responder binds its UDP socket to the same
             // port number as its TCP listener, which is the first free port in
-            // the takeover range 9113..9118 (a wedged instance keeps 9113, so the
+            // the takeover range 9113..9143 (a wedged instance keeps 9113, so the
             // live server may sit on a fallback). Probe the whole range.
-            var discoveryPorts = Enumerable.Range(9113, 6).ToList();
+            var discoveryPorts = Enumerable.Range(9113, 31).ToList();
             try
             {
                 using var udp = new UdpClient();

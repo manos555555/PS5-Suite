@@ -87,7 +87,7 @@ namespace PS5Upload
 
         private async Task ConnectToPS5Async()
         {
-            if (await _protocol.ConnectAsync(_ps5IpAddress))
+            if (await _protocol.ConnectAsync(_ps5IpAddress, _ps5Port))
             {
                 Log("✅ Connected to PS5 successfully");
                 await Dispatcher.UIThread.InvokeAsync(() =>
@@ -120,6 +120,7 @@ namespace PS5Upload
                     return;
                 }
                 IpAddressTextBox.Text = found.Value.ip;
+                _ps5Port = found.Value.port;
                 Log($"🔍 Found PS5 at {found.Value.ip}:{found.Value.port}");
             }
             catch (Exception ex) { Log($"❌ Discovery failed: {ex.Message}"); }
@@ -153,6 +154,7 @@ namespace PS5Upload
                         return;
                     }
                     ipAddress = found.Value.ip;
+                    _ps5Port = found.Value.port;
                     Log($"🔍 Found PS5 at {ipAddress}:{found.Value.port}");
                     await Dispatcher.UIThread.InvokeAsync(() => IpAddressTextBox.Text = ipAddress);
                 }
@@ -205,7 +207,7 @@ namespace PS5Upload
                 });
                 try
                 {
-                    if (await _protocol.ConnectAsync(ipAddress, 9113, _connectCts.Token))
+                    if (await _protocol.ConnectAsync(ipAddress, _ps5Port, _connectCts.Token))
                     {
                         Log("✅ Connected to PS5 successfully");
                         await Dispatcher.UIThread.InvokeAsync(() =>
@@ -257,7 +259,7 @@ namespace PS5Upload
                 if (!_protocol.IsConnected)
                 {
                     Log($"⚠️ Connection lost (LastError: {_protocol.LastError}), reconnecting...");
-                    if (!await _protocol.ConnectAsync(_ps5IpAddress))
+                    if (!await _protocol.ConnectAsync(_ps5IpAddress, _ps5Port))
                     {
                         await ShowMessageAsync("Failed to reconnect to PS5", "Connection Error");
                         return;
@@ -1061,19 +1063,41 @@ namespace PS5Upload
 
             Log($"⬇️ Downloading {selectedItems.Count} files to {destFolder}...");
             int successCount = 0, failCount = 0;
-
-            foreach (var item in selectedItems)
+            _uploadCancellation = new CancellationTokenSource();
+            var batchCt = _uploadCancellation.Token;
+            CancelButton.IsEnabled = true;
+            ProgressPanel.IsVisible = true;
+            try
             {
-                try
+                int fileIdx = 0;
+                foreach (var item in selectedItems)
                 {
-                    string destPath = Path.Combine(destFolder, item.Name);
-                    Log($"⬇️ Downloading: {item.Name} ({FormatFileSize(item.Size)})");
-                    bool success = await _protocol.DownloadFileAsync(item.FullPath, destPath);
-                    if (success) { Log($"✅ Downloaded: {item.Name}"); successCount++; }
-                    else { Log($"❌ Download failed: {item.Name}"); failCount++; }
+                    if (batchCt.IsCancellationRequested) { Log("⏹ Download cancelled"); break; }
+                    fileIdx++;
+                    try
+                    {
+                        string destPath = Path.Combine(destFolder, item.Name);
+                        Log($"⬇️ Downloading: {item.Name} ({FormatFileSize(item.Size)})");
+                        int idx = fileIdx;
+                        var progress = new InlineProgress<UploadProgress>(p =>
+                        {
+                            Dispatcher.UIThread.Post(() =>
+                            {
+                                double percent = p.TotalBytes > 0 ? (double)p.BytesSent / p.TotalBytes * 100 : 0;
+                                TotalProgressBar.Value = percent;
+                                TotalProgressText.Text = $"Downloading {idx}/{selectedItems.Count}: {FormatFileSize(p.BytesSent)}/{FormatFileSize(p.TotalBytes)} ({percent:F1}%)";
+                                UploadFileNameText.Text = $"⬇️ {item.Name}";
+                            });
+                        });
+                        bool success = await _protocol.DownloadFileAsync(item.FullPath, destPath, progress, batchCt);
+                        if (success) { Log($"✅ Downloaded: {item.Name}"); successCount++; }
+                        else { Log($"❌ Download failed: {item.Name}"); failCount++; }
+                    }
+                    catch (OperationCanceledException) { Log("⏹ Download cancelled"); break; }
+                    catch (Exception ex) { Log($"❌ Download error {item.Name}: {ex.Message}"); failCount++; }
                 }
-                catch (Exception ex) { Log($"❌ Download error {item.Name}: {ex.Message}"); failCount++; }
             }
+            finally { _uploadCancellation = null; CancelButton.IsEnabled = false; ProgressPanel.IsVisible = false; TotalProgressBar.Value = 0; TotalProgressText.Text = ""; UploadFileNameText.Text = ""; }
 
             Log($"⬇️ Batch download complete: {successCount} succeeded, {failCount} failed");
             await ShowMessageAsync($"Download complete!\n\n✅ {successCount} downloaded\n❌ {failCount} failed\n\nSaved to: {destFolder}");
@@ -1101,6 +1125,8 @@ namespace PS5Upload
                         Log($"⬇️ Downloading folder: {item.FullPath} → {localBasePath}");
                         _uploadCancellation = new CancellationTokenSource();
                         var ct = _uploadCancellation.Token;
+                        CancelButton.IsEnabled = true;
+                        ProgressPanel.IsVisible = true;
                         int dlCallCount = 0;
                         var progress = new InlineProgress<DownloadFolderProgress>(p =>
                         {
@@ -1127,8 +1153,9 @@ namespace PS5Upload
                         Log($"✅ Folder download complete: {downloaded} files ({FormatFileSize(totalBytes)}), {failed} failed");
                         await ShowMessageAsync($"Folder downloaded!\n\nFiles: {downloaded} downloaded, {failed} failed\nSize: {FormatFileSize(totalBytes)}\nSaved to: {localBasePath}", "Download Complete");
                     }
+                    catch (OperationCanceledException) { Log("⏹ Folder download cancelled"); }
                     catch (Exception ex) { Log($"❌ Folder download error: {ex.Message}"); await ShowMessageAsync($"Folder download error: {ex.Message}", "Error"); }
-                    finally { _uploadCancellation = null; TotalProgressBar.Value = 0; TotalProgressText.Text = ""; UploadFileNameText.Text = ""; }
+                    finally { _uploadCancellation = null; CancelButton.IsEnabled = false; ProgressPanel.IsVisible = false; TotalProgressBar.Value = 0; TotalProgressText.Text = ""; UploadFileNameText.Text = ""; }
                     return;
                 }
 
@@ -1141,6 +1168,11 @@ namespace PS5Upload
                     try
                     {
                         Log($"⬇️ Downloading: {item.Name} ({FormatFileSize(item.Size)})");
+                        _uploadCancellation = new CancellationTokenSource();
+                        var ct = _uploadCancellation.Token;
+                        CancelButton.IsEnabled = true;
+                        ProgressPanel.IsVisible = true;
+                        UploadFileNameText.Text = $"⬇️ {item.Name}";
                         int sfCallCount = 0;
                         var progress = new InlineProgress<UploadProgress>(p =>
                         {
@@ -1152,12 +1184,13 @@ namespace PS5Upload
                                 TotalProgressText.Text = $"Downloading: {FormatFileSize(p.BytesSent)}/{FormatFileSize(p.TotalBytes)} ({percent:F1}%) @ {FormatFileSize((long)p.SpeedBytesPerSecond)}/s";
                             });
                         });
-                        bool success = await _protocol.DownloadFileAsync(item.FullPath, savePath, progress);
+                        bool success = await _protocol.DownloadFileAsync(item.FullPath, savePath, progress, ct);
                         if (success) { Log($"✅ Downloaded: {item.Name} → {savePath}"); await ShowMessageAsync($"File downloaded successfully!\n\nSaved to: {savePath}", "Success"); }
                         else { Log($"❌ Download failed: {item.Name}"); await ShowMessageAsync("Download failed", "Error"); }
                     }
+                    catch (OperationCanceledException) { Log("⏹ Download cancelled"); }
                     catch (Exception ex) { Log($"❌ Download error: {ex.Message}"); await ShowMessageAsync($"Download error: {ex.Message}", "Error"); }
-                    finally { TotalProgressBar.Value = 0; TotalProgressText.Text = ""; }
+                    finally { _uploadCancellation = null; CancelButton.IsEnabled = false; ProgressPanel.IsVisible = false; TotalProgressBar.Value = 0; TotalProgressText.Text = ""; UploadFileNameText.Text = ""; }
                 }
             }
         }
@@ -1194,7 +1227,7 @@ namespace PS5Upload
             var tempProtocol = new PS5Protocol();
             try
             {
-                if (!await tempProtocol.ConnectAsync(_ps5IpAddress)) { Log("❌ Storage refresh: failed to open temporary connection"); return null; }
+                if (!await tempProtocol.ConnectAsync(_ps5IpAddress, _ps5Port)) { Log("❌ Storage refresh: failed to open temporary connection"); return null; }
                 return await tempProtocol.ListStorageAsync();
             }
             finally { tempProtocol.Dispose(); }

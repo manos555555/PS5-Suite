@@ -484,7 +484,7 @@ namespace PS5Upload
             try
             {
                 using var proto = new PS5Protocol();
-                if (!await proto.ConnectAsync(_ps5IpAddress)) return;
+                if (!await proto.ConnectAsync(_ps5IpAddress, _ps5Port)) return;
                 foreach (var set in sets)
                 {
                     // icon0_<lang>.png is the set cover; fall back to plain icon0.png.
@@ -508,7 +508,7 @@ namespace PS5Upload
             try
             {
                 using var proto = new PS5Protocol();
-                if (!await proto.ConnectAsync(_ps5IpAddress)) return;
+                if (!await proto.ConnectAsync(_ps5IpAddress, _ps5Port)) return;
                 foreach (var t in set.Trophies)
                 {
                     if (t.Icon != null) continue;

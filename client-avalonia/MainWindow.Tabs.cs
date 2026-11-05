@@ -57,7 +57,7 @@ namespace PS5Upload
                     try
                     {
                         using var iconProto = new PS5Protocol();
-                        if (!await iconProto.ConnectAsync(_ps5IpAddress)) return;
+                        if (!await iconProto.ConnectAsync(_ps5IpAddress, _ps5Port)) return;
                         foreach (var s2 in visible)
                         {
                             if (s2.Icon != null) continue;
@@ -460,7 +460,7 @@ namespace PS5Upload
                         // Dedicated connection: keeps bulk icon fetches off the
                         // shared main connection (no more serialized UI stalls).
                         using var iconProto = new PS5Protocol();
-                        if (!await iconProto.ConnectAsync(_ps5IpAddress)) return;
+                        if (!await iconProto.ConnectAsync(_ps5IpAddress, _ps5Port)) return;
 
                         foreach (var game in games)
                         {
@@ -840,7 +840,7 @@ namespace PS5Upload
                     // Dedicated connection: thumbnail downloads used to run on
                     // the main connection and block every other UI operation.
                     using var thumbProto = new PS5Protocol();
-                    if (!await thumbProto.ConnectAsync(_ps5IpAddress)) return;
+                    if (!await thumbProto.ConnectAsync(_ps5IpAddress, _ps5Port)) return;
 
                     foreach (var shot in shots)
                     {

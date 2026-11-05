@@ -47,7 +47,17 @@ All-in-one management suite for jailbroken PS5 consoles. One app — on **Window
 
 ### ✨ New in v7.8.1
 
-- **Fixed: trophies not unlocking on FW 5.50 (issues #16/#17)** — the FW 5.50 trophy daemon rejects the `options=1` post signature with `0x80553102`. Every handle pair is now probed with `options=1` first (13.60+ stat-extraction signature) and automatically falls back to `options=0` (the 7.6.0 signature 5.50 accepts). Verified on FW 5.50: trophies unlock through the daemon's own award path. The unlock log now marks which signature fired (`(o0)`/`(o1)`).
+- **On-console Web UI** — the payload now serves a full dashboard (default port 17382) with a home-screen tile (`PSUI00001`) to launch it straight from the PS5 — no PC needed. Pages: Dashboard, System with live charts, Games, Install, Trophy, Saves, Screenshots, Files, Kernel Log, Tools.
+- **Web UI Saves manager** — per-save icons, friendly game names, PS4/PS5 badges, `sce_bu_*` backups hidden, and Mount / Browse / Download / Delete actions per save.
+- **Web UI Lights control** — console LED colors + effects (breathe, sunrise, off/auto) and DualSense lightbar colors, from the Tools page.
+- **Fixed: trophies not unlocking on FW 5.50 (issues #16/#17)** — the FW 5.50 trophy daemon rejects the `options=1` post signature with `0x80553102`. Every handle pair is now probed with `options=1` first (13.60+ stat-extraction signature) and automatically falls back to `options=0` (the 7.6.0 signature 5.50 accepts). Verified on FW 5.50: trophies unlock through the daemon's own award path.
+- **Verified unlock cascade** — every trophy now goes through a 4-layer cascade (UDS post → daemon `GetTrophyInfo` query → `sceNpTrophy2SystemDebugUnlockTrophy` IPMI → direct `TRPTITLE.DAT` pin), so custom-protocol titles that reject posts still get their trophies. Response reports which layer landed each trophy.
+- **`repair:<title|all>` registration repair** — suite-mounted games missing from the home screen can be re-registered in place (re-ensures `param.json`/`icon0.png` and re-runs the daemon registration). `repair:all` only touches suite mounts — real installs are never affected.
+- **Fixed: payload port stacking** — the TCP listener no longer uses `SO_REUSEPORT`; redeploys could otherwise stack wedged listeners that accept but never answer (unkillable until reboot). Stale-instance takeover + 9113–9143 fallback now work as designed.
+- **Fixed: client used the wrong port after fallback** — discovery found the live port but connections still dialed hardcoded 9113. The discovered port is now stored silently and used by every connection path; TCP/UDP scanning covers the full 9113–9143 range.
+- **Fixed: downloads showed no progress (issue #18)** — the progress panel was only shown for uploads; single-file, folder and multi-select downloads now display percent/speed/filename and support STOP cancel.
+- **Web downloads save with real filenames** — the `/dl` endpoint now sends the actual basename via `Content-Disposition`.
+- Payload + client bumped together — the v7.8.1 client requires the v7.8.1 `ps5_suite_server.elf`.
 
 ### ✨ New in v7.8.0
 
@@ -92,7 +102,7 @@ All-in-one management suite for jailbroken PS5 consoles. One app — on **Window
 
 1. Load a jailbreak / payload loader on the PS5 — **fully compatible with both etaHEN and Kstuff** (any payload loader that accepts ELFs works). All features including mount/unmount, launch game and DualSense control work on k-stuff.
 2. Open the app → expand **⚙️ Payload Settings** → **📂 Browse** → pick `payload/ps5_suite_server.elf` → **📤 Send Payload** (default port 9021).
-3. The payload installs itself and starts the suite server (ports 9113–9116).
+3. The payload installs itself and starts the suite server (ports 9113–9143, first free wins — the Web UI follows at +4269, e.g. 17382 for 9113).
 4. Press **🔍** to auto-discover the console on your LAN, or type its IP → **🔌 Connect**.
 5. Done. Future payload updates go through **🔄 Self-Update Payload** (pushes the new ELF through the running server) or **⬆️ Update from GitHub**.
 
@@ -297,6 +307,19 @@ Everything is read **live from the console** — nothing hardcoded; values the c
 - Timestamped log of **every** operation the app performs — connections, transfers, errors, PS5 responses.
 - **📋 Copy Log**, **🗑️ Clear Log**; a `ps5suite_*.log` file is also written automatically next to the executable for post-mortem debugging.
 - **Failed transfers** section with per-item **🔄 Retry** and **🗑️ Remove**.
+
+---
+
+### 🌐 WEB UI (on-console, no PC needed)
+
+- The payload serves a full dashboard over HTTP — open `http://<ps5-ip>:17382` in any browser, or launch it straight from the **PSUI00001 home-screen tile** the payload registers.
+- **Dashboard** — storage, mounted games, running apps and payload status at a glance.
+- **System** — live CPU/memory/network charts and hardware info in real time.
+- **Games / Install** — browse mounted titles, launch, mount, install PKGs.
+- **Trophy** — trophy sets with icons, per-trophy state, lock/unlock, registration repair.
+- **Saves** — save manager with per-save icons, game names, PS4/PS5 badges (`sce_bu_*` backups hidden): Mount, Browse, Download (real filenames), Delete.
+- **Screenshots / Files / Kernel Log** — media preview + download, full filesystem browser, live klog.
+- **Tools** — notifications, shell, fan control, network + controller info, **Lights** (console LED colors/effects + DualSense lightbar), power actions.
 
 ---
 

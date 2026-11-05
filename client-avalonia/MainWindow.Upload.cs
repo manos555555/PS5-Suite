@@ -193,7 +193,7 @@ namespace PS5Upload
                 if (!_protocol.IsConnected)
                 {
                     Log("⚠️ Connection lost before directory creation, reconnecting...");
-                    if (!await _protocol.ConnectAsync(_ps5IpAddress)) throw new Exception("Failed to reconnect to PS5 before directory creation");
+                    if (!await _protocol.ConnectAsync(_ps5IpAddress, _ps5Port)) throw new Exception("Failed to reconnect to PS5 before directory creation");
                     Log("✅ Reconnected successfully");
                 }
 
@@ -215,7 +215,7 @@ namespace PS5Upload
                     catch (Exception ex)
                     {
                         Log($"⚠️ Failed to create dir {dir}: {ex.Message}, retrying...");
-                        try { _protocol.Disconnect(); await Task.Delay(500); if (await _protocol.ConnectAsync(_ps5IpAddress)) await _protocol.CreateDirAsync(dir); else throw new Exception("Reconnect failed"); }
+                        try { _protocol.Disconnect(); await Task.Delay(500); if (await _protocol.ConnectAsync(_ps5IpAddress, _ps5Port)) await _protocol.CreateDirAsync(dir); else throw new Exception("Reconnect failed"); }
                         catch (Exception retryEx) { Log($"❌ Directory creation failed permanently: {dir} - {retryEx.Message}"); }
                     }
                     dirCreated++;
@@ -225,7 +225,7 @@ namespace PS5Upload
                 if (!_protocol.IsConnected)
                 {
                     Log("⚠️ Connection lost after directory creation, reconnecting...");
-                    if (!await _protocol.ConnectAsync(_ps5IpAddress)) throw new Exception("Failed to reconnect to PS5 after directory creation");
+                    if (!await _protocol.ConnectAsync(_ps5IpAddress, _ps5Port)) throw new Exception("Failed to reconnect to PS5 after directory creation");
                     Log("✅ Reconnected successfully");
                 }
 
@@ -236,7 +236,7 @@ namespace PS5Upload
                 Log($"🚀 Starting parallel upload with {MaxParallelUploads} connections (pre-warming {preWarmCount})...");
                 var preWarmTasks = new List<Task<PS5Protocol?>>();
                 for (int i = 0; i < preWarmCount; i++)
-                    preWarmTasks.Add(Task.Run(async () => { try { var c = new PS5Protocol(); if (await c.ConnectAsync(_ps5IpAddress)) { Interlocked.Increment(ref _currentPoolConnections); return c; } c.Dispose(); } catch { } return (PS5Protocol?)null; }));
+                    preWarmTasks.Add(Task.Run(async () => { try { var c = new PS5Protocol(); if (await c.ConnectAsync(_ps5IpAddress, _ps5Port)) { Interlocked.Increment(ref _currentPoolConnections); return c; } c.Dispose(); } catch { } return (PS5Protocol?)null; }));
                 await Task.WhenAll(preWarmTasks);
                 int pooled = 0;
                 foreach (var t in preWarmTasks) { if (t.Result != null) { _connectionPool.Enqueue(t.Result); pooled++; } }
@@ -357,10 +357,10 @@ namespace PS5Upload
                 else { Log("⚠️ Upload cancelled"); await ShowMessageAsync("Upload cancelled by user", "Cancelled"); }
 
                 // Reconnect if needed
-                if (!_protocol.IsConnected) { try { if (await _protocol.ConnectAsync(_ps5IpAddress)) { Log("✅ Reconnected"); await LoadPS5DirectoryAsync(_currentPS5Path); } } catch { } }
+                if (!_protocol.IsConnected) { try { if (await _protocol.ConnectAsync(_ps5IpAddress, _ps5Port)) { Log("✅ Reconnected"); await LoadPS5DirectoryAsync(_currentPS5Path); } } catch { } }
                 else { Log("✅ Main connection still active"); await LoadPS5DirectoryAsync(_currentPS5Path); }
             }
-            catch (OperationCanceledException) { Log("❌ Upload cancelled"); await ShowMessageAsync("Upload cancelled by user", "Cancelled"); if (!_protocol.IsConnected) { try { if (await _protocol.ConnectAsync(_ps5IpAddress)) await LoadPS5DirectoryAsync(_currentPS5Path); } catch { } } else await LoadPS5DirectoryAsync(_currentPS5Path); }
+            catch (OperationCanceledException) { Log("❌ Upload cancelled"); await ShowMessageAsync("Upload cancelled by user", "Cancelled"); if (!_protocol.IsConnected) { try { if (await _protocol.ConnectAsync(_ps5IpAddress, _ps5Port)) await LoadPS5DirectoryAsync(_currentPS5Path); } catch { } } else await LoadPS5DirectoryAsync(_currentPS5Path); }
             catch (Exception ex) { Log($"❌ Upload failed: {ex.Message}\n{ex.StackTrace}"); await ShowMessageAsync($"Upload failed: {ex.Message}", "Error"); }
             finally
             {
@@ -536,7 +536,7 @@ namespace PS5Upload
             var c = new PS5Protocol();
             for (int i = 0; i < 3; i++)
             {
-                if (await c.ConnectAsync(_ps5IpAddress))
+                if (await c.ConnectAsync(_ps5IpAddress, _ps5Port))
                 {
                     // Verify the session was actually accepted. When the server
                     // is over MAX_CLIENT_SESSIONS it replies RESP_ERROR and
@@ -600,7 +600,7 @@ namespace PS5Upload
 
             bool uploadsIdle = (_uploadCancellation == null || _uploadCancellation.IsCancellationRequested) && _activeTaskCount == 0;
             PS5Protocol? dupConn = null; bool disposeDup = false;
-            if (!uploadsIdle) { dupConn = new PS5Protocol(); if (await dupConn.ConnectAsync(_ps5IpAddress)) disposeDup = true; else dupConn = null; }
+            if (!uploadsIdle) { dupConn = new PS5Protocol(); if (await dupConn.ConnectAsync(_ps5IpAddress, _ps5Port)) disposeDup = true; else dupConn = null; }
 
             int dirIndex = 0; const int LogInterval = 50;
             foreach (var dirGroup in filesByDir)

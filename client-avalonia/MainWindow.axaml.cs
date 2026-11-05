@@ -28,6 +28,7 @@ namespace PS5Upload
         private bool _isDeleting;
         private CancellationTokenSource? _uploadCancellation;
         private string _ps5IpAddress = "";
+        private int _ps5Port = 9113;
         private string _searchQuery = "";
 
         // Multi-PS5 Support
