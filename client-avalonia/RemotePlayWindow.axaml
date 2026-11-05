@@ -1,0 +1,44 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="PS5Upload.RemotePlayWindow"
+        Title="Remote Play"
+        Width="1280" Height="760" MinWidth="640" MinHeight="420"
+        Background="#000000">
+    <Window.Styles>
+        <Style Selector="Button">
+            <Setter Property="Background" Value="#3E3E42"/>
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Padding" Value="10,3"/>
+            <Setter Property="CornerRadius" Value="4"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="FontSize" Value="12"/>
+        </Style>
+    </Window.Styles>
+
+    <Grid RowDefinitions="Auto,*">
+        <!-- slim title/action bar -->
+        <Border Grid.Row="0" Background="#1E1E1E" BorderBrush="#3E3E42" BorderThickness="0,0,0,1" Height="36">
+            <DockPanel Margin="10,0">
+                <TextBlock x:Name="TitleText" Text="📺 Remote Play" Foreground="#0E9CFF"
+                           FontWeight="SemiBold" VerticalAlignment="Center" DockPanel.Dock="Left"/>
+                <TextBlock x:Name="BarStatusText" Text="" Foreground="#808080" FontSize="12"
+                           VerticalAlignment="Center" Margin="14,0,0,0"/>
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center" DockPanel.Dock="Right">
+                    <Button x:Name="FullscreenBtn" Content="⛶ Fullscreen" Click="OnFullscreen" Margin="0,0,6,0"/>
+                    <Button x:Name="DisconnectBtn" Content="⏹ Disconnect" Click="OnDisconnect" Background="#7A2020"/>
+                </StackPanel>
+            </DockPanel>
+        </Border>
+
+        <!-- video host — decoded frames render directly into VideoImage -->
+        <Grid Grid.Row="1" x:Name="HostGrid" Background="Black">
+            <Image x:Name="VideoImage" Stretch="Uniform" IsHitTestVisible="False"/>
+            <StackPanel x:Name="Overlay" HorizontalAlignment="Center" VerticalAlignment="Center">
+                <TextBlock x:Name="OverlayText" Text="Connecting to PS5…" Foreground="#CCCCCC"
+                           FontSize="15" HorizontalAlignment="Center" Margin="0,0,0,14"/>
+                <ProgressBar x:Name="OverlayProgress" Width="260" Height="4" IsIndeterminate="True"/>
+            </StackPanel>
+        </Grid>
+    </Grid>
+</Window>

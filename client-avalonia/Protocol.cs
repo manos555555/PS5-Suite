@@ -104,6 +104,8 @@ namespace PS5Upload
         TrophyIcon = 0x81,
         TrophyUnlock = 0x82,
 
+        RemotePlay = 0x84,
+
         Shutdown = 0xFF
     }
 
@@ -1269,6 +1271,28 @@ namespace PS5Upload
 
         public Task<(bool success, string message)> IccControlAsync(string cmd)
             => SendTextCommandAsync(Command.IccControl, cmd);
+
+        // CMD_REMOTEPLAY — returns RESP_DATA with JSON status (see payload handle_remoteplay).
+        // arg: status|enable|disable|enableuser|disableuser|pin|poll|cancel
+        public async Task<(bool success, string json)> RemotePlayCommandAsync(string arg, int timeoutMs = 40000)
+        {
+            await _commandLock.WaitAsync();
+            try
+            {
+                await SendCommandAsync(Command.RemotePlay, Encoding.UTF8.GetBytes(arg));
+                var (response, data) = await ReceiveResponseAsync(timeoutMs);
+                string msg = data.Length > 0 ? Encoding.UTF8.GetString(data).TrimEnd('\0') : "";
+                return (response == Response.Data || response == Response.Ok, msg);
+            }
+            catch (Exception ex)
+            {
+                return (false, ex.Message);
+            }
+            finally
+            {
+                _commandLock.Release();
+            }
+        }
 
         // NEW: Get list of mounted games
         public async Task<List<PS5MountedGame>> GetGameListAsync()

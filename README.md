@@ -1,8 +1,8 @@
-# 🎮 PS5 Suite v7.8.1 — Complete PS5 Management Platform
+# 🎮 PS5 Suite v8.0.0 — Complete PS5 Management Platform
 
 **By Manos**
 
-All-in-one management suite for jailbroken PS5 consoles. One app — on **Windows, Linux, macOS and Android** — that does everything: high-speed file transfers, game mount/launch, **trophy unlock & re-lock**, decrypted save backup/restore, screenshots, live hardware monitoring, PKG streaming installs, full FPKG building on the PC, an integrated Homebrew Store + Prospero Store, memory tools, fan control, kernel log, a remote shell — plus console LED control and DualSense lightbar support.
+All-in-one management suite for jailbroken PS5 consoles. One app — on **Windows, Linux, macOS and Android** — that does everything: high-speed file transfers, game mount/launch, **trophy unlock & re-lock**, decrypted save backup/restore, screenshots, live hardware monitoring, PKG streaming installs, full FPKG building on the PC, an integrated Homebrew Store + Prospero Store, memory tools, fan control, kernel log, a remote shell — plus console LED control and DualSense lightbar support. And now: **full Remote Play, built into the app itself** — pair, stream and control the console with video/audio/input running inside PS5 Suite, no second program.
 
 <div align="center">
 
@@ -44,6 +44,19 @@ All-in-one management suite for jailbroken PS5 consoles. One app — on **Window
 | `PS5Suite-macOS-ARM64.zip` | Apple Silicon (M1/M2/M3/M4) — same steps |
 | `PS5Suite.apk` | **Android** — signed APK, full feature parity with desktop |
 | `ps5_suite_server.elf` | **Required** on-console server component |
+
+### ✨ New in v8.0.0
+
+- **Remote Play runs inside PS5 Suite** — the streaming engine is `ps5chiaki.dll`, a 927 KB shim over chiaki-ng's libchiaki protocol core, embedded in the single-file `PS5Suite.exe` (self-extracts to temp). Video decodes via ffmpeg → BGRA into an Avalonia control, audio via opus → PCM → `waveOut`, input maps straight onto `ChiakiControllerState`. No second app, no Qt, no window docking — down from the 430 MB bundled engine of v7.9.0.
+- **Remote Play tab** — pair, register and stream the PS5: `Pair & Connect` runs PIN → encrypted regist handshake (UDP probe + TCP 9295) → credential save → the stream opens in the suite's own window with Disconnect/Fullscreen controls. Verified live: 1080p60 + audio + keyboard input + clean disconnect.
+- **Payload Remote Play commands** — `status`, `enable`/`enableuser`, `pin`/`poll`/`cancel` (libSceRemoteplay loaded dynamically — optional, never breaks firmware without it), `diag`, `setkey`, plus the regist account-id resolver.
+- **Fixed: stream stability** — audio buffers could be freed while the driver was still playing them (silent crash); session context lifetime hardened.
+
+Keyboard map: arrows = d-pad · Enter = ✕ · Esc = ◯ · F = □ · T = △ · PgUp/PgDn = L1/R1 · Q/E = L2/R2 · F1/F2 = L3/R3 · O = Options · N = Share · P = PS · Tab = touchpad.
+
+Remote Play engine is **Windows x64 only** for now — other platforms run the full suite without it (engine port is tracked as future work).
+
+- Payload + client bumped together — the v8.0.0 client requires the v8.0.0 `ps5_suite_server.elf`.
 
 ### ✨ New in v7.8.1
 
@@ -230,6 +243,15 @@ Everything is read **live from the console** — nothing hardcoded; values the c
 - **⏸ Suspend / ▶ Resume** — SIGSTOP/SIGCONT freeze, works on any app.
 - **🗑️ Kill** — ForceKillApp → KillApp → SIGKILL fallback chain.
 - **🧠 Coredump** — triggers a process memory dump (needs etaHEN).
+
+---
+
+### 📺 REMOTE PLAY (Windows x64)
+
+- **Fully inside PS5 Suite** — the stream engine (`ps5chiaki.dll`, a flat-C shim over chiaki-ng's libchiaki) is embedded in the exe; video, audio and input run in the app's own process and window. No external program.
+- **Pair & Connect** — asks the payload for a fresh PIN + account id, runs the encrypted registration handshake from this PC (UDP probe + TCP 9295), stores credentials locally. One-time per PC.
+- **Connect** — opens the suite's Remote Play window: 1080p60 stream, audio, fullscreen toggle, disconnect. Keyboard controls the console directly (map above).
+- **Payload helpers** — enable service/user, live pairing status, device list, PIN issue/cancel — all driven through `remoteplay|…` payload commands.
 
 ---
 

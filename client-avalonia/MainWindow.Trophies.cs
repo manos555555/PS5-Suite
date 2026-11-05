@@ -78,6 +78,8 @@ namespace PS5Upload
             if (e.Source is not TabControl tc) return;
             if (tc.SelectedItem is TabItem { Header: "🏆 Trophies" })
                 await RefreshTrophiesAsync();
+            else if (tc.SelectedItem is TabItem { Header: "📺 Remote Play" })
+                await RpRefreshAsync();
             else if (tc.SelectedItem is TabItem { Header: "🌐 Prospero Store Site" } && !_prosperoLoadedOnce)
             {
                 // Remote JSON catalog — no PS5 connection needed to browse.

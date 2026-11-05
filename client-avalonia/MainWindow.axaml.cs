@@ -188,6 +188,10 @@ namespace PS5Upload
             if (PayloadPathTextBox != null) PayloadPathTextBox.Text = _payloadPath;
             if (PayloadPortTextBox != null) PayloadPortTextBox.Text = _payloadPort.ToString();
 
+            // Remote Play tab: restore saved registration + engine status.
+            RpLoadStore();
+            RpChiakiPathText.Text = ChiakiStreamSession.EnginePath;
+
             if (_autoSendPayload && !string.IsNullOrEmpty(_payloadPath) && !string.IsNullOrEmpty(_ps5IpAddress))
                 _ = AutoSendPayloadOnStartup();
 

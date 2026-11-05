@@ -8,8 +8,8 @@
     <ImplicitUsings>disable</ImplicitUsings>
     <AvaloniaUseCompiledBindingsByDefault>false</AvaloniaUseCompiledBindingsByDefault>
     <ApplicationId>com.manos.ps5suite</ApplicationId>
-    <ApplicationVersion>17</ApplicationVersion>
-    <ApplicationDisplayVersion>7.8.1</ApplicationDisplayVersion>
+    <ApplicationVersion>18</ApplicationVersion>
+    <ApplicationDisplayVersion>7.9.0</ApplicationDisplayVersion>
     <ApplicationTitle>PS5 Suite</ApplicationTitle>
     <AssemblyName>PS5Suite</AssemblyName>
     <RootNamespace>PS5Upload</RootNamespace>
@@ -29,7 +29,7 @@
 
   <!-- Reuse the full desktop UI/codebase so the Android app has feature parity -->
   <ItemGroup>
-    <Compile Include="..\client-avalonia\**\*.cs" Exclude="..\client-avalonia\Program.cs;..\client-avalonia\bin\**;..\client-avalonia\obj\**" />
+    <Compile Include="..\client-avalonia\**\*.cs" Exclude="..\client-avalonia\Program.cs;..\client-avalonia\rptest\**;..\client-avalonia\**\bin\**;..\client-avalonia\**\obj\**" />
     <AvaloniaXaml Include="..\client-avalonia\**\*.axaml" Exclude="..\client-avalonia\bin\**;..\client-avalonia\obj\**" />
     <AvaloniaResource Include="..\client-avalonia\ps5_logo.png" Link="ps5_logo.png" />
     <AvaloniaResource Include="..\client-avalonia\ps5_logo.ico" Link="ps5_logo.ico" />

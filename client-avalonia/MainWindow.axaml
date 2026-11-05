@@ -499,6 +499,89 @@
                             </Grid>
                         </TabItem>
 
+                        <!-- Remote Play tab -->
+                        <TabItem Header="📺 Remote Play">
+                            <ScrollViewer Background="#1E1E1E">
+                                <StackPanel Margin="15">
+                                    <WrapPanel Margin="0,0,0,15">
+                                        <TextBlock Text="📺 Remote Play" FontWeight="Bold" FontSize="16" Foreground="#0E9CFF" VerticalAlignment="Center" Margin="0,0,15,0"/>
+                                        <Button Content="🔄 Refresh" Click="RpRefresh_Click" Padding="10,5" Background="#3E3E42" Margin="0,0,8,0"
+                                                ToolTip.Tip="Re-read the console's Remote Play status"/>
+                                        <Button Content="✅ Enable service" x:Name="RpEnableButton" Click="RpEnable_Click" Padding="10,5" Background="#28A745" Margin="0,0,8,0"
+                                                ToolTip.Tip="Writes rp_enable=1 into the PS5 registry (preparation). The real switch is Settings → System → Remote Play on the console — that toggle wakes the daemon."/>
+                                        <Button Content="👤 Allow this user" x:Name="RpEnableUserButton" Click="RpEnableUser_Click" Padding="10,5" Background="#17A2B8" Margin="0,0,8,0" IsVisible="False"
+                                                ToolTip.Tip="Marks the logged-in PSN user as allowed to use Remote Play"/>
+                                    </WrapPanel>
+
+                                    <!-- Status -->
+                                    <Border Background="#252526" BorderBrush="#3E3E42" BorderThickness="1" CornerRadius="6" Padding="15" Margin="0,0,0,15">
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                            </Grid.ColumnDefinitions>
+                                            <StackPanel>
+                                                <TextBlock x:Name="RpStateText" Text="—" FontSize="14" FontWeight="SemiBold" Foreground="#CCCCCC" Margin="0,0,0,6"/>
+                                                <TextBlock x:Name="RpAccountText" Text="Account: —" FontSize="12" Foreground="#9CDCFE" FontFamily="Consolas" Margin="0,0,0,3"/>
+                                                <TextBlock x:Name="RpServiceText" Text="Service: —" FontSize="12" Foreground="#808080" Margin="0,0,0,3"/>
+                                                <TextBlock x:Name="RpErrorText" Text="" FontSize="12" Foreground="#F48771" TextWrapping="Wrap" Margin="0,4,0,0" IsVisible="False"/>
+                                            </StackPanel>
+                                            <TextBlock Grid.Column="1" x:Name="RpDevicesText" Text="" FontSize="12" Foreground="#28A745" VerticalAlignment="Top"/>
+                                        </Grid>
+                                    </Border>
+
+                                    <!-- Pairing / Connect -->
+                                    <Border Background="#252526" BorderBrush="#3E3E42" BorderThickness="1" CornerRadius="6" Padding="15" Margin="0,0,0,15">
+                                        <StackPanel>
+                                            <TextBlock Text="🔐 Pairing &amp; Connect" FontWeight="SemiBold" FontSize="14" Foreground="#CCCCCC" Margin="0,0,0,10"/>
+                                            <StackPanel x:Name="RpPinPanel" IsVisible="False" Margin="0,0,0,10">
+                                                <WrapPanel VerticalAlignment="Center">
+                                                    <TextBlock Text="PIN: " Foreground="#808080" FontSize="14" VerticalAlignment="Center"/>
+                                                    <TextBlock x:Name="RpPinText" Text="—" FontSize="28" FontWeight="Bold" Foreground="#FFC107" FontFamily="Consolas" VerticalAlignment="Center"/>
+                                                    <TextBlock x:Name="RpPinCountdown" Text="" Foreground="#808080" FontSize="13" VerticalAlignment="Center" Margin="10,0,0,0"/>
+                                                </WrapPanel>
+                                                <TextBlock Text="Pairing runs automatically — no need to type this anywhere." Foreground="#707070" FontSize="11" Margin="0,4,0,0"/>
+                                            </StackPanel>
+                                            <WrapPanel>
+                                                <Button Content="🔗 Pair &amp; Connect" x:Name="RpPairConnectButton" Click="RpPairConnect_Click" Padding="15,8" Background="#007ACC" FontWeight="SemiBold" Margin="0,0,10,0"
+                                                        ToolTip.Tip="One-time setup: asks the console for a PIN, registers this PC over the network, saves the keys, then opens the stream. Only needed once per console."/>
+                                                <Button Content="▶ Connect" x:Name="RpConnectButton" Click="RpConnect_Click" Padding="15,8" Background="#28A745" FontWeight="SemiBold" Margin="0,0,10,0" IsEnabled="False"
+                                                        ToolTip.Tip="Opens the Remote Play stream using the saved pairing — no PIN needed."/>
+                                                <Button Content="⏹ Cancel pairing" x:Name="RpCancelButton" Click="RpCancel_Click" Padding="10,8" Background="#DC3545" IsVisible="False"
+                                                        ToolTip.Tip="Closes the console's pairing window"/>
+                                            </WrapPanel>
+                                            <ProgressBar x:Name="RpProgress" IsVisible="False" IsIndeterminate="True" Height="3" Margin="0,12,0,0"/>
+                                            <TextBlock x:Name="RpPairStatus" Text="" FontSize="12" Foreground="#9CDCFE" TextWrapping="Wrap" Margin="0,8,0,0"/>
+                                        </StackPanel>
+                                    </Border>
+
+                                    <!-- Paired devices -->
+                                    <Border Background="#252526" BorderBrush="#3E3E42" BorderThickness="1" CornerRadius="6" Padding="15" Margin="0,0,0,15">
+                                        <StackPanel>
+                                            <TextBlock Text="📱 Paired devices" FontWeight="SemiBold" FontSize="14" Foreground="#CCCCCC" Margin="0,0,0,8"/>
+                                            <TextBlock x:Name="RpDevicesList" Text="—" FontFamily="Consolas" FontSize="12" Foreground="#AAAAAA" TextWrapping="Wrap"/>
+                                            <TextBlock x:Name="RpOurRegText" Text="" FontSize="11" Foreground="#28A745" TextWrapping="Wrap" Margin="0,8,0,0"/>
+                                        </StackPanel>
+                                    </Border>
+
+                                    <!-- Advanced: bundled streaming engine (hidden — it ships inside PS5 Suite) -->
+                                    <Expander Background="#252526" BorderBrush="#3E3E42" BorderThickness="1" CornerRadius="6" Padding="12" Margin="0,0,0,15" IsExpanded="False">
+                                        <Expander.Header>
+                                            <TextBlock Text="⚙ Advanced — streaming engine" FontSize="12" Foreground="#808080"/>
+                                        </Expander.Header>
+                                        <StackPanel>
+                                            <Grid ColumnDefinitions="Auto,*,Auto" Margin="0,0,0,8">
+                                                <TextBlock Text="Streaming engine:" Foreground="#808080" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                                <TextBlock Grid.Column="1" x:Name="RpChiakiPathText" Foreground="#A0A0A0" FontFamily="Consolas" FontSize="11" VerticalAlignment="Center" TextWrapping="Wrap"/>
+                                                <Button Grid.Column="2" Content="🔍 Detect" Click="RpChiakiDetect_Click" Padding="10,5" Background="#3E3E42" Margin="8,0,0,0"/>
+                                            </Grid>
+                                            <TextBlock Text="chiaki-ng ships bundled inside PS5 Suite — it is used automatically, nothing to install or configure." Foreground="#707070" FontSize="11" TextWrapping="Wrap"/>
+                                        </StackPanel>
+                                    </Expander>
+                                </StackPanel>
+                            </ScrollViewer>
+                        </TabItem>
+
                         <!-- Prospero Store Site (homebrew.page native PS5 catalog) -->
                         <TabItem Header="🌐 Prospero Store Site">
                             <Grid>

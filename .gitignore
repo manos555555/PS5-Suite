@@ -54,3 +54,9 @@ lib-prospero-pkg/
 
 # local dev/debug scripts — not part of the shipped product
 tools/
+
+# vendored Remote Play engine source — fetched per native/ps5chiaki/README.md
+third_party/
+native/ps5chiaki/bin/
+native/ps5chiaki/build/
+binpub/

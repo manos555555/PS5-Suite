@@ -10,12 +10,24 @@
     <AssemblyName>PS5Suite</AssemblyName>
     <RootNamespace>PS5Upload</RootNamespace>
     <ApplicationIcon>ps5_logo.ico</ApplicationIcon>
-    <Version>7.8.1</Version>
+    <Version>8.0.0</Version>
     <Authors>Manos</Authors>
     <Description>PS5 Suite - Complete PS5 Management Platform</Description>
     <Copyright>Copyright © 2026 Manos</Copyright>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
   </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="rptest/**" />
+  </ItemGroup>
+
+  <!-- Bundle the native Remote Play engine (ps5chiaki = libchiaki shim) and
+       its dependency DLLs next to the app — Windows x64 build only.
+       Built by build-ps5chiaki.ps1 into native/ps5chiaki/bin/. -->
+  <ItemGroup Condition="'$(RuntimeIdentifier)' == '' or '$(RuntimeIdentifier)' == 'win-x64'">
+    <None Include="..\native\ps5chiaki\bin\**" CopyToOutputDirectory="PreserveNewest"
+          Link="%(Filename)%(Extension)" />
+  </ItemGroup>
 
   <ItemGroup>
     <AvaloniaResource Include="ps5_logo.ico" />

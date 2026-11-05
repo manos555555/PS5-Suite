@@ -2191,7 +2191,7 @@ void release_file_mutex(const char *path) {
 // payload loader (elfldr raw-socket protocol — identical to what the PC
 // client does during deploy). The spawned instance sweeps every stale
 // "payload*" process and binds the port — no explicit handoff needed.
-#define SUITE_VERSION      "7.8.1"
+#define SUITE_VERSION      "8.0.0"
 #define SUITE_DIR          "/data/ps5suite"
 #define UPDATE_STAGE_PATH  "/data/ps5suite/update.elf"
 #define UPDATE_MARKER      "/data/ps5suite/update.marker"
@@ -2221,6 +2221,10 @@ void release_file_mutex(const char *path) {
 #define CMD_TROPHY_LIST    0x80  // → RESP_DATA framed blob (see handle_trophy_list)
 #define CMD_TROPHY_UNLOCK  0x82  // "unlock:<id|all>" / "lock:<id>" via trophy daemon
 #define CMD_TROPHY_ICON    0x81  // "NPWR|entry.png" → RESP_DATA raw PNG bytes
+
+// Remote Play — service enable + PIN pairing (sceRegMgr + libSceRemoteplay,
+// resolved at runtime). See the REMOTE PLAY section above handle_remoteplay.
+#define CMD_REMOTEPLAY     0x84  // "status|enable|disable|enableuser|disableuser|pin|poll|cancel"
 
 #define CMD_SHUTDOWN 0xFF
 
@@ -11066,6 +11070,782 @@ void handle_icc_control(client_session_t *session, const char *arg) {
         send_response(session->sock, RESP_ERROR, out, n);
 }
 
+// ============================================================================
+// REMOTE PLAY — service enable + offline PIN pairing.
+//
+// sceRegMgr registry keys + libSceRemoteplay are resolved at runtime: the SPRX
+// is optional on some firmwares, so a DT_NEEDED entry could keep the payload
+// itself from loading. The registry key layout, the libSceRemoteplay call
+// sequence and the pairing state machine follow phantomptr/ps5upload's
+// remoteplay.c + rp_pair.c (which itself ports soniciso's elf-arsenal
+// remoteplay.c; GPL-3.0-or-later — same licence as this file).
+//
+// Everything here runs on watchdog workers (resolve/dlopen can park) and a
+// single mutex serializes the Sony calls — a parked worker holds it, so a
+// later op reports "busy" instead of corrupting shared state.
+// ============================================================================
+#define RP_ERR_ALREADY_INITIALIZED ((int)0x80FC0003)
+#define RP_ERR_PIN_INVALID      0x80FC1047u
+#define RP_ERR_ACCOUNT_INVALID  0x80FC1040u
+#define RP_CONFIRM_PAIRED   2u
+#define RP_CONFIRM_FAILED   3u
+#define RP_CONFIRM_ABORTED  4u
+#define RP_PAIR_WAIT_MS     (300 * 1000)
+#define RP_MAX_LOGIN_USERS  16
+#define RP_KEY_SERVICE_ENABLE 1098973184u
+
+#define RP_ST_IDLE    0
+#define RP_ST_WAITING 1
+#define RP_ST_PAIRED  2
+#define RP_ST_FAILED  3
+#define RP_ST_TIMEOUT 4
+
+static uint32_t rp_ent_num(uint32_t slot, uint32_t max, uint32_t stride,
+                           uint32_t base, uint32_t fallback) {
+    if (slot < 1 || slot > max) return fallback;
+    return (slot - 1) * stride + base;
+}
+// Per-user registry slot tables (bases verified against regdump/offact).
+static uint32_t rp_key_user_id(uint32_t slot)       { return rp_ent_num(slot,16,65536,125829376u,127140096u); }
+static uint32_t rp_key_account_id(uint32_t slot)    { return rp_ent_num(slot,16,65536,125830400u,127141120u); }
+static uint32_t rp_key_user_enable(uint32_t slot)   { return rp_ent_num(slot,16,65536,125859841u,127170561u); }
+static uint32_t rp_key_account_type(uint32_t slot)  { return rp_ent_num(slot,16,65536,125874183u,127184903u); }
+// Extra per-slot NP/activation fields (ActRemoteLink's table): what the
+// regist validator really checks beyond the raw account id.
+static uint32_t rp_key_account_name(uint32_t slot)  { return rp_ent_num(slot,16,65536,125829632u,127140352u); }
+static uint32_t rp_key_signin_id(uint32_t slot)     { return rp_ent_num(slot,16,65536,125830656u,127141376u); }
+static uint32_t rp_key_account_flags(uint32_t slot) { return rp_ent_num(slot,16,65536,125831168u,127141888u); }
+static uint32_t rp_key_created_ver(uint32_t slot)   { return rp_ent_num(slot,16,65536,125832704u,127143424u); }
+static uint32_t rp_key_user_status(uint32_t slot)   { return rp_ent_num(slot,16,65536,125832960u,127143680u); }
+static uint32_t rp_key_online_id(uint32_t slot)     { return rp_ent_num(slot,16,65536,125874188u,127184908u); }
+static uint32_t rp_key_np_id(uint32_t slot)         { return rp_ent_num(slot,16,65536,125874189u,127184909u); }
+// np-fake-signin's "CRITICAL" signin state flag (config.dat +0x1F8, template
+// value 2) plus its sibling +0x1FC — present only when a fake/real signin ran.
+static uint32_t rp_key_signin_flag(uint32_t slot)   { return rp_ent_num(slot,16,65536,125874185u,127184905u); }
+static uint32_t rp_key_field_1fc(uint32_t slot)     { return rp_ent_num(slot,16,65536,125874186u,127184906u); }
+static uint32_t rp_key_regist_user_id(uint32_t slot){ return rp_ent_num(slot,32,65536,1090584832u,1092681984u); }
+static uint32_t rp_key_regist_client(uint32_t slot) { return rp_ent_num(slot,32,65536,1090585600u,1092682752u); }
+// Two more registered-device tables used on newer firmwares (ActRemoteLink's
+// "DEVICE2"/"DEVICE3" dumps); 13.x daemons may write there instead.
+static uint32_t rp_key_reg2_user_id(uint32_t slot)  { return rp_ent_num(slot,16,65536,1115685120u,1116733696u); }
+static uint32_t rp_key_reg2_regist(uint32_t slot)   { return rp_ent_num(slot,16,65536,1115685376u,1116733952u); }
+static uint32_t rp_key_reg2_aes(uint32_t slot)      { return rp_ent_num(slot,16,65536,1115685632u,1116734208u); }
+static uint32_t rp_key_reg2_client(uint32_t slot)   { return rp_ent_num(slot,16,65536,1115685888u,1116734464u); }
+static uint32_t rp_key_reg3_user_id(uint32_t slot)  { return rp_ent_num(slot,16,65536,1132462336u,1133510912u); }
+static uint32_t rp_key_reg3_regist(uint32_t slot)   { return rp_ent_num(slot,16,65536,1132462592u,1133511168u); }
+static uint32_t rp_key_reg3_aes(uint32_t slot)      { return rp_ent_num(slot,16,65536,1132462848u,1133511424u); }
+static uint32_t rp_key_reg3_client(uint32_t slot)   { return rp_ent_num(slot,16,65536,1132463104u,1133511680u); }
+
+// ---- sceRegMgr (dlsym'd; libSceRegMgr may arrive via ShellCore IPC rather
+// than as a loadable dep, so RTLD_DEFAULT is tried before the dlopen paths) ----
+typedef int (*regmgr_get_int_fn)(uint32_t, int *);
+typedef int (*regmgr_set_int_fn)(uint32_t, int);
+typedef int (*regmgr_get_str_fn)(uint32_t, char *, int);
+typedef int (*regmgr_get_bin_fn)(uint32_t, void *, size_t);
+static regmgr_get_int_fn g_rm_get_int;
+static regmgr_set_int_fn g_rm_set_int;
+static regmgr_get_str_fn g_rm_get_str;
+static regmgr_get_bin_fn g_rm_get_bin;
+static int g_rm_resolved = 0;
+
+static void rp_resolve_regmgr(void) {
+    if (g_rm_resolved) return;
+    g_rm_get_int = (regmgr_get_int_fn)dlsym(RTLD_DEFAULT, "sceRegMgrGetInt");
+    g_rm_set_int = (regmgr_set_int_fn)dlsym(RTLD_DEFAULT, "sceRegMgrSetInt");
+    g_rm_get_str = (regmgr_get_str_fn)dlsym(RTLD_DEFAULT, "sceRegMgrGetStr");
+    g_rm_get_bin = (regmgr_get_bin_fn)dlsym(RTLD_DEFAULT, "sceRegMgrGetBin");
+    if (!g_rm_get_int) {
+        static const char *paths[] = {
+            "/system/common/lib/libSceRegMgr.sprx",
+            "/system_ex/common/lib/libSceRegMgr.sprx",
+            "/system/priv/lib/libSceRegMgr.sprx", NULL };
+        for (int i = 0; paths[i]; i++)
+            if (dlopen(paths[i], RTLD_NOW | RTLD_GLOBAL)) break;
+        g_rm_get_int = (regmgr_get_int_fn)dlsym(RTLD_DEFAULT, "sceRegMgrGetInt");
+        g_rm_set_int = (regmgr_set_int_fn)dlsym(RTLD_DEFAULT, "sceRegMgrSetInt");
+        g_rm_get_str = (regmgr_get_str_fn)dlsym(RTLD_DEFAULT, "sceRegMgrGetStr");
+        g_rm_get_bin = (regmgr_get_bin_fn)dlsym(RTLD_DEFAULT, "sceRegMgrGetBin");
+    }
+    g_rm_resolved = 1;
+}
+
+// ---- libSceRemoteplay (optional SPRX → dlopen once, dlsym per symbol) ----
+// Arities verified on hardware by ps5upload against linkdev / ps5-remoteplay-
+// get-pin / ActRemoteLink — a wrong prototype is a wild write, not an error.
+typedef int (*rp_init_fn)(void *, size_t);
+typedef int (*rp_gen_pin_fn)(uint32_t *);
+typedef int (*rp_confirm_fn)(uint32_t *, uint32_t *);
+typedef int (*rp_notify_err_fn)(int);
+static rp_init_fn g_rp_init;
+static rp_gen_pin_fn g_rp_gen_pin;
+static rp_confirm_fn g_rp_confirm;
+static rp_notify_err_fn g_rp_pinerr;
+static int g_rplib_resolved = 0;
+
+static void *g_rplib = NULL;
+static void rp_resolve_lib(void) {
+    if (g_rplib_resolved) return;
+    static const char *paths[] = {
+        "/system/common/lib/libSceRemoteplay.sprx",
+        "/system_ex/common/lib/libSceRemoteplay.sprx",
+        "/system/priv/lib/libSceRemoteplay.sprx", NULL };
+    void *lib = NULL;
+    for (int i = 0; paths[i]; i++) {
+        lib = dlopen(paths[i], RTLD_NOW | RTLD_GLOBAL);
+        if (lib) break;
+    }
+    if (!lib) lib = RTLD_DEFAULT;
+    g_rplib = lib;
+    g_rp_init    = (rp_init_fn)dlsym(lib, "sceRemoteplayInitialize");
+    g_rp_gen_pin = (rp_gen_pin_fn)dlsym(lib, "sceRemoteplayGeneratePinCode");
+    g_rp_confirm = (rp_confirm_fn)dlsym(lib, "sceRemoteplayConfirmDeviceRegist");
+    g_rp_pinerr  = (rp_notify_err_fn)dlsym(lib, "sceRemoteplayNotifyPinCodeError");
+    g_rplib_resolved = 1;
+}
+
+static int64_t rp_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+// ---- pairing state (persists across commands) ----
+static pthread_mutex_t g_rp_mtx = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+    int state;
+    char pin[12];
+    char err[160];
+    char account_id[32];
+    int64_t deadline_ms;
+    int devices_at_start;
+    int invalidate_owed;
+    int last_rc; uint32_t last_status; uint32_t last_err; uint32_t probes;
+} g_rpp = { RP_ST_IDLE, {0}, {0}, {0}, 0, -1, 0, 0, 0, 0, 0 };
+
+// Bounded trylock — a parked Sony call must not park us with it.
+static int rp_lock(int ms) {
+    int64_t until = rp_now_ms() + ms;
+    for (;;) {
+        if (pthread_mutex_trylock(&g_rp_mtx) == 0) return 0;
+        if (rp_now_ms() >= until) return -1;
+        usleep(20000);
+    }
+}
+
+static const char *rp_b64tab =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static void rp_b64(const uint8_t *in, size_t n, char *out) {
+    size_t i = 0, j = 0;
+    while (i < n) {
+        size_t rem = n - i;
+        uint32_t v = ((uint32_t)in[i] << 16) |
+                     (rem > 1 ? (uint32_t)in[i+1] << 8 : 0) |
+                     (rem > 2 ? (uint32_t)in[i+2] : 0);
+        out[j++] = rp_b64tab[(v >> 18) & 63];
+        out[j++] = rp_b64tab[(v >> 12) & 63];
+        out[j++] = rem > 1 ? rp_b64tab[(v >> 6) & 63] : '=';
+        out[j++] = rem > 2 ? rp_b64tab[v & 63] : '=';
+        i += 3;
+    }
+    out[j] = 0;
+}
+
+// JSON string escape into dst (no surrounding quotes).
+static size_t rp_jesc(char *dst, size_t cap, const char *src) {
+    size_t o = 0;
+    if (!src) return 0;
+    for (const char *p = src; *p && o + 8 < cap; p++) {
+        if (*p == '"' || *p == '\\') { dst[o++] = '\\'; dst[o++] = *p; }
+        else if ((unsigned char)*p < 0x20) o += snprintf(dst + o, cap - o, "\\u%04x", (unsigned char)*p);
+        else dst[o++] = *p;
+    }
+    dst[o] = 0;
+    return o;
+}
+
+// Registry slot (1..16) whose stored user-id equals uid, or -1.
+static int rp_slot_for_user(int uid) {
+    if (uid <= 0 || !g_rm_get_int) return -1;
+    for (uint32_t i = 1; i <= 16; i++) {
+        int reg_uid = 0;
+        if (g_rm_get_int(rp_key_user_id(i), &reg_uid) == 0 && reg_uid == uid)
+            return (int)i;
+    }
+    return -1;
+}
+
+// Slot holds an activated (non-zero) PSN account id?
+static int rp_slot_has_account(int slot) {
+    if (slot < 1 || !g_rm_get_bin) return 0;
+    uint8_t raw[8] = {0};
+    if (g_rm_get_bin(rp_key_account_id((uint32_t)slot), raw, sizeof(raw)) != 0)
+        return 0;
+    for (size_t i = 0; i < sizeof(raw); i++) if (raw[i]) return 1;
+    return 0;
+}
+
+// Foreground user first, then first signed-in user with an activated
+// account — a console on the dashboard can have no foreground user and
+// still pair fine. `via` says which source answered.
+static int rp_resolve_account_slot(int *uid_out, const char **via) {
+    if (uid_out) *uid_out = 0;
+    if (via) *via = "none";
+    (void)sceUserServiceInitialize(NULL);   // idempotent
+    int uid = 0;
+    if (sceUserServiceGetForegroundUser(&uid) == 0 && uid > 0) {
+        int slot = rp_slot_for_user(uid);
+        if (slot > 0 && rp_slot_has_account(slot)) {
+            if (uid_out) *uid_out = uid;
+            if (via) *via = "foreground";
+            return slot;
+        }
+    }
+    int ids[RP_MAX_LOGIN_USERS];
+    for (int i = 0; i < RP_MAX_LOGIN_USERS; i++) ids[i] = -1;
+    if (sceUserServiceGetLoginUserIdList(ids) != 0) return -1;
+    for (int i = 0; i < RP_MAX_LOGIN_USERS; i++) {
+        if (ids[i] <= 0) continue;
+        int slot = rp_slot_for_user(ids[i]);
+        if (slot > 0 && rp_slot_has_account(slot)) {
+            if (uid_out) *uid_out = ids[i];
+            if (via) *via = "login-list";
+            return slot;
+        }
+    }
+    return -1;
+}
+
+static int rp_device_slot(uint32_t slot, int *user_id, int *client_type) {
+    if (!g_rm_get_int) return 0;
+    int uid = 0;
+    if (g_rm_get_int(rp_key_regist_user_id(slot), &uid) != 0) return 0;
+    if (uid == 0 || uid == -1) return 0;
+    if (user_id) *user_id = uid;
+    if (client_type) {
+        *client_type = 0;
+        (void)g_rm_get_int(rp_key_regist_client(slot), client_type);
+    }
+    return 1;
+}
+
+static int rp_device_count(void) {
+    int n = 0;
+    for (uint32_t s = 1; s <= 32; s++) n += rp_device_slot(s, NULL, NULL);
+    return n;
+}
+
+static int rp_has_per_user(void) {
+    uint32_t fw = kernel_get_fw_version();
+    if (!fw) return 0;                      // unknown → fail closed
+    return fw >= 0x10000000u;               // per-user toggle since 10.00
+}
+
+// Full readiness + pairing snapshot (caller holds g_rp_mtx).
+static int rp_status_json(char *out, size_t cap) {
+    static const char *names[] = { "idle", "waiting", "paired", "failed", "timeout" };
+    rp_resolve_regmgr();
+    rp_resolve_lib();
+
+    int uid = 0, fg_uid = -1, slot = -1, svc = 0, usr = 0;
+    const char *via = "none";
+    char acct_b64[32] = "", acct_type[24] = "";
+    uint64_t acct_raw = 0;
+    uint32_t reg_err = 0;
+
+    (void)sceUserServiceInitialize(NULL);
+    if (sceUserServiceGetForegroundUser(&fg_uid) != 0) fg_uid = -1;
+    slot = rp_resolve_account_slot(&uid, &via);
+
+    if (slot > 0 && g_rm_get_bin) {
+        uint8_t raw[8] = {0};
+        if (g_rm_get_bin(rp_key_account_id((uint32_t)slot), raw, sizeof(raw)) == 0) {
+            rp_b64(raw, sizeof(raw), acct_b64);
+            for (int i = 7; i >= 0; i--) acct_raw = (acct_raw << 8) | raw[i];
+        }
+        if (g_rm_get_str)
+            (void)g_rm_get_str(rp_key_account_type((uint32_t)slot), acct_type, sizeof(acct_type));
+    }
+    if (g_rm_get_int) {
+        int rc = g_rm_get_int(RP_KEY_SERVICE_ENABLE, &svc);
+        if (rc != 0) reg_err = (uint32_t)rc;
+        if (slot > 0 && rp_has_per_user())
+            (void)g_rm_get_int(rp_key_user_enable((uint32_t)slot), &usr);
+    }
+
+    // Activation diagnostics for the resolved slot — empty NP fields are the
+    // usual reason registration is refused on offline accounts.
+    char uname[36] = "", signin[68] = "", onid[20] = "", npid[68] = "";
+    int aflags = 0, ustatus = 0, cver = 0, sflag = -1, f1fc = -1;
+    if (slot > 0) {
+        if (g_rm_get_str) {
+            (void)g_rm_get_str(rp_key_account_name((uint32_t)slot), uname, sizeof(uname));
+            (void)g_rm_get_str(rp_key_signin_id((uint32_t)slot), signin, sizeof(signin));
+            (void)g_rm_get_str(rp_key_online_id((uint32_t)slot), onid, sizeof(onid));
+            (void)g_rm_get_str(rp_key_np_id((uint32_t)slot), npid, sizeof(npid));
+        }
+        if (g_rm_get_int) {
+            (void)g_rm_get_int(rp_key_account_flags((uint32_t)slot), &aflags);
+            (void)g_rm_get_int(rp_key_user_status((uint32_t)slot), &ustatus);
+            (void)g_rm_get_int(rp_key_created_ver((uint32_t)slot), &cver);
+            (void)g_rm_get_int(rp_key_signin_flag((uint32_t)slot), &sflag);
+            (void)g_rm_get_int(rp_key_field_1fc((uint32_t)slot), &f1fc);
+        }
+    }
+
+    int secs = 0;
+    if (g_rpp.state == RP_ST_WAITING && g_rpp.deadline_ms > rp_now_ms())
+        secs = (int)((g_rpp.deadline_ms - rp_now_ms() + 999) / 1000);
+    if (g_rpp.account_id[0])
+        snprintf(acct_b64, sizeof(acct_b64), "%s", g_rpp.account_id);
+
+    char eerr[320], eat[48], eun[80], esi[140], eoi[44], enp[140];
+    rp_jesc(eerr, sizeof(eerr), g_rpp.err);
+    rp_jesc(eat, sizeof(eat), acct_type);
+    rp_jesc(eun, sizeof(eun), uname);
+    rp_jesc(esi, sizeof(esi), signin);
+    rp_jesc(eoi, sizeof(eoi), onid);
+    rp_jesc(enp, sizeof(enp), npid);
+
+    size_t o = snprintf(out, cap,
+        "{\"state\":\"%s\",\"pin\":\"%s\",\"seconds_left\":%d,\"err\":\"%s\","
+        "\"account_id\":\"%s\",\"account_id_raw\":%llu,\"account_via\":\"%s\","
+        "\"account_uid\":%d,\"foreground_uid\":%d,\"user_slot\":%d,"
+        "\"account_type\":\"%s\",\"service_enabled\":%d,\"has_per_user\":%d,"
+        "\"user_enabled\":%d,\"symbols_ok\":%d,\"regmgr_ok\":%d,"
+        "\"registry_err\":%u,\"fw\":%u,\"probes\":%u,\"confirm_rc\":%d,"
+        "\"confirm_status\":%u,\"confirm_err\":%u,"
+        "\"user_name\":\"%s\",\"signin_id\":\"%s\",\"online_id\":\"%s\","
+        "\"np_id\":\"%s\",\"account_flags\":%d,\"user_status\":%d,"
+        "\"created_version\":%d,\"signin_flag\":%d,\"field_1fc\":%d,\"devices\":[",
+        names[g_rpp.state >= 0 && g_rpp.state <= 4 ? g_rpp.state : 0],
+        g_rpp.pin, secs, eerr, acct_b64,
+        (unsigned long long)acct_raw, via, uid, fg_uid, slot, eat,
+        svc ? 1 : 0, rp_has_per_user(), usr ? 1 : 0,
+        (g_rp_init && g_rp_gen_pin && g_rp_confirm) ? 1 : 0,
+        g_rm_get_int ? 1 : 0, reg_err, kernel_get_fw_version(),
+        g_rpp.probes, g_rpp.last_rc, g_rpp.last_status, g_rpp.last_err,
+        eun, esi, eoi, enp, aflags, ustatus, cver, sflag, f1fc);
+    int first = 1, cnt = 0;
+    for (uint32_t s = 1; s <= 32 && o + 96 < cap; s++) {
+        int du = 0, dc = 0;
+        if (!rp_device_slot(s, &du, &dc)) continue;
+        o += snprintf(out + o, cap - o, "%s{\"slot\":%u,\"user_id\":%d,\"client_type\":%d}",
+                      first ? "" : ",", s, du, dc);
+        first = 0; cnt++;
+    }
+    if (g_rm_get_int && g_rm_get_bin) {
+        for (uint32_t s = 1; s <= 16 && o + 160 < cap; s++) {
+            int du = 0, dc = 0, rk = 0;
+            uint8_t aes[16] = {0};
+            if (g_rm_get_int(rp_key_reg2_user_id(s), &du) != 0 || du == 0 || du == -1) continue;
+            (void)g_rm_get_int(rp_key_reg2_client(s), &dc);
+            (void)g_rm_get_int(rp_key_reg2_regist(s), &rk);
+            (void)g_rm_get_bin(rp_key_reg2_aes(s), aes, sizeof(aes));
+            o += snprintf(out + o, cap - o,
+                "%s{\"table\":2,\"slot\":%u,\"user_id\":%d,\"client_type\":%d,"
+                "\"regist_key\":\"0x%08X\",\"aes\":\"%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X\"}",
+                first ? "" : ",", s, du, dc, (unsigned)rk,
+                aes[0],aes[1],aes[2],aes[3],aes[4],aes[5],aes[6],aes[7],
+                aes[8],aes[9],aes[10],aes[11],aes[12],aes[13],aes[14],aes[15]);
+            first = 0; cnt++;
+        }
+        for (uint32_t s = 1; s <= 16 && o + 160 < cap; s++) {
+            int du = 0, dc = 0, rk = 0;
+            uint8_t aes[16] = {0};
+            if (g_rm_get_int(rp_key_reg3_user_id(s), &du) != 0 || du == 0 || du == -1) continue;
+            (void)g_rm_get_int(rp_key_reg3_client(s), &dc);
+            (void)g_rm_get_int(rp_key_reg3_regist(s), &rk);
+            (void)g_rm_get_bin(rp_key_reg3_aes(s), aes, sizeof(aes));
+            o += snprintf(out + o, cap - o,
+                "%s{\"table\":3,\"slot\":%u,\"user_id\":%d,\"client_type\":%d,"
+                "\"regist_key\":\"0x%08X\",\"aes\":\"%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X\"}",
+                first ? "" : ",", s, du, dc, (unsigned)rk,
+                aes[0],aes[1],aes[2],aes[3],aes[4],aes[5],aes[6],aes[7],
+                aes[8],aes[9],aes[10],aes[11],aes[12],aes[13],aes[14],aes[15]);
+            first = 0; cnt++;
+        }
+    }
+    o += snprintf(out + o, cap - o, "],\"device_count\":%d}", cnt);
+    return (int)o;
+}
+
+// Fail the pairing state with a reason.
+static void rp_fail(const char *msg) {
+    g_rpp.state = RP_ST_FAILED;
+    g_rpp.pin[0] = 0;
+    g_rpp.deadline_ms = 0;
+    snprintf(g_rpp.err, sizeof(g_rpp.err), "%s", msg);
+}
+
+// ---- work functions (run inside wdg workers; caller holds nothing) ----
+typedef struct {
+    char sub[24];
+    char opt[64];
+    char out[4096];
+    char notify[96];
+    int rc;
+} rp_work_t;
+static rp_work_t g_rpw;
+static volatile int g_rpw_busy = 0;
+
+// Read-only: status (default) — registry + userservice reads.
+static int rp_work_query(rp_work_t *w) {
+    if (rp_lock(4000) != 0) {
+        snprintf(w->out, sizeof(w->out), "Remote Play service is busy (a previous call is still running)");
+        w->rc = -1; return 0;
+    }
+    w->rc = rp_status_json(w->out, sizeof(w->out));
+    pthread_mutex_unlock(&g_rp_mtx);
+    return 0;
+}
+
+// Registry writes: sub = enable|disable|enableuser|disableuser.
+static int rp_work_enable(rp_work_t *w) {
+    if (rp_lock(4000) != 0) {
+        snprintf(w->out, sizeof(w->out), "Remote Play service is busy");
+        w->rc = -1; return 0;
+    }
+    rp_resolve_regmgr();
+    int rc = 0;
+    if (!g_rm_set_int) {
+        rp_fail("sceRegMgr is not available on this firmware");
+    } else if (!strcmp(w->sub, "enable") || !strcmp(w->sub, "disable")) {
+        int v = !strcmp(w->sub, "enable") ? 1 : 0;
+        rc = g_rm_set_int(RP_KEY_SERVICE_ENABLE, v);
+        if (rc != 0) {
+            char m[96]; snprintf(m, sizeof(m), "sceRegMgrSetInt failed: 0x%08X", (unsigned)rc);
+            rp_fail(m); rc = -1;
+        }
+    } else {
+        if (!rp_has_per_user()) {
+            rp_fail("per-user Remote Play permission needs FW 10.00+");
+            rc = -2;
+        } else {
+            int uid = 0;
+            int slot = rp_resolve_account_slot(&uid, NULL);
+            if (slot < 1) {
+                rp_fail("no signed-in user with an activated PSN account");
+                rc = -3;
+            } else {
+                int v = !strcmp(w->sub, "enableuser") ? 1 : 0;
+                rc = g_rm_set_int(rp_key_user_enable((uint32_t)slot), v);
+                if (rc != 0) {
+                    char m[96]; snprintf(m, sizeof(m), "sceRegMgrSetInt failed: 0x%08X", (unsigned)rc);
+                    rp_fail(m); rc = -1;
+                }
+            }
+        }
+    }
+    w->rc = rc;
+    w->out[0] = 0;
+    int n = rp_status_json(w->out, sizeof(w->out));
+    if (n <= 0) snprintf(w->out, sizeof(w->out), "{\"state\":\"%s\",\"err\":\"status read failed\"}",
+                       rc == 0 ? "idle" : "failed");
+    pthread_mutex_unlock(&g_rp_mtx);
+    return 0;
+}
+
+// Diagnostic: query the daemon's own view through libSceRemoteplay getters.
+// Prototypes are unknown beyond the four the pairing path uses, so each call
+// passes a scratch buffer + size — that covers fn(ptr), fn(ptr,size) and
+// fn(void) without risking an out-of-range write.
+static int rp_work_diag(rp_work_t *w) {
+    if (rp_lock(6000) != 0) {
+        snprintf(w->out, sizeof(w->out), "Remote Play service is busy");
+        w->rc = -1; return 0;
+    }
+    rp_resolve_lib();
+    static const char *names[] = {
+        "sceRemoteplayGetRemoteplayStatus",
+        "sceRemoteplayGetOperationStatus",
+        "sceRemoteplayGetRpMode",
+        "sceRemoteplayGetApMode",
+        "sceRemoteplayGetConnectionStatus",
+        "sceRemoteplayIsRemotePlaying",
+        "sceRemoteplayGetPrimaryUserId",
+        "sceRemoteplayGetConnectUserId",
+        "sceRemoteplayIsRemoteOskReady",
+        "sceRemoteplayGetMbusDeviceInfo",
+    };
+    int only = -1;
+    if (w->opt[0]) only = atoi(w->opt);
+    size_t o = snprintf(w->out, sizeof(w->out), "{");
+    int emitted = 0;
+    for (size_t i = 0; i < sizeof(names)/sizeof(names[0]) && o + 220 < sizeof(w->out); i++) {
+        if (only >= 0 && (int)i != only) continue;
+        typedef int (*any_fn)(void *, int);
+        any_fn fn = g_rplib ? (any_fn)dlsym(g_rplib, names[i]) : NULL;
+        o += snprintf(w->out + o, sizeof(w->out) - o, "%s\"%s\":",
+                      emitted++ ? "," : "", names[i] + 13);
+        if (!fn) { o += snprintf(w->out + o, sizeof(w->out) - o, "null"); continue; }
+        uint8_t buf[256]; memset(buf, 0, sizeof(buf));
+        int rc = fn(buf, sizeof(buf));
+        int v0 = 0, v1 = 0;
+        memcpy(&v0, buf, 4); memcpy(&v1, buf + 4, 4);
+        o += snprintf(w->out + o, sizeof(w->out) - o,
+                      "{\"rc\":\"0x%08X\",\"v0\":%d,\"v1\":%d}", (unsigned)rc, v0, v1);
+    }
+    o += snprintf(w->out + o, sizeof(w->out) - o, "}");
+    w->rc = (int)o;
+    pthread_mutex_unlock(&g_rp_mtx);
+    return 0;
+}
+
+// Probe: call an arbitrary libSceRemoteplay export and report rc + state.
+// probe|<symname>|<mode> — mode: buf=fn(ptr,256) int=fn(ival) void=fn()
+// int uses opt2 as the integer argument. Afterwards re-reads
+// GetRemoteplayStatus so a state flip is visible in the same reply.
+static int rp_work_probe(rp_work_t *w) {
+    if (rp_lock(8000) != 0) {
+        snprintf(w->out, sizeof(w->out), "Remote Play service is busy");
+        w->rc = -1; return 0;
+    }
+    rp_resolve_lib();
+    // w->opt holds "name|mode|ival" parsed here (opt cap is 63 chars)
+    char name[64] = "", mode[8] = "buf";
+    long ival = 0;
+    {
+        char tmp[64]; snprintf(tmp, sizeof(tmp), "%s", w->opt);
+        char *p1 = strchr(tmp, '|');
+        if (p1) { *p1++ = 0; char *p2 = strchr(p1, '|');
+                  if (p2) { *p2++ = 0; ival = strtol(p2, NULL, 0); }
+                  snprintf(mode, sizeof(mode), "%s", p1); }
+        snprintf(name, sizeof(name), "%s", tmp);
+    }
+    typedef int (*any_fn)(void *, int);
+    any_fn fn = g_rplib ? (any_fn)dlsym(g_rplib, name) : NULL;
+    size_t o = snprintf(w->out, sizeof(w->out), "{\"sym\":\"%s\"", name);
+    if (!fn) {
+        o += snprintf(w->out + o, sizeof(w->out) - o, ",\"resolved\":false}");
+        w->rc = (int)o; pthread_mutex_unlock(&g_rp_mtx); return 0;
+    }
+    uint8_t buf[256]; memset(buf, 0, sizeof(buf));
+    int rc;
+    if (!strcmp(mode, "void"))      rc = ((int(*)(void))fn)();
+    else if (!strcmp(mode, "int"))  rc = ((int(*)(long))fn)(ival);
+    else                            rc = fn(buf, sizeof(buf));
+    int v0 = 0, v1 = 0;
+    memcpy(&v0, buf, 4); memcpy(&v1, buf + 4, 4);
+    o += snprintf(w->out + o, sizeof(w->out) - o,
+                  ",\"resolved\":true,\"rc\":\"0x%08X\",\"v0\":%d,\"v1\":%d",
+                  (unsigned)rc, v0, v1);
+    // re-read the service state after the call
+    any_fn st = g_rplib ? (any_fn)dlsym(g_rplib, "sceRemoteplayGetRemoteplayStatus") : NULL;
+    if (st) {
+        uint8_t sb[32]; memset(sb, 0, sizeof(sb));
+        int src = st(sb, sizeof(sb));
+        int s0 = 0; memcpy(&s0, sb, 4);
+        o += snprintf(w->out + o, sizeof(w->out) - o,
+                      ",\"status_rc\":\"0x%08X\",\"status\":%d", (unsigned)src, s0);
+    }
+    o += snprintf(w->out + o, sizeof(w->out) - o, "}");
+    w->rc = (int)o;
+    pthread_mutex_unlock(&g_rp_mtx);
+    return 0;
+}
+
+// Arbitrary sceRegMgr int write for probing: setkey|<keynum>|<value>
+static int rp_work_setkey(rp_work_t *w) {
+    if (rp_lock(4000) != 0) {
+        snprintf(w->out, sizeof(w->out), "Remote Play service is busy");
+        w->rc = -1; return 0;
+    }
+    rp_resolve_regmgr();
+    char *sp = strchr(w->opt, '|');
+    unsigned long key = strtoul(w->opt, NULL, 10);
+    long val = sp ? strtol(sp + 1, NULL, 10) : -999999;
+    int old = 0, orc = -1, wrc = -1;
+    if (g_rm_get_int) orc = g_rm_get_int((uint32_t)key, &old);
+    if (g_rm_set_int && val != -999999) wrc = g_rm_set_int((uint32_t)key, (int)val);
+    snprintf(w->out, sizeof(w->out),
+             "{\"key\":%lu,\"old_rc\":%d,\"old\":%d,\"write_rc\":%d}",
+             key, orc, old, wrc);
+    w->rc = 0;
+    pthread_mutex_unlock(&g_rp_mtx);
+    return 0;
+}
+
+// Pairing: sub = pin | poll | cancel. Holds g_rp_mtx across the Sony calls.
+static int rp_work_pair(rp_work_t *w) {
+    int wait_ms = !strcmp(w->sub, "cancel") ? 4000 : 6000;
+    if (rp_lock(wait_ms) != 0) {
+        snprintf(w->out, sizeof(w->out),
+                 "{\"state\":\"busy\",\"err\":\"a Remote Play call is still running\"}");
+        w->rc = -1; return 0;
+    }
+    rp_resolve_regmgr();
+    rp_resolve_lib();
+    int64_t now = rp_now_ms();
+
+    if (!strcmp(w->sub, "pin")) {
+        // prepare
+        g_rpp.err[0] = 0;
+        if (!g_rp_init || !g_rp_gen_pin || !g_rp_confirm) {
+            rp_fail("this firmware does not expose sceRemoteplay to the payload");
+            goto out;
+        }
+        // service must be on or the PIN it hands out is unusable
+        if (g_rm_get_int && g_rm_set_int) {
+            int en = 0;
+            if (g_rm_get_int(RP_KEY_SERVICE_ENABLE, &en) == 0 && en != 1)
+                (void)g_rm_set_int(RP_KEY_SERVICE_ENABLE, 1);
+        }
+        {
+            int rc = g_rp_init(0, 0);
+            if (rc == RP_ERR_ALREADY_INITIALIZED) rc = 0;
+            if (rc != 0) {
+                char m[96];
+                snprintf(m, sizeof(m), "sceRemoteplayInitialize failed: 0x%08X", (unsigned)rc);
+                rp_fail(m); goto out;
+            }
+        }
+        if (rp_resolve_account_slot(NULL, NULL) < 0 && !w->opt[0]) {
+            rp_fail("no signed-in user with an activated PSN account"); goto out;
+        }
+        // drop any live PIN before asking for another (console holds one)
+        if (g_rp_pinerr) (void)g_rp_pinerr(1);
+        g_rpp.devices_at_start = g_rm_get_int ? rp_device_count() : -1;
+        {
+            uint32_t pin = 0;
+            int rc = g_rp_gen_pin(&pin);
+            g_rpp.last_rc = rc;
+            if (rc != 0) {
+                char m[96];
+                snprintf(m, sizeof(m), "sceRemoteplayGeneratePinCode failed: 0x%08X", (unsigned)rc);
+                rp_fail(m); goto out;
+            }
+            snprintf(g_rpp.pin, sizeof(g_rpp.pin), "%08u", (unsigned)(pin % 100000000u));
+        }
+        g_rpp.state = RP_ST_WAITING;
+        g_rpp.deadline_ms = now + RP_PAIR_WAIT_MS;
+        g_rpp.probes = 0;
+        g_rpp.invalidate_owed = 0;
+        if (w->opt[0]) snprintf(g_rpp.account_id, sizeof(g_rpp.account_id), "%s", w->opt);
+        else {
+            char b64[32] = "";
+            int slot = rp_resolve_account_slot(NULL, NULL);
+            if (slot > 0 && g_rm_get_bin) {
+                uint8_t raw[8] = {0};
+                if (g_rm_get_bin(rp_key_account_id((uint32_t)slot), raw, sizeof(raw)) == 0)
+                    rp_b64(raw, sizeof(raw), b64);
+            }
+            snprintf(g_rpp.account_id, sizeof(g_rpp.account_id), "%s", b64);
+        }
+        snprintf(w->notify, sizeof(w->notify), "Remote Play PIN: %s", g_rpp.pin);
+        goto out;
+    }
+
+    if (!strcmp(w->sub, "cancel")) {
+        int was_waiting = (g_rpp.state == RP_ST_WAITING);
+        g_rpp.state = RP_ST_IDLE;
+        g_rpp.pin[0] = 0; g_rpp.err[0] = 0; g_rpp.deadline_ms = 0;
+        if (was_waiting && g_rp_pinerr) (void)g_rp_pinerr(1);
+        g_rpp.invalidate_owed = 0;
+        goto out;
+    }
+
+    // poll
+    if (g_rpp.invalidate_owed) {
+        if (g_rp_pinerr) (void)g_rp_pinerr(1);
+        g_rpp.invalidate_owed = 0;
+    }
+    if (g_rpp.state == RP_ST_WAITING) {
+        if (g_rpp.deadline_ms && now >= g_rpp.deadline_ms) {
+            g_rpp.state = RP_ST_TIMEOUT;
+            g_rpp.pin[0] = 0; g_rpp.deadline_ms = 0;
+            snprintf(g_rpp.err, sizeof(g_rpp.err), "the PIN expired before a device paired");
+            if (g_rp_pinerr) (void)g_rp_pinerr(1);
+        } else if (g_rp_confirm) {
+            uint32_t st = 0, er = 0;
+            int rc = g_rp_confirm(&st, &er);
+            g_rpp.last_rc = rc; g_rpp.last_status = st; g_rpp.last_err = er;
+            g_rpp.probes++;
+            if (rc == 0 && st == RP_CONFIRM_PAIRED) {
+                g_rpp.state = RP_ST_PAIRED;
+                g_rpp.pin[0] = 0; g_rpp.deadline_ms = 0;
+                snprintf(w->notify, sizeof(w->notify), "Remote Play: device paired");
+            } else if (rc == 0 && (st == RP_CONFIRM_FAILED || st == RP_CONFIRM_ABORTED)) {
+                char m[160];
+                const char *why = er == RP_ERR_PIN_INVALID ? "the PIN was entered wrong"
+                    : er == RP_ERR_ACCOUNT_INVALID ? "the account id was not accepted"
+                    : st == RP_CONFIRM_ABORTED ? "the console ended the registration"
+                    : "the console refused the registration";
+                snprintf(m, sizeof(m), "pairing failed: %s (status %u, 0x%08X)",
+                         why, (unsigned)st, (unsigned)er);
+                rp_fail(m);
+                if (g_rp_pinerr) (void)g_rp_pinerr(1);
+            } else if (g_rpp.devices_at_start >= 0 && g_rm_get_int &&
+                       rp_device_count() > g_rpp.devices_at_start) {
+                // registration table grew — proof of pairing even if Confirm
+                // never reported it
+                g_rpp.state = RP_ST_PAIRED;
+                g_rpp.pin[0] = 0; g_rpp.deadline_ms = 0;
+                snprintf(w->notify, sizeof(w->notify), "Remote Play: device paired");
+            }
+        }
+    }
+
+out:
+    w->rc = 0;
+    if (rp_status_json(w->out, sizeof(w->out)) <= 0)
+        snprintf(w->out, sizeof(w->out), "{\"state\":\"failed\",\"err\":\"status read failed\"}");
+    pthread_mutex_unlock(&g_rp_mtx);
+    return 0;
+}
+
+// CMD_REMOTEPLAY — arg: "sub" or "sub|opt"
+//   status (default) | enable | disable | enableuser | disableuser |
+//   pin [|manual_account_id_b64] | poll | cancel
+void handle_remoteplay(client_session_t *session, const char *arg) {
+    if (__atomic_exchange_n(&g_rpw_busy, 1, __ATOMIC_SEQ_CST)) {
+        send_error(session->sock, "a Remote Play command is already running");
+        return;
+    }
+    memset(&g_rpw, 0, sizeof(g_rpw));
+    sscanf(arg ? arg : "", "%23[^|]|%63s", g_rpw.sub, g_rpw.opt);
+    if (!g_rpw.sub[0]) snprintf(g_rpw.sub, sizeof(g_rpw.sub), "status");
+
+    void *fn = NULL;
+    int timeout = 15000;
+    if (!strcmp(g_rpw.sub, "status") || !strcmp(g_rpw.sub, "devices")) {
+        fn = (void *)rp_work_query;
+    } else if (!strcmp(g_rpw.sub, "enable") || !strcmp(g_rpw.sub, "disable") ||
+               !strcmp(g_rpw.sub, "enableuser") || !strcmp(g_rpw.sub, "disableuser")) {
+        fn = (void *)rp_work_enable;
+    } else if (!strcmp(g_rpw.sub, "pin") || !strcmp(g_rpw.sub, "poll") ||
+               !strcmp(g_rpw.sub, "cancel")) {
+        fn = (void *)rp_work_pair;
+        timeout = 35000;   // Initialize + PIN generation can take seconds
+    } else if (!strcmp(g_rpw.sub, "diag")) {
+        fn = (void *)rp_work_diag;
+        timeout = 35000;
+    } else if (!strcmp(g_rpw.sub, "setkey")) {
+        fn = (void *)rp_work_setkey;
+        timeout = 15000;
+    } else if (!strcmp(g_rpw.sub, "probe")) {
+        fn = (void *)rp_work_probe;
+        timeout = 20000;
+    }
+    if (!fn) {
+        g_rpw_busy = 0;
+        send_error(session->sock,
+            "usage: status|enable|disable|enableuser|disableuser|pin|poll|cancel|diag");
+        return;
+    }
+    int wrc = wdg_fn_call(fn, &g_rpw, NULL, NULL, NULL, timeout);
+    g_rpw_busy = 0;
+    if (wrc == -2) {
+        send_error(session->sock, "Remote Play call timed out");
+        return;
+    }
+    if (g_rpw.notify[0]) {
+        char nm[128];
+        snprintf(nm, sizeof(nm), "PS5 Suite\n%s", g_rpw.notify);
+        send_notification(nm);
+    }
+    send_response(session->sock, RESP_DATA, g_rpw.out, strlen(g_rpw.out));
+}
+
 // SAVE_DELETE — delete a save image + companion .bin from the console.
 void handle_save_delete(client_session_t *session, const char *path) {
     if (!path || !*path) { send_error(session->sock, "No save path provided"); return; }
@@ -17985,6 +18765,20 @@ static const char g_webui_html[] =
 "h+='<div style=\"display:flex;gap:8px;flex-wrap:wrap;align-items:center\">'"
 "+lbB('Blue','0,0,255')+lbB('Red','255,0,0')+lbB('Green','0,255,0')+lbB('Purple','160,32,240')+lbB('White','255,255,255')+lbB('Off','0,0,0')+'</div>';"
 "h+='</div></div>';"
+"h+='<div class=\"coll open\" style=\"margin-top:14px\"><div class=hd><span class=ic>📡</span>Remote Play<span class=cnt id=rp_st></span></div><div class=bd style=\"padding:18px\">';"
+"h+='<div id=rp_tbl><div class=dim>Loading…</div></div>';"
+"h+='<div id=rp_pinbox style=\"display:none;text-align:center;padding:16px 0 6px\">'"
+"+'<div class=dim style=\"font-size:12px;margin-bottom:6px\">PAIRING PIN — enter it in Chiaki / pxplay on this network</div>'"
+"+'<div id=rp_pin class=mono style=\"font-size:46px;letter-spacing:8px;color:var(--acc2);font-weight:700\"></div>'"
+"+'<div id=rp_cd class=dim style=\"font-size:12px;margin-top:4px\"></div></div>';"
+"h+='<div style=\"display:flex;gap:8px;flex-wrap:wrap;margin-top:10px\">'"
+"+'<button class=btn onclick=\"rpPair()\">Pair new device</button>'"
+"+'<button class=\"btn dim\" id=rp_en onclick=\"rpCmd(\\'enable\\')\">Enable service</button>'"
+"+'<button class=\"btn dim\" id=rp_eu style=\"display:none\" onclick=\"rpCmd(\\'enableuser\\')\">Allow this user</button>'"
+"+'<button class=\"btn dim\" onclick=\"rpCmd(\\'cancel\\')\">Cancel</button>'"
+"+'<button class=\"btn dim\" onclick=\"rpRefresh()\">Refresh</button></div>';"
+"h+='<div id=rp_dev style=\"margin-top:10px\"></div>';"
+"h+='</div></div>';"
 "h+='<div class=sec style=\"margin-top:22px\"><span class=ic>⚠</span>Power</div><div class=grid>';"
 "h+=card0('Reboot','reboot the console','reboot');"
 "h+=card0('Shutdown','power off','shutdown');"
@@ -17996,13 +18790,33 @@ static const char g_webui_html[] =
 "h+='</table>';e.innerHTML=h;}});"
 "api('padinfo').then(t=>{let e=$('pad_info');if(e){if(!t||t=='ERR'){e.innerHTML='<div class=dim style=\"padding:16px\">No controller connected</div>';return;}"
 "let h='<table>';t.split(/\\r?\\n/).forEach(l=>{let i=l.indexOf('=');if(i>0){let k=l.slice(0,i).trim().replace(/_/g,' ');h+='<tr><td class=dim style=\"width:180px;padding:10px 16px;text-transform:capitalize\">'+esc(k)+'</td><td class=mono style=\"padding:10px 16px\">'+esc(l.slice(i+1).trim())+'</td></tr>';}});"
-"h+='</table>';e.innerHTML=h;}});}"
+"h+='</table>';e.innerHTML=h;}});rpRefresh();}"
 "function fanApply(v){v=Math.max(0,Math.min(100,v));if($('fc_sl'))$('fc_sl').value=v;if($('fc_val'))$('fc_val').textContent=v;"
 "api('fanset',String(v)).then(t=>{let o=$('out');o.style.display='block';o.textContent=t||'Fan set to '+v;if($('fc_lbl'))$('fc_lbl').textContent='threshold: '+v;});}"
 "function ledB(l,a){return '<button class=\"btn dim\" style=\"font-size:12px\" onclick=\"ledC(\\''+a+'\\')\">'+l+'</button>';}"
 "function lbB(l,c){return '<button class=\"btn dim\" style=\"font-size:12px;border-bottom:3px solid rgb('+c+')\" onclick=\"lbC(\\''+c+'\\')\">'+l+'</button>';}"
 "function ledC(a){api('icc',a).then(t=>{let o=$('out');o.style.display='block';o.textContent=t;});}"
 "function lbC(c){api('pad','lightbar|'+c).then(t=>{let o=$('out');o.style.display='block';o.textContent=t;});}"
+"let rpT=0;"
+"function rpRefresh(){api('rp','status').then(t=>{try{rpRender(JSON.parse(t))}catch(e){let d=$('rp_tbl');if(d)d.innerHTML='<div class=dim>'+esc(t)+'</div>';}});}"
+"function rpRender(j){let e=$('rp_tbl');if(!e)return;"
+"let rows=[['Remote Play service',j.service_enabled?'<span class=\"badge g\">enabled</span>':'<span class=\"badge d\">disabled</span>'],"
+"['libSceRemoteplay',j.symbols_ok?'<span class=\"badge g\">available</span>':'<span class=\"badge d\">missing on this FW</span>'],"
+"['Account',j.account_id?('<span class=mono>'+esc(j.account_id)+'</span> <span class=dim style=\"font-size:11px\">uid '+j.account_uid+' · '+esc(j.account_via)+'</span>'):'<span class=\"badge d\">no activated PSN account</span>']];"
+"if(j.has_per_user)rows.push(['User allowed',j.user_enabled?'<span class=\"badge g\">yes</span>':'<span class=\"badge d\">no — sessions refused</span>']);"
+"let h='<table>';rows.forEach(r=>{h+='<tr><td class=dim style=\"width:170px;padding:7px 14px\">'+r[0]+'</td><td style=\"padding:7px 14px\">'+r[1]+'</td></tr>';});h+='</table>';e.innerHTML=h;"
+"let eu=$('rp_eu');if(eu)eu.style.display=(j.has_per_user&&!j.user_enabled)?'':'none';"
+"let st=$('rp_st');if(st)st.textContent=j.state;"
+"let pb=$('rp_pinbox');"
+"if(j.state=='waiting'){pb.style.display='';$('rp_pin').textContent=j.pin;$('rp_cd').textContent='expires in '+j.seconds_left+'s';rpArm();}"
+"else if(j.state=='paired'){pb.style.display='';$('rp_pin').textContent='PAIRED';$('rp_pin').style.fontSize='30px';$('rp_cd').textContent='device registered — Remote Play ready';}"
+"else{pb.style.display='none';$('rp_pin').style.fontSize='46px';if(j.err&&j.state!='idle'){let o=$('out');o.style.display='block';o.textContent='Remote Play: '+j.err;}}"
+"let dv=$('rp_dev');if(dv){if(j.devices&&j.devices.length){let h='<div class=dim style=\"font-size:12px;margin-bottom:6px\">Paired devices ('+j.device_count+')</div>';"
+"j.devices.forEach(d=>{h+='<span class=badge style=\"margin-right:6px\">slot '+d.slot+' · uid '+d.user_id+(d.client_type?' · type '+d.client_type:'')+'</span>';});dv.innerHTML=h;}else dv.innerHTML='';}}"
+"function rpArm(){if(rpT)return;rpT=setInterval(()=>{api('rp','poll').then(t=>{try{let j=JSON.parse(t);rpRender(j);if(j.state!='waiting'){clearInterval(rpT);rpT=0;}}catch(e){}});},2000);"
+"setTimeout(()=>{if(rpT){clearInterval(rpT);rpT=0;}},310000);}"
+"function rpPair(){api('rp','pin').then(t=>{try{rpRender(JSON.parse(t))}catch(e){let o=$('out');o.style.display='block';o.textContent=t;}});rpArm();}"
+"function rpCmd(s){api('rp',s).then(rpRefresh);}"
 "const FN={dash,system,games,install,trophy,saves,screens,files,klog,tools};"
 "function show(p){document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.p==p));"
 "$('pg').textContent=PAGES[p];$('out').style.display='none';$('out').textContent='';FN[p]();}"
@@ -18127,6 +18941,7 @@ static void web_serve_one(int cs) {
             {"renamefile",0x07,1},
             {"indexstart",0x40,0},{"indexstatus",0x41,0},{"search",0x42,1},
             {"padinfo",0x79,0},{"icc",0x7E,1},{"pad",0x7D,1},{"restartui",0x67,0},
+            {"rp",0x84,1},
             {0,0,0}};
         const char *res = "unknown command"; int res_len = 0, http_st = 200;
         const char *ctype = "text/plain; charset=utf-8";
@@ -18620,6 +19435,9 @@ void *client_thread(void *arg) {
             case CMD_ICC_CONTROL:
                 if (data) handle_icc_control(session, (const char *)data);
                 else send_error(session->sock, "Usage: led|n buzzer|n buzzervol|n buzzermute|n ledcolor|b,w,o");
+                break;
+            case CMD_REMOTEPLAY:
+                handle_remoteplay(session, data ? (const char *)data : "status");
                 break;
             case CMD_PFS_TEST:
                 if (data) handle_pfs_test(session, (const char *)data);

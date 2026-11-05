@@ -1,5 +1,44 @@
 # Changelog - PS5 Suite
 
+## v8.0.0 (November 2026)
+
+### Changed — Remote Play is now truly in-process (Windows x64)
+
+- **libchiaki as a native library, not a bundled app** — the 430 MB `chiaki/` folder (chiaki-ng Qt GUI + runtime) is replaced by `ps5chiaki.dll` (927 KB), a flat-C shim over chiaki-ng's `lib` protocol/streaming core, plus 9 dependency DLLs (ffmpeg avcodec/avutil/swscale/swresample, opus, libcrypto, json-c, miniupnpc, libevent — ~22 MB total). No second executable, no Qt, no window docking/reparenting.
+- **Video decoded and rendered inside PS5 Suite** — chiaki's ffmpeg decoder output is converted to BGRA in the shim and blitted into an Avalonia `WriteableBitmap` in the Remote Play window. The stream lives inside the app's own process and window.
+- **Audio decoded in-process** — session opus packets go through `ChiakiOpusDecoder`; 48 kHz s16 PCM is pushed to Windows `waveOut` from a C# player with bounded queueing.
+- **Input via controller state API** — keyboard maps straight onto `ChiakiControllerState` (d-pad/face/L1/R1/L2/R2/L3/R3/Options/Share/PS/touchpad, analog L2/R2 at full press) through `chiaki_session_set_controller_state`.
+- **Registration credentials feed `ChiakiConnectInfo` directly** — the stored 16-byte regist key / morning / 8-byte PSN account id are passed to `chiaki_session_init`; no QSettings sync, no external config.
+- **Verified live on console** — pairing, 1080p60 stream, audio, keyboard input, clean disconnect (session quit reason 1, app stays up). Non-Windows builds ship without the engine for now and report it cleanly.
+
+### Fixed — stream stability
+
+- **Audio queue use-after-free** — `WaveOutPlayer` previously unprepared and freed the oldest buffer while the driver could still be playing it (queue overflow → heap corruption → silent process exit). Buffers are now only reclaimed once `WHDR_DONE` is set; a full queue drops incoming packets instead.
+- **Session context lifetime** — the native session pointer is volatile so `Stop`/`PullFrame` can't race a stale context during teardown.
+
+### Build system
+
+- `native/ps5chiaki/build-ps5chiaki.ps1` builds the engine: VS2022 + **clang-cl** (MSVC rejects chiaki's C99 VLAs — three sites also malloc'd instead), Ninja, vcpkg x64-windows deps, bundled static nanopb/jerasure/gf-complete and curl(Schannel+WebSocket). Windows-only patches: `<intrin.h>` for `__cpuidex` in gf-complete, static-only nanopb (shared+static emit the same `protobuf-nanopb.lib`), `CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS` for the flat API.
+
+## v7.9.0 (November 2026)
+
+### New — integrated Remote Play (client + payload)
+
+- **One app, no second program** — the Remote Play tab pairs, registers and streams the PS5 entirely inside PS5 Suite: `Pair & Connect` runs PIN → encrypted regist handshake (UDP probe + TCP 9295, ported from chiaki's regist/rpcrypt) → credential save → managed stream window with Disconnect/Fullscreen controls.
+- **chiaki-ng bundled** (GPL-3.0 streaming engine) — Windows x64 ships the portable build, Linux x64/ARM64 the AppImage, macOS ARM64 the .app; nothing else to install. The engine path is auto-detected and shown read-only under Advanced.
+- **Managed stream window** — on Windows the chiaki video window is chromeless, owned by the suite window and docked over the video area by a tracking watchdog (attached-window mode; a true `SetParent` reparent breaks the GPU swapchain). On other platforms it runs in its own suite-owned window.
+- **Automatic credentials sync** — `WriteRegisteredHost` writes `registered_hosts` entries in chiaki's exact QSettings format (REG_BINARY `@ByteArray` on Windows, INI `@ByteArray` elsewhere) before every connect.
+- **Payload Remote Play commands** (`remoteplay|…`): `status`, `enable`/`enableuser` (registry service keys), `pin`/`poll`/`cancel` (libSceRemoteplay loaded dynamically — stays optional, never breaks firmware without the module), `diag` (daemon status, account, device registry), `setkey`, and the regist account-id resolver (sign-in id → account id via user service + regmgr).
+
+### Fixed — Remote Play session refused (`RP-Application-Reason: 80108b26`)
+
+- **Root cause via live daemon disassembly** (SceRemotePlay, FW 13.60): the daemon hex-decodes `RP-Registkey`, `strtol`s it, then scans a per-client-type registry table — lookup fails → internal `0x80FC1021` → `0x80108b26`. Two request-side bugs produced it: a missing `User-Agent` (client type 0) and a mangled regist key.
+- **16-byte `rp_regist_key`** — chiaki's `LoadFromSettings` memcpys only an exactly-16-byte `QByteArray` (`CHIAKI_SESSION_AUTH_SIZE`): the stored value must be the hex-decoded `PS5-RegistKey` header (`b81a7050`) NUL-padded to 16, which chiaki then hex-encodes back to `6238316137303530` on the wire. A 16-byte *text* copy of the header triple-encodes it; an 8-byte copy fails the size check and sends an empty header. Fixed and verified end-to-end (200 OK → 1920x1080 stream + audio + heartbeats).
+
+### Platform support for Remote Play
+
+- Windows x64: bundled engine, docked managed window. Linux x64/ARM64: bundled AppImage, suite-owned window. macOS ARM64: bundled .app. macOS Intel: no upstream chiaki-ng build — external install is picked up automatically. Android: no streaming engine exists — rest of the app unaffected.
+
 ## v7.8.1 (November 2026)
 
 ### New — verified unlock cascade (payload)
