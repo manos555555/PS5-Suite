@@ -51,3 +51,6 @@ homebrew/
 
 # vendored library source — the client uses the compiled dll (client-avalonia/libs/)
 lib-prospero-pkg/
+
+# local dev/debug scripts — not part of the shipped product
+tools/
