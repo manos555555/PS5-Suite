@@ -2,8 +2,6 @@
 
 **By Manos**
 
-All-in-one management suite for jailbroken PS5 consoles. One app — on **Windows, Linux, macOS and Android** — that does everything: high-speed file transfers, game mount/launch, **trophy unlock**, decrypted save backup/restore, screenshots, live hardware monitoring, PKG streaming installs, full FPKG building on the PC, an integrated Homebrew Store + Prospero Store, memory tools, fan control, kernel log, a remote shell — plus console LED control and DualSense lightbar support. And now: **full Remote Play, built into the app itself** — pair, stream and control the console with video/audio/input running inside PS5 Suite, no second program.
-
 <div align="center">
 
 ### ☕ Enjoying PS5 Suite?
@@ -17,6 +15,10 @@ All-in-one management suite for jailbroken PS5 consoles. One app — on **Window
 [![Join our Discord](https://img.shields.io/badge/Join%20our%20Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/eRXG2Csmpy)
 
 </div>
+
+---
+
+All-in-one management suite for jailbroken PS5 consoles. One app — on **Windows, Linux, macOS and Android** — that does everything: high-speed file transfers, game mount/launch, **trophy unlock**, decrypted save backup/restore, screenshots, live hardware monitoring, PKG streaming installs, full FPKG building on the PC, an integrated Homebrew Store + Prospero Store, memory tools, fan control, kernel log, a remote shell — plus console LED control and DualSense lightbar support. And now: **full Remote Play, built into the app itself** — pair, stream and control the console with video/audio/input running inside PS5 Suite, no second program.
 
 ![PS5 Suite — File Transfer](screenshots/file_transfer.png)
 
