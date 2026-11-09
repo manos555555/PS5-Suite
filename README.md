@@ -1,8 +1,8 @@
-# 🎮 PS5 Suite v8.0.0 — Complete PS5 Management Platform
+# 🎮 PS5 Suite v8.1.1 — Complete PS5 Management Platform
 
 **By Manos**
 
-All-in-one management suite for jailbroken PS5 consoles. One app — on **Windows, Linux, macOS and Android** — that does everything: high-speed file transfers, game mount/launch, **trophy unlock & re-lock**, decrypted save backup/restore, screenshots, live hardware monitoring, PKG streaming installs, full FPKG building on the PC, an integrated Homebrew Store + Prospero Store, memory tools, fan control, kernel log, a remote shell — plus console LED control and DualSense lightbar support. And now: **full Remote Play, built into the app itself** — pair, stream and control the console with video/audio/input running inside PS5 Suite, no second program.
+All-in-one management suite for jailbroken PS5 consoles. One app — on **Windows, Linux, macOS and Android** — that does everything: high-speed file transfers, game mount/launch, **trophy unlock**, decrypted save backup/restore, screenshots, live hardware monitoring, PKG streaming installs, full FPKG building on the PC, an integrated Homebrew Store + Prospero Store, memory tools, fan control, kernel log, a remote shell — plus console LED control and DualSense lightbar support. And now: **full Remote Play, built into the app itself** — pair, stream and control the console with video/audio/input running inside PS5 Suite, no second program.
 
 <div align="center">
 
@@ -45,6 +45,20 @@ All-in-one management suite for jailbroken PS5 consoles. One app — on **Window
 | `PS5Suite.apk` | **Android** — signed APK, full feature parity with desktop |
 | `ps5_suite_server.elf` | **Required** on-console server component |
 
+### ✨ New in v8.1.1
+
+- **Android Remote Play over the internet** — hardware-decoded H.264 video and Opus audio stream to your phone from anywhere; immersive landscape fullscreen with on-screen controller.
+- **Suite Link remote connectivity** — 8-character per-console code connects the app from mobile data or any Wi-Fi: direct IPv6 → NAT punch → MQTT relay fallback. No VPN, no port forwarding needed (IPv6 pinhole optional for the fastest path — see guide below).
+- **Set / Read Suite Link code** — "Set on PS5" writes a custom code to the console, "Read from PS5" fetches the current one. Validation: 8 chars, A–Z (no I/O), digits 2–9.
+- **Adaptive quality** — direct connections (LAN/Wi-Fi/IPv6) negotiate up to 720p60 / 6 Mbps; relay/tunnel paths keep a compact 540p for stability. Full 16:9 frame visible on tall phone screens.
+- **File browser Move/Copy with folder picker** — moves and copies now open a remote folder picker (browse PS5 dirs, ".." up, optional rename in the same dialog) instead of a free-text path input. Live progress strip during cross-mount copies (progress bar + `Moving X/Y MB`); same-mount moves complete instantly via `rename()`.
+- **Trophy Lock removed** — the re-lock feature has been disabled; unlock-only from this version forward.
+- **Fixed-port networking (payload)** — every listener pinned to exactly one port: Suite TCP/UDP 9113, PKG 13801, WebUI 17382, Suite Link punch 39295, Remote Play 9295–9297.
+- **SDK v0.45** — payload rebuilt against ps5-payload-sdk v0.45 (adds kernel offsets for FW 14.00/14.10).
+- **UDS trophy fix** — `evval`/`evcval` are now `long` (parsed with `strtoll`); values >INT_MAX (e.g. Ratchet's `TrophyCodeNameHash`) no longer truncate to 0.
+- Security: removed hardcoded Suite Link code from UI placeholders and test defaults.
+- Zero warnings, zero errors across all builds.
+
 ### ✨ New in v8.0.0
 
 - **Remote Play runs inside PS5 Suite** — the streaming engine is `ps5chiaki.dll`, a 927 KB shim over chiaki-ng's libchiaki protocol core, embedded in the single-file `PS5Suite.exe` (self-extracts to temp). Video decodes via ffmpeg → BGRA into an Avalonia control, audio via opus → PCM → `waveOut`, input maps straight onto `ChiakiControllerState`. No second app, no Qt, no window docking — down from the 430 MB bundled engine of v7.9.0.
@@ -54,7 +68,7 @@ All-in-one management suite for jailbroken PS5 consoles. One app — on **Window
 
 Keyboard map: arrows = d-pad · Enter = ✕ · Esc = ◯ · F = □ · T = △ · PgUp/PgDn = L1/R1 · Q/E = L2/R2 · F1/F2 = L3/R3 · O = Options · N = Share · P = PS · Tab = touchpad.
 
-Remote Play engine is **Windows x64 only** for now — other platforms run the full suite without it (engine port is tracked as future work).
+Remote Play engine runs on **Windows x64 and Android** — the Android client decodes video via `MediaCodec` (hardware H.264) and audio via Opus, and connects over the internet through Suite Link (direct IPv6 → IPv4 → NAT punch → MQTT relay, with a transport picker to force the path). Other platforms run the full suite without it.
 
 - Payload + client bumped together — the v8.0.0 client requires the v8.0.0 `ps5_suite_server.elf`.
 
@@ -150,6 +164,7 @@ Two side-by-side panes: your PC on the left, the PS5 on the right.
 - Full filesystem browser: path bar + **Go**, ⭐ **favorites** (saved per console), live **search/filter** box.
 - **Permissions column** — every file/folder shows its octal mode (e.g. `0755`) next to its size, read live via `stat()` on the console.
 - Right-click menu: **⬇️ Download**, **⬇️ Download Selected** (multi-select), **📁 Create Folder**, **📝 Rename**, **📋 Copy**, **✂️ Move**, **� Change Permissions** (chmod dialog — R/W/X checkboxes for Owner/Group/Others synced with octal), **ℹ️ Properties** (size, type, octal+rwx mode, timestamps), **📋 Copy Path**, **💻 Open Terminal Here**, **�🗑️ Delete**, **🗑️ Delete Selected**, **🔄 Refresh**, **Sort By** — Name/Size/Date (folders stay on top).
+- **📋 Copy / ✂️ Move** — opens a remote **folder picker** (browse PS5 directories, go up with "..", optionally rename the item in the same dialog). Cross-mount copies show a live progress strip (bar + `Moving X/Y MB`, payload sends updates every 32 MB); same-mount moves are instant (`rename()`).
 - Downloads ask where to save on the PC; folders download recursively.
 
 **Transfer engine**
@@ -191,7 +206,6 @@ Two side-by-side panes: your PC on the left, the PS5 on the right.
 
 - Lists every trophy set on the console (per game) with real data parsed from TRPTITLE.DAT — names, descriptions, grades (bronze/silver/gold/platinum), icons, hidden status and earned timestamps.
 - **🔓 Unlock** — awards a trophy live through the running game's own trophy pipeline (the matching title must be running — the app tells you if it isn't). Works on both legacy `libSceNpTrophy2` titles and newer UDS-driven games: each trophy's real unlock event is resolved dynamically from the game's `stats_extraction.json`, and the console's daemon performs the award — real notification, real state file. A direct-award path through the daemon's own debug op (`sceNpTrophy2SystemDebugUnlockTrophy`) is also available.
-- **🔒 Lock** — re-locks a trophy by rewriting the set's unlock bitmasks in place (group masks, row flags and timestamps cleared) — as if it was never earned.
 - Search/filter across sets, live refresh after every change.
 
 > ⚠️ **Warning:** unlocking many trophies with unrealistically short/identical timestamps can look suspicious if the console ever syncs to PSN. **I take no responsibility for any ban on your account or console** — use this feature offline and at your own risk.
@@ -252,6 +266,42 @@ Everything is read **live from the console** — nothing hardcoded; values the c
 - **Pair & Connect** — asks the payload for a fresh PIN + account id, runs the encrypted registration handshake from this PC (UDP probe + TCP 9295), stores credentials locally. One-time per PC.
 - **Connect** — opens the suite's Remote Play window: 1080p60 stream, audio, fullscreen toggle, disconnect. Keyboard controls the console directly (map above).
 - **Payload helpers** — enable service/user, live pairing status, device list, PIN issue/cancel — all driven through `remoteplay|…` payload commands.
+
+---
+
+### 🌍 CONNECTING OVER THE INTERNET (Suite Link)
+
+Enter your 8-character Suite Link code and the app finds the console from anywhere — no server of your own needed. You can change the code at any time: **"Set on PS5"** writes a new code to `/data/suite_link_code.txt` (re-advertised under new MQTT topics within ~2 s, no reboot) and **"Read from PS5"** fetches the current one. Transports race automatically and the status line shows the winner:
+
+| Transport | When it wins | Needs |
+|---|---|---|
+| **Direct IPv6** ✅ best | console has a global IPv6 + router allows it | firewall pinhole on the router (below) |
+| **Direct IPv4** | same ISP routable address | port-forward (rare on CGNAT) |
+| **NAT punch** | both sides UDP, non-symmetric NAT | nothing — automatic |
+| **MQTT relay** | always works | nothing — slowest, last resort |
+
+**To get the fastest path (direct IPv6), open the ports on your router once:**
+
+1. **Find the console's IPv6** — on the PS5: *Settings → Network → View Connection Status → IPv6 Address* (the long one starting with `2…`). It must be a **global** address, not `fe80::`.
+2. **Log into your router** — usually `http://192.168.0.1` or `http://192.168.1.1` (check the sticker on the modem for the admin page + password).
+3. **Find the IPv6 firewall/pinhole page** — named differently per brand:
+   - **FRITZ!Box** → *Internet → Permit Access → IPv6* → add the console, tick the ports below
+   - **TP-Link / Netgear / Asus** → *Advanced → IPv6 → Firewall* (or *Security → IPv6 Firewall*) → add an *inbound/allow* rule
+   - **ISP routers (Vodafone, Cosmote, Nova…)** → *Internet → Port Forwarding / Firewall → IPv6* → *Add rule / Pinhole*
+4. **Add a rule allowing inbound traffic to the PS5's IPv6** on these ports:
+
+   | Port | Protocol | Used for |
+   |---|---|---|
+   | `9113` | TCP + UDP | Suite Link (management, files, trophies, discovery — everything) |
+   | `9295` | TCP + UDP | Remote Play registration/control |
+   | `9296`–`9297` | UDP | Remote Play video/audio/input stream |
+
+   Source: *any* (or `::/0`) · Destination: **the PS5's IPv6 address** · Action: **allow/permit**.
+5. **Save + reconnect.** In the app set the transport picker to **Auto** (or **Direct IPv6** to force it) and connect — the status line should show `direct ipv6`.
+
+> 💡 No IPv6 or locked-down router? Just connect anyway — NAT punch and the MQTT relay need **zero** router config; they're slower but always work. If the pinhole is missing, Auto falls back by itself.
+>
+> 💡 **Dynamic IPv6**: some ISPs rotate the prefix periodically. If direct IPv6 stops working, check the console's current address (*Settings → Network → View Connection Status*) and update the firewall rule. With FRITZ!Box and some others you can allow the device by name instead of a fixed address — the rule survives prefix changes.
 
 ---
 
@@ -338,7 +388,7 @@ Everything is read **live from the console** — nothing hardcoded; values the c
 - **Dashboard** — storage, mounted games, running apps and payload status at a glance.
 - **System** — live CPU/memory/network charts and hardware info in real time.
 - **Games / Install** — browse mounted titles, launch, mount, install PKGs.
-- **Trophy** — trophy sets with icons, per-trophy state, lock/unlock, registration repair.
+- **Trophy** — trophy sets with icons, per-trophy state, unlock, registration repair.
 - **Saves** — save manager with per-save icons, game names, PS4/PS5 badges (`sce_bu_*` backups hidden): Mount, Browse, Download (real filenames), Delete.
 - **Screenshots / Files / Kernel Log** — media preview + download, full filesystem browser, live klog.
 - **Tools** — notifications, shell, fan control, network + controller info, **Lights** (console LED colors/effects + DualSense lightbar), power actions.
